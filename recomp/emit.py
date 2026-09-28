@@ -62,6 +62,8 @@ class Reg:
 
     def __init__(self, name):
         self.name = name
+        if name is None:  # an operand Capstone decodes but cannot name
+            raise Unhandled("register without a name")
         if name in ("sp",):
             self.kind, self.n = "x", 31
         elif name == "wsp":
@@ -108,7 +110,12 @@ class Reg:
         return f"c.x[{self.n}] = uint32_t({expr});"
 
 
-class Emitter:
+# Mixins with more handlers; they import the helpers defined above.
+from .emit_ext import ExtOps  # noqa: E402
+from .emit_vldst import VecLdSt  # noqa: E402
+
+
+class Emitter(ExtOps, VecLdSt):
     def __init__(self, an, prefix="sub"):
         self.an = an
         self.m = an.module
@@ -277,6 +284,8 @@ class Emitter:
             return h(f, i, ops) if mn not in ("br",) else h(f, i, ops, jt)
         if mn.startswith("b."):
             return f"if ({self.cond(i)}) {self.goto_or_tail(f, self.target(ops[0]))}"
+        if self.LSE.match(mn):
+            return self.lse(i, ops)
         raise Unhandled("no handler")
 
     # branches
@@ -800,10 +809,16 @@ class Emitter:
 
     def i_clz(self, f, i, ops):
         d = self.regop(i, ops[0])
+        if not d.gp:  # clz v0.4s, v1.4s
+            bits = self.vinfo(ops[0])[0]
+            return self.v_un(i, ops, f"std::countl_zero(uint{bits}_t(a))")
         return d.w(f"std::countl_zero({u(d.bits)}({self.regop(i, ops[1]).r()}))")
 
     def i_cls(self, f, i, ops):
         d = self.regop(i, ops[0])
+        if not d.gp:  # cls v0.4s, v1.4s
+            bits = self.vinfo(ops[0])[0]
+            return self.v_un(i, ops, f"std::countl_zero(uint{bits}_t((uint{bits}_t(a) ^ (uint{bits}_t(a) << 1)) | 1))")
         n = self.regop(i, ops[1]).r()
         return d.w(f"std::countl_zero({u(d.bits)}(({u(d.bits)}({n}) ^ ({u(d.bits)}({n}) << 1)) | 1)) ")
 
@@ -862,13 +877,13 @@ class Emitter:
 
     def ldst(self, i, ops, size=None, signed=False, store=False, pair=False):
         regs, mem, after = self.mem_ops(ops)
-        rs = [self.regop(i, o) for o in regs]
         if mem is None:
-            # Literal: ldr x0, #addr
-            addr = f"{B} + {regs[-1].imm:#x}ull" if False else f"{B} + {ops[-1].imm:#x}ull"
+            # Literal: ldr x0, #addr (the address is an immediate operand, not a register)
+            addr = f"{B} + {ops[-1].imm:#x}ull"
             r = self.regop(i, ops[0])
             sz = size or r.bits // 8
             return self.load_into(r, addr, sz, signed)
+        rs = [self.regop(i, o) for o in regs]
         sz = size or rs[0].bits // 8
         a, wb = self.address(i, mem, after)
         parts = [f"uint64_t a = {a};"]
@@ -1059,14 +1074,22 @@ class Emitter:
             return self.v_bin(i, ops, expr, fp=True)
         d, n, m = (self.regop(i, o) for o in ops[:3])
         if self.is_vec(i, ops[2]):  # scalar by element: fmul s0, s1, v2.s[1]
-            m_expr = self.velem(i, ops[2], "f")
+            m_expr = self.velem(i, ops[2], "f", like=d)
         else:
             m_expr = self.fr(m)
         return self.fw(d, subst(expr, a=f"({self.fr(n)})", b=f"({m_expr})"))
 
-    def velem(self, i, o, kind):
+    def velem(self, i, o, kind, like=None):
+        """Element o.vector_index of a vector register. Without an arrangement the size comes from the register's
+        own kind, or from `like` (the scalar destination) when Capstone names the whole vector (v2 for v2.s[1])."""
         r = self.regop(i, o)
-        bits = VAS[o.vas][0] if o.vas else {"b": 8, "h": 16, "s": 32, "d": 64}[r.kind]
+        if o.vas:
+            bits = VAS[o.vas][0]
+        else:
+            k = like.kind if r.kind in ("v", "q") and like is not None else r.kind
+            if k not in ("b", "h", "s", "d"):
+                raise Unhandled(f"element size of {r.name}")
+            bits = {"b": 8, "h": 16, "s": 32, "d": 64}[k]
         return f"c.v[{r.n}].{kind}{bits}[{o.vector_index}]"
 
     def i_fadd(self, f, i, ops):
@@ -1202,7 +1225,7 @@ class Emitter:
         if self.is_vec(i, ops[0]):
             return self.v_cvt_to_int(i, ops, rnd, signed)
         d, n = self.regop(i, ops[0]), self.regop(i, ops[1])
-        if not d.gp:
+        if not d.gp and d.kind not in ("s", "d"):
             raise Unhandled("fcvt to simd scalar")
         v = self.fr(n)
         if len(ops) > 2:  # fixed point
@@ -1210,6 +1233,9 @@ class Emitter:
         v = {"z": f"std::trunc({v})", "m": f"std::floor({v})", "p": f"std::ceil({v})",
              "a": f"nx::round_away({v})", "n": f"nx::round_even({v})"}[rnd]
         t = f"{s(d.bits) if signed else u(d.bits)}"
+        if not d.gp:  # fcvtzs s0, s1: the integer stays in the SIMD register
+            return (f"{{ nx::V128 t_ = nx::vzero(); t_.u{d.bits}[0] = {u(d.bits)}(nx::fcvt_sat<{t}>({v})); "
+                    f"c.v[{d.n}] = t_; }}")
         return d.w(f"{u(d.bits)}(nx::fcvt_sat<{t}>({v}))")
 
     def i_fcvtzs(self, f, i, ops):
@@ -1244,6 +1270,9 @@ class Emitter:
 
     def cvt_from_int(self, i, ops, signed):
         if self.is_vec(i, ops[0]):
+            if len(ops) > 2 and ops[2].type == A.ARM64_OP_IMM:  # scvtf v0.4s, v0.4s, #fbits
+                ty = "float" if self.vinfo(ops[0])[0] == 32 else "double"
+                return self.v_un(i, ops, f"{ty}(a) / {ty}({float(2 ** ops[2].imm)!r})", fp_from_int=("s" if signed else "u"))
             return self.v_un(i, ops, "a", fp_from_int=("s" if signed else "u"))
         d, n = self.regop(i, ops[0]), self.regop(i, ops[1])
         ty = "float" if d.kind in ("s", "h") else "double"
@@ -1266,6 +1295,10 @@ class Emitter:
 
     def vinfo(self, o):
         if not o.vas:
+            # AdvSIMD scalar form (sqadd s0, s0, s1; sub d0, d0, d1): one lane of the register's size.
+            name = self.cs.reg_name(o.reg) if o.type == A.ARM64_OP_REG else None
+            if name and name[0] in "bhsd" and name[1:].isdigit() and o.vector_index == -1:
+                return {"b": 8, "h": 16, "s": 32, "d": 64}[name[0]], 1
             raise Unhandled("vector without arrangement")
         return VAS[o.vas]
 
@@ -1751,7 +1784,7 @@ class Emitter:
         return self.fbin(i, ops, "nx::frsqrts(a, b)")
 
     def i_frecps(self, f, i, ops):
-        return self.fbin(i, ops, "2.0f - a * b")
+        return self.fbin(i, ops, "nx::frecps(a, b)")
 
     def i_sqxtun(self, f, i, ops):
         return self.narrow(i, ops, "nx::sat<uint{dbits}_t>({a})", src_kind="s")
@@ -1922,80 +1955,3 @@ class Emitter:
 
     def i_frsqrte(self, f, i, ops):
         return self.fun(i, ops, "1.0f / std::sqrt(a)")
-
-    # structured loads / stores
-    def vlist(self, i, ops):
-        regs, mem, after = self.mem_ops(ops)
-        return [self.regop(i, o) for o in regs], regs, mem, after
-
-    def vldst(self, i, ops, nstruct, store, replicate=False):
-        rs, regs, mem, after = self.vlist(i, ops)
-        o0 = regs[0]
-        bits, lanes = VAS[o0.vas]
-        a, wb = self.address(i, mem, after)
-        if i.writeback and after is None:
-            # Immediate post-index: capstone drops the operand; it always equals the bytes transferred.
-            per_reg = bits // 8 if (o0.vector_index != -1 or replicate) else bits * lanes // 8
-            wb = f"c.x[{Reg(i.reg_name(mem.mem.base)).n}] += {per_reg * len(rs)};"
-            a = f"c.x[{Reg(i.reg_name(mem.mem.base)).n}]"
-        parts = [f"uint64_t a = {a};"]
-        esz = bits // 8
-        lane_m = re.search(r"\}\[(\d+)\]", i.op_str)  # capstone omits the lane index on multi-register lists
-        if o0.vector_index != -1 or lane_m:  # single lane
-            lane = o0.vector_index if o0.vector_index != -1 else int(lane_m.group(1))
-            for k, r in enumerate(rs):
-                if store:
-                    parts.append(f"nx::st<uint{bits}_t>(a + {k * esz}, c.v[{r.n}].u{bits}[{lane}]);")
-                else:
-                    parts.append(f"c.v[{r.n}].u{bits}[{lane}] = nx::ld<uint{bits}_t>(a + {k * esz});")
-        elif replicate:
-            for k, r in enumerate(rs):
-                parts.append(f"{{ uint{bits}_t e_ = nx::ld<uint{bits}_t>(a + {k * esz}); nx::V128 r_ = nx::vzero(); "
-                             f"for (int j = 0; j < {lanes}; j++) r_.u{bits}[j] = e_; c.v[{r.n}] = r_; }}")
-        elif nstruct == 1:
-            size = bits * lanes // 8
-            for k, r in enumerate(rs):
-                if store:
-                    parts.append(f"std::memcpy(reinterpret_cast<void*>(a + {k * size}), &c.v[{r.n}], {size});")
-                else:
-                    parts.append(f"{{ nx::V128 r_ = nx::vzero(); std::memcpy(&r_, reinterpret_cast<const void*>(a + {k * size}), {size}); c.v[{r.n}] = r_; }}")
-        else:
-            # Interleaved: element j of structure s is at a + (j * nstruct + s) * esz.
-            if store:
-                for s_, r in enumerate(rs):
-                    parts.append(f"for (int j = 0; j < {lanes}; j++) nx::st<uint{bits}_t>(a + (j * {nstruct} + {s_}) * {esz}, c.v[{r.n}].u{bits}[j]);")
-            else:
-                tmp = []
-                for s_, r in enumerate(rs):
-                    parts.append(f"nx::V128 t{s_} = nx::vzero(); for (int j = 0; j < {lanes}; j++) t{s_}.u{bits}[j] = nx::ld<uint{bits}_t>(a + (j * {nstruct} + {s_}) * {esz});")
-                    tmp.append(f"c.v[{r.n}] = t{s_};")
-                parts += tmp
-        parts.append(wb)
-        return "{ " + " ".join(p for p in parts if p) + " }"
-
-    def i_ld1(self, f, i, ops):
-        return self.vldst(i, ops, 1, False)
-
-    def i_st1(self, f, i, ops):
-        return self.vldst(i, ops, 1, True)
-
-    def i_ld1r(self, f, i, ops):
-        return self.vldst(i, ops, 1, False, replicate=True)
-
-    def i_ld2(self, f, i, ops):
-        return self.vldst(i, ops, 2, False)
-
-    def i_st2(self, f, i, ops):
-        return self.vldst(i, ops, 2, True)
-
-    def i_ld3(self, f, i, ops):
-        return self.vldst(i, ops, 3, False)
-
-    def i_st3(self, f, i, ops):
-        return self.vldst(i, ops, 3, True)
-
-    def i_ld4(self, f, i, ops):
-        return self.vldst(i, ops, 4, False)
-
-    def i_st4(self, f, i, ops):
-        return self.vldst(i, ops, 4, True)

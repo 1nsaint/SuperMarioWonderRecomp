@@ -5,7 +5,7 @@ emits each sample with the recompiler, runs it natively on random states and on 
 registers, flags and memory.
 
 Usage: python -m tests.difftest <module.nso> <work dir> [--per-shape N] [--states N] [--filter mnem,...]
-(run from a VS dev shell: needs clang-cl)
+(Windows: run from a VS dev shell, needs clang-cl. macOS / Linux: clang++ and `pip install unicorn`.)
 """
 import argparse
 import collections
@@ -24,12 +24,14 @@ from unicorn import arm64_const as U
 from recomp import analysis, emit, nso
 
 NX_BASE = 0x0000004000000000
-BUF = 0x10000000
+# Scratch memory for loads and stores, at the same address natively and in Unicorn. macOS arm64 reserves the
+# low 4 GiB (__PAGEZERO), so POSIX hosts use a higher address.
+BUF = 0x10000000 if os.name == "nt" else 0x300000000
 BUF_SIZE = 0x1000
 BUF_MID = 0x600
 
 SKIP = {"b", "bl", "blr", "br", "ret", "cbz", "cbnz", "tbz", "tbnz", "udf", "brk", "svc", "hint", "nop", "prfm",
-        "dmb", "dsb", "isb", "clrex", "mrs", "msr", "stlxr", "stxr", "stlxrb", "stxrb", "stlxrh", "yield"}
+        "dmb", "dsb", "isb", "clrex", "mrs", "msr", "stlxr", "stxr", "stlxp", "stxp", "stlxrb", "stxrb", "stlxrh", "yield"}
 # Results that are allowed to differ (estimates).
 APPROX = {"frecpe", "frsqrte"}
 
@@ -129,7 +131,13 @@ def make_state(rng, i, tid):
 RUNNER_HEAD = r"""
 #include <nx/cpu.h>
 #define NXB 0x4000000000ull
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <csetjmp>
+#include <csignal>
+#include <sys/mman.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 namespace nx {
@@ -145,11 +153,30 @@ RUNNER_MAIN = r"""
 #pragma pack(push, 1)
 struct State { uint32_t id, has_mem; uint64_t x[32]; uint8_t v[512]; uint32_t nzcv; };
 #pragma pack(pop)
+#ifdef _WIN32
 static int run(nx::Fn f, nx::CPU& c) {
     __try { f(c); return 0; } __except (EXCEPTION_EXECUTE_HANDLER) { return 1; }
 }
+static uint8_t* map_buf() {
+    return (uint8_t*)VirtualAlloc((void*)BUF_ADDR, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+}
+#else
+static sigjmp_buf fault_jmp;
+static void on_fault(int) { siglongjmp(fault_jmp, 1); }
+static int run(nx::Fn f, nx::CPU& c) {
+    if (sigsetjmp(fault_jmp, 1)) return 1;
+    f(c);
+    return 0;
+}
+static uint8_t* map_buf() {
+    std::signal(SIGSEGV, on_fault);
+    std::signal(SIGBUS, on_fault);
+    void* p = mmap((void*)BUF_ADDR, 0x10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+    return p == MAP_FAILED ? nullptr : (uint8_t*)p;
+}
+#endif
 int main(int argc, char** argv) {
-    uint8_t* buf = (uint8_t*)VirtualAlloc((void*)0x10000000, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    uint8_t* buf = map_buf();
     if (!buf) { std::printf("no buffer\n"); return 2; }
     FILE* in = std::fopen(argv[1], "rb");
     FILE* out = std::fopen(argv[2], "wb");
@@ -180,15 +207,20 @@ def build_runner(work, stmts):
     src = os.path.join(work, "runner.cpp")
     with open(src, "w") as f:
         f.write(RUNNER_HEAD)
-        f.write(f"#define BUF_SIZE {BUF_SIZE}\n")
+        f.write(f"#define BUF_SIZE {BUF_SIZE}\n#define BUF_ADDR {BUF:#x}ull\n")
         for k, s_ in enumerate(stmts):
             f.write(f"static void t{k}(nx::CPU& c) {{ {s_} }}\n")
         f.write("static const nx::Fn tests[] = {" + ", ".join(f"t{k}" for k in range(len(stmts))) + "};\n")
         f.write(RUNNER_MAIN)
-    exe = os.path.join(work, "runner.exe")
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    cmd = ["clang-cl", "/nologo", "/std:c++20", "/O1", "/arch:AVX2", "/EHa", f"/I{root}/runtime/include",
-           "-Wno-everything", src, f"/Fe{exe}", f"/Fo{work}/"]
+    if os.name == "nt":
+        exe = os.path.join(work, "runner.exe")
+        cmd = ["clang-cl", "/nologo", "/std:c++20", "/O1", "/arch:AVX2", "/EHa", f"/I{root}/runtime/include",
+               "-Wno-everything", src, f"/Fe{exe}", f"/Fo{work}/"]
+    else:
+        exe = os.path.join(work, "runner")
+        cmd = ["clang++", "-std=c++20", "-O1", f"-I{root}/runtime/include", "-Wno-everything", src, "-o", exe]
+        cmd += os.environ.get("NX_DIFFTEST_CFLAGS", "").split()
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
         print(r.stdout[-4000:], r.stderr[-4000:])
@@ -304,6 +336,7 @@ def main():
         sys.exit(1)
 
     uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
+    uc.ctl_set_cpu_model(U.UC_CPU_ARM64_MAX)  # ARMv8.1+ (LSE atomics) and the crypto extension
     t0, tn = m.text
     uc.mem_map(NX_BASE, (tn + 0xFFF) & ~0xFFF)
     uc.mem_write(NX_BASE, bytes(m.image[t0:t0 + tn]))
