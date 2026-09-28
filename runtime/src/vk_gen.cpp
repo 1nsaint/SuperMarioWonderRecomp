@@ -17,9 +17,6 @@ static void w_vkAcquireNextImage2KHR(CPU& c) { c.x[0] = ret_u64(p_vkAcquireNextI
 NX_HLE("vkAcquireNextImage2KHR", w_vkAcquireNextImage2KHR);
 
 PFN_vkAcquireNextImageKHR p_vkAcquireNextImageKHR = nullptr;
-static void w_vkAcquireNextImageKHR(CPU& c) { c.x[0] = ret_u64(p_vkAcquireNextImageKHR(arg<VkDevice>(c.x[0]), arg<VkSwapchainKHR>(c.x[1]), arg<uint64_t>(c.x[2]), arg<VkSemaphore>(c.x[3]), arg<VkFence>(c.x[4]), arg<uint32_t*>(c.x[5]))); }
-NX_HLE("vkAcquireNextImageKHR", w_vkAcquireNextImageKHR);
-
 PFN_vkAcquirePerformanceConfigurationINTEL p_vkAcquirePerformanceConfigurationINTEL = nullptr;
 static void w_vkAcquirePerformanceConfigurationINTEL(CPU& c) { c.x[0] = ret_u64(p_vkAcquirePerformanceConfigurationINTEL(arg<VkDevice>(c.x[0]), arg<const VkPerformanceConfigurationAcquireInfoINTEL*>(c.x[1]), arg<VkPerformanceConfigurationINTEL*>(c.x[2]))); }
 NX_HLE("vkAcquirePerformanceConfigurationINTEL", w_vkAcquirePerformanceConfigurationINTEL);

@@ -183,7 +183,9 @@ static LONG WINAPI crash_handler(EXCEPTION_POINTERS* e) {
     using namespace nx;
     auto* r = e->ExceptionRecord;
     uint64_t info = r->NumberParameters > 1 ? r->ExceptionInformation[1] : 0;
-    log("CRASH: exception %08lx at host %p, data address %llx", r->ExceptionCode, r->ExceptionAddress,
+    log("CRASH: exception %08lx at host %p (hades.exe+%llx, see hades.map), data address %llx", r->ExceptionCode,
+        r->ExceptionAddress,
+        (unsigned long long)(uint64_t(r->ExceptionAddress) - uint64_t(GetModuleHandleW(nullptr)) + 0x140000000ull),
         (unsigned long long)info);
     CPU& c = current_cpu();
     log("  guest lr %s  sp %llx  tpidr %llx  tpidrro %llx", describe(c.x[30]).c_str(), (unsigned long long)c.x[31],

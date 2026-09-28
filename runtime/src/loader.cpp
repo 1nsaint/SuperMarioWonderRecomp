@@ -50,7 +50,10 @@ void log(const char* fmt, ...) {
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     std::lock_guard lk(g_log_lock);
-    if (!g_log_file) g_log_file = std::fopen("nx.log", "w");
+    if (!g_log_file) {
+        const char* path = std::getenv("NX_LOG");
+        g_log_file = std::fopen(path ? path : "nx.log", "w");
+    }
     std::fprintf(stderr, "%s\n", buf);
     if (g_log_file) {
         std::fprintf(g_log_file, "%s\n", buf);

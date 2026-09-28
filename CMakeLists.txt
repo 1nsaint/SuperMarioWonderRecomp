@@ -48,7 +48,7 @@ else()
     set(NX_VULKAN_SDK "C:/VulkanSDK/1.4.357.0" CACHE PATH "Vulkan SDK")
 endif()
 target_include_directories(hades PRIVATE runtime/include runtime/src "${NX_VULKAN_SDK}/Include")
-target_link_libraries(hades PRIVATE game_main game_sdk xinput)
+target_link_libraries(hades PRIVATE game_main game_sdk xinput xaudio2 ole32)
 # Static tables (and HLE registrars) must not be dropped by the linker.
 if(MSVC)
     # Keep host allocations low so the guest ranges (0x40_0000_0000..0x80_0000_0000) are always free.

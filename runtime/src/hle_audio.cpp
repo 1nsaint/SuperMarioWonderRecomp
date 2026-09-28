@@ -1,10 +1,16 @@
-// nn::audio AudioOut at the API level. FMOD (inside main) mixes into AudioOutBuffers and appends them; a host
-// thread "plays" them at 48 kHz stereo s16 and releases them, signalling the guest's system event, which is what
-// paces FMOD's mixer. Sound output to the PC's device plugs in at play() (phase 4). Audio input reports no devices.
+// nn::audio AudioOut at the API level, played through XAudio2. FMOD (inside main) mixes s16 stereo 48 kHz into
+// AudioOutBuffers and appends them; each one is copied into an XAudio2 source voice and handed back to the game
+// (released + system event signalled) when XAudio2 has finished playing it, so the device clock paces FMOD's
+// mixer. Without an audio device the same pacing runs on a timer. Audio input reports no devices.
+#include <algorithm>
 #include <chrono>
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <vector>
+
+#include <windows.h>
+#include <xaudio2.h>
 
 #include "kernel.h"
 
@@ -14,43 +20,102 @@ namespace {
 
 constexpr uint32_t kSampleRate = 48000, kChannels = 2;
 constexpr uint64_t kBytesPerSecond = kSampleRate * kChannels * 2;
+constexpr uint32_t kMaxInFlight = 4;  // buffers queued in XAudio2 (4 x 21 ms)
 
-// Our AudioOutBuffer layout (only our HLE reads it): {void* data; u64 capacity; u64 size; u64 next}.
+// Our AudioOutBuffer layout (only our HLE reads it): {void* data; u64 capacity; u64 size}.
 struct Out {
     std::mutex lock;
+    std::condition_variable cv;
     std::deque<uint64_t> queued, released;
     std::shared_ptr<EventState> event = std::make_shared<EventState>();
     bool started = false;
+    uint32_t in_flight = 0;
 };
 Out g_out;
 
-void play(uint64_t /*data*/, uint64_t /*size*/) {}
+void release(uint64_t buf) {
+    std::lock_guard lk(g_out.lock);
+    g_out.released.push_back(buf);
+    g_out.event->signaled = true;
+    notify_all();
+}
+
+// XAudio2 plays copies; the guest buffer goes back to the game when its copy has played.
+struct Voice : IXAudio2VoiceCallback {
+    struct Pending {
+        uint64_t guest;
+        std::vector<uint8_t> data;
+    };
+    void STDMETHODCALLTYPE OnBufferEnd(void* ctx) override {
+        auto* p = static_cast<Pending*>(ctx);
+        release(p->guest);
+        delete p;
+        std::lock_guard lk(g_out.lock);
+        g_out.in_flight--;
+        g_out.cv.notify_all();
+    }
+    void STDMETHODCALLTYPE OnVoiceProcessingPassStart(UINT32) override {}
+    void STDMETHODCALLTYPE OnVoiceProcessingPassEnd() override {}
+    void STDMETHODCALLTYPE OnStreamEnd() override {}
+    void STDMETHODCALLTYPE OnBufferStart(void*) override {}
+    void STDMETHODCALLTYPE OnLoopEnd(void*) override {}
+    void STDMETHODCALLTYPE OnVoiceError(void*, HRESULT) override {}
+};
+
+IXAudio2* g_xa = nullptr;
+IXAudio2SourceVoice* g_voice = nullptr;
+Voice g_callback;
+
+bool init_xaudio() {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(XAudio2Create(&g_xa, 0, XAUDIO2_DEFAULT_PROCESSOR))) return false;
+    IXAudio2MasteringVoice* master = nullptr;
+    if (FAILED(g_xa->CreateMasteringVoice(&master))) return false;
+    WAVEFORMATEX wf{};
+    wf.wFormatTag = WAVE_FORMAT_PCM;
+    wf.nChannels = kChannels;
+    wf.nSamplesPerSec = kSampleRate;
+    wf.wBitsPerSample = 16;
+    wf.nBlockAlign = kChannels * 2;
+    wf.nAvgBytesPerSec = kSampleRate * wf.nBlockAlign;
+    if (FAILED(g_xa->CreateSourceVoice(&g_voice, &wf, 0, 2.0f, &g_callback))) return false;
+    g_voice->Start();
+    return true;
+}
 
 void player() {
+    bool device = init_xaudio();
+    log("audio: %s", device ? "XAudio2 output (48 kHz stereo s16)" : "no audio device, timer pacing");
     using clock = std::chrono::steady_clock;
     auto next = clock::now();
     for (;;) {
         uint64_t buf = 0, size = 0;
         {
-            std::lock_guard lk(g_out.lock);
-            if (g_out.started && !g_out.queued.empty()) {
-                buf = g_out.queued.front();
-                size = ld<uint64_t>(buf + 16);
-            }
+            std::unique_lock lk(g_out.lock);
+            g_out.cv.wait_for(lk, std::chrono::milliseconds(5), [] {
+                return g_out.started && !g_out.queued.empty() && g_out.in_flight < kMaxInFlight;
+            });
+            if (!g_out.started || g_out.queued.empty() || g_out.in_flight >= kMaxInFlight) continue;
+            buf = g_out.queued.front();
+            g_out.queued.pop_front();
+            size = ld<uint64_t>(buf + 16);
+            if (device) g_out.in_flight++;
         }
-        if (!buf) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            next = clock::now();
-            continue;
+        if (device) {
+            auto* p = new Voice::Pending{buf, {}};
+            p->data.assign(reinterpret_cast<const uint8_t*>(ld<uint64_t>(buf)),
+                           reinterpret_cast<const uint8_t*>(ld<uint64_t>(buf)) + size);
+            XAUDIO2_BUFFER xb{};
+            xb.AudioBytes = UINT32(p->data.size());
+            xb.pAudioData = p->data.data();
+            xb.pContext = p;
+            g_voice->SubmitSourceBuffer(&xb);
+        } else {
+            next = std::max(next, clock::now() - std::chrono::milliseconds(50));
+            next += std::chrono::microseconds(size * 1000000 / kBytesPerSecond);
+            std::this_thread::sleep_until(next);
+            release(buf);
         }
-        play(ld<uint64_t>(buf), size);
-        next += std::chrono::microseconds(size * 1000000 / kBytesPerSecond);
-        std::this_thread::sleep_until(next);
-        std::lock_guard lk(g_out.lock);
-        g_out.queued.pop_front();
-        g_out.released.push_back(buf);
-        g_out.event->signaled = true;
-        notify_all();
     }
 }
 
@@ -82,13 +147,13 @@ void OpenDefaultAudioOut(CPU& c) {  // (AudioOut*, os::SystemEvent*, const Audio
     st<uint64_t>(out, 0xA0D10);  // opaque
     static std::once_flag once;
     std::call_once(once, [] { std::thread(player).detach(); });
-    log("audio: AudioOut opened (48 kHz stereo s16, silent for now)");
     c.x[0] = 0;
 }
 
 void StartAudioOut(CPU& c) {
     std::lock_guard lk(g_out.lock);
     g_out.started = true;
+    g_out.cv.notify_all();
     c.x[0] = 0;
 }
 
@@ -110,6 +175,7 @@ void GetAudioOutBufferDataPointer(CPU& c) { c.x[0] = ld<uint64_t>(c.x[0]); }
 void AppendAudioOutBuffer(CPU& c) {  // (AudioOut*, AudioOutBuffer*)
     std::lock_guard lk(g_out.lock);
     g_out.queued.push_back(c.x[1]);
+    g_out.cv.notify_all();
     c.x[0] = 1;  // bool: appended
 }
 

@@ -22,10 +22,11 @@ SPECIAL = {
     "vkDestroyDebugUtilsMessengerEXT", "vkDestroyDebugReportCallbackEXT",
     "vkGetPhysicalDeviceQueueFamilyProperties", "vkGetPhysicalDeviceQueueFamilyProperties2",
     "vkGetPhysicalDeviceQueueFamilyProperties2KHR", "vkQueuePresentKHR", "vkGetDeviceQueue", "vkCreateSwapchainKHR",
+    "vkAcquireNextImageKHR",
 }
 # Host pointers the hand-written bridges still need are declared anyway (without a wrapper).
 POINTER_ONLY = {"vkGetPhysicalDeviceQueueFamilyProperties", "vkGetPhysicalDeviceQueueFamilyProperties2",
-                "vkQueuePresentKHR", "vkGetDeviceQueue", "vkCreateSwapchainKHR"}
+                "vkQueuePresentKHR", "vkGetDeviceQueue", "vkCreateSwapchainKHR", "vkAcquireNextImageKHR"}
 PLATFORMS = {None, "win32", "vi"}
 FLOAT_TYPES = {"float", "double"}
 

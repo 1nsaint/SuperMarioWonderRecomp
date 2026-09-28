@@ -31,6 +31,7 @@ const std::unordered_set<std::string> kSpecial = {
     "vkCreateDebugReportCallbackEXT", "vkDestroyInstance", "vkEnumeratePhysicalDevices",
     "vkDestroyDebugUtilsMessengerEXT", "vkDestroyDebugReportCallbackEXT", "vkGetPhysicalDeviceQueueFamilyProperties",
     "vkGetPhysicalDeviceQueueFamilyProperties2", "vkGetPhysicalDeviceQueueFamilyProperties2KHR", "vkQueuePresentKHR", "vkGetDeviceQueue", "vkCreateSwapchainKHR",
+    "vkAcquireNextImageKHR",
 };
 
 void load_loader() {
@@ -432,7 +433,22 @@ void capture(VkQueue queue, VkPresentInfoKHR& pi, uint64_t frame, VkSemaphore& o
     p_vkFreeMemory(dev, mem, nullptr);
 }
 
+// A minimized window has no surface to draw to; the Switch never loses its screen, so the game does not handle
+// VK_ERROR_OUT_OF_DATE_KHR. Hold the render thread while minimized (the game pauses, like a console asleep).
+void wait_while_minimized() {
+    while (nx::g_window && IsIconic(nx::g_window)) Sleep(50);
+}
+
+void w_vkAcquireNextImageKHR(CPU& c) {  // (device, swapchain, timeout, semaphore, fence, uint32_t* index)
+    wait_while_minimized();
+    VkResult r = p_vkAcquireNextImageKHR(arg<VkDevice>(c.x[0]), arg<VkSwapchainKHR>(c.x[1]), c.x[2],
+                                         arg<VkSemaphore>(c.x[3]), arg<VkFence>(c.x[4]), arg<uint32_t*>(c.x[5]));
+    if (r != VK_SUCCESS) log("vkAcquireNextImageKHR -> %d", r);
+    c.x[0] = ret_u64(r);
+}
+
 void w_vkQueuePresentKHR(CPU& c) {
+    wait_while_minimized();
     static uint64_t frames = 0;
     static auto t0 = std::chrono::steady_clock::now();
     static const std::vector<uint64_t> shots = screenshot_frames();
@@ -474,6 +490,7 @@ NX_HLE("vkGetPhysicalDeviceQueueFamilyProperties2", w_vkGetPhysicalDeviceQueueFa
 NX_HLE("vkGetPhysicalDeviceQueueFamilyProperties2KHR", w_vkGetPhysicalDeviceQueueFamilyProperties2);
 NX_HLE("vkCreateViSurfaceNN", w_vkCreateViSurfaceNN);
 NX_HLE("vkQueuePresentKHR", w_vkQueuePresentKHR);
+NX_HLE("vkAcquireNextImageKHR", w_vkAcquireNextImageKHR);
 NX_HLE("vkGetDeviceQueue", w_vkGetDeviceQueue);
 NX_HLE("vkCreateSwapchainKHR", w_vkCreateSwapchainKHR);
 NX_HLE("vkCreateDebugUtilsMessengerEXT", w_create_debug_callback);

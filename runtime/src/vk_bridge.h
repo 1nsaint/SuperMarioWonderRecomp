@@ -12,6 +12,10 @@
 
 #include <nx/runtime.h>
 
+namespace nx {
+extern HWND g_window;
+}
+
 namespace nx::vk {
 
 using nx::CPU;

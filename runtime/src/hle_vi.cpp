@@ -37,10 +37,12 @@ void window_thread(std::atomic<bool>* ready) {
     RegisterClassW(&wc);
     // Windowed, the size the game renders at (720p), centred on the primary screen.
     RECT r{0, 0, 1280, 720};
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    AdjustWindowRect(&r, (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX), FALSE);
     int w = r.right - r.left, h = r.bottom - r.top;
     int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2, y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
-    g_window = CreateWindowW(wc.lpszClassName, L"Hades (Switch recomp)", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    // Fixed size: the game never expects its surface to change (resizing would make the swapchain out of date).
+    constexpr DWORD style = (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX) | WS_VISIBLE;
+    g_window = CreateWindowW(wc.lpszClassName, L"Hades (Switch recomp)", style,
                              std::max(0, x), std::max(0, y), w, h, nullptr, nullptr, wc.hInstance, nullptr);
     SetForegroundWindow(g_window);
     *ready = true;
