@@ -16,7 +16,14 @@ The game renders at the phone's own resolution and aspect by default (Hades hand
 19.5:9 it draws its own side art). `config.txt` in the data folder can set another one, e.g. `resolution=1560x720`
 for more speed.
 
-## Build and install
+## Install from your phone alone
+
+1. Copy `hades.apk` and `Hades-data.zip` (`private\celular\`, made by `tools\pack_phone.ps1`) to the phone.
+2. Extract `Hades-data.zip` into Internal storage (My Files > the zip > Extract): you get `Internal storage/Hades/`.
+3. Install `hades.apk` (allow installing from this source), open it, turn on All files access when the
+   system page appears, go back: the game starts. Log: `Internal storage/Hades/nx.log`.
+
+## Build and install (USB)
 
 ```powershell
 . .\dev.ps1

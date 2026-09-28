@@ -7,12 +7,17 @@
     android:versionName="0.1.0">
 
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="35" />
+    <!-- The game data lives in Internal storage/Hades (copied there by the player), which needs all-files access. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true" />
     <uses-feature android:name="android.hardware.gamepad" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
     <application
         android:label="Hades"
+        android:requestLegacyExternalStorage="true"
         android:hasCode="false"
         android:extractNativeLibs="true"
         android:debuggable="true"

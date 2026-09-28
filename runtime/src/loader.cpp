@@ -52,7 +52,12 @@ void log(const char* fmt, ...) {
     std::lock_guard lk(g_log_lock);
     if (!g_log_file) {
         const char* path = std::getenv("NX_LOG");
-        g_log_file = std::fopen(path ? path : (plat::data_root() + "/../nx.log").c_str(), "w");
+#if defined(__ANDROID__)
+        std::string def = plat::data_root() + "/nx.log";  // next to the data, readable from the phone
+#else
+        std::string def = plat::data_root() + "/../nx.log";
+#endif
+        g_log_file = std::fopen(path ? path : def.c_str(), "w");
     }
     plat::log_line(buf);
     if (g_log_file) {

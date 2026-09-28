@@ -11,6 +11,7 @@
 #include <android/window.h>
 #include <android_native_app_glue.h>
 #include <dlfcn.h>
+#include <jni.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -437,10 +438,52 @@ void on_cmd(android_app* app, int32_t cmd) {
 
 }  // namespace
 
+// All-files access (Android 11+): needed to read Internal storage/Hades. Asks for it by opening the system page.
+static bool has_all_files_access(android_app* app) {
+    JNIEnv* env = nullptr;
+    app->activity->vm->AttachCurrentThread(&env, nullptr);
+    jclass envc = env->FindClass("android/os/Environment");
+    jmethodID m = env->GetStaticMethodID(envc, "isExternalStorageManager", "()Z");
+    bool ok = m && env->CallStaticBooleanMethod(envc, m);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    return ok;
+}
+
+static void request_all_files_access(android_app* app) {
+    JNIEnv* env = nullptr;
+    app->activity->vm->AttachCurrentThread(&env, nullptr);
+    jclass uric = env->FindClass("android/net/Uri");
+    jobject uri = env->CallStaticObjectMethod(uric, env->GetStaticMethodID(uric, "parse", "(Ljava/lang/String;)Landroid/net/Uri;"),
+                                              env->NewStringUTF("package:io.github.belmantegu.hadesrecomp"));
+    jclass intentc = env->FindClass("android/content/Intent");
+    jobject intent = env->NewObject(intentc, env->GetMethodID(intentc, "<init>", "(Ljava/lang/String;Landroid/net/Uri;)V"),
+                                    env->NewStringUTF("android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION"), uri);
+    jclass actc = env->GetObjectClass(app->activity->clazz);
+    env->CallVoidMethod(app->activity->clazz, env->GetMethodID(actc, "startActivity", "(Landroid/content/Intent;)V"), intent);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+}
+
+static bool has_data(const std::string& root) { return access((root + "/analysis/main.bin").c_str(), R_OK) == 0; }
+
 extern "C" void android_main(android_app* app) {
     using namespace nx::plat;
     g_app = app;
-    g_root = app->activity->externalDataPath ? app->activity->externalDataPath : "/sdcard/hades";
+    // Game data: Internal storage/Hades (put there by the player, needs all-files access) or the app's own
+    // external files folder (adb push).
+    const std::string shared = "/storage/emulated/0/Hades";
+    const std::string own = app->activity->externalDataPath ? app->activity->externalDataPath : shared;
+    if (!has_data(own) && !has_all_files_access(app)) {
+        request_all_files_access(app);
+        while (!has_all_files_access(app)) {  // keep the app responsive until the switch is turned on
+            int events;
+            android_poll_source* src;
+            while (ALooper_pollOnce(100, nullptr, &events, reinterpret_cast<void**>(&src)) >= 0) {
+                if (src) src->process(app, src);
+                if (app->destroyRequested) _exit(0);
+            }
+        }
+    }
+    g_root = has_data(own) ? own : shared;
     app->onAppCmd = on_cmd;
     app->onInputEvent = on_input;
     ANativeActivity_setWindowFlags(app->activity, AWINDOW_FLAG_KEEP_SCREEN_ON | AWINDOW_FLAG_FULLSCREEN, 0);
