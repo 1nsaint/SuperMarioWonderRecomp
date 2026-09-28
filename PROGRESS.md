@@ -14,15 +14,31 @@ NVN implemented over Vulkan (MoltenVK).
 | N0 shared core, per-game layout, probe | #7 | done for this track (Windows/Hades items left, not needed here) |
 | N1 CPU side: recompile, boot to `nvnBootstrapLoader` | #8 | **done**: the game runs its frame loop on macOS (2,000+ frames, no crash) |
 | N2 NVN reconnaissance (tracer, API.md) | #9 | **mostly done**: tracer, driver addresses of all 534 procs, device info, signatures of the procs in use; API.md to write |
-| N3 (CPU side) | #10 | pools/GPU addresses, buffers, textures, samplers, programs, queues, windows, syncs on the CPU side; Vulkan next |
-| N3 device, pools, sync, window (first pixel) | #10 | not started |
-| N4 textures and samplers | #11 | not started |
-| N5 Maxwell shaders → SPIR-V | #12 | not started (shader inventory done) |
-| N6 pipeline state and draws | #13 | not started |
+| N3 device, pools, sync, window (first NVN pixel) | #10 | **done**: MoltenVK device, swapchain, window textures presented, clears replayed (dark grey = never drawn) |
+| N4 textures and samplers | #11 | formats (0xa1 values), block-linear sizes, samplers decoded; deswizzle + upload in progress |
+| N5 Maxwell shaders → SPIR-V | #12 | **offline translation done**: 12,717/12,717 blocks valid SPIR-V (Ryujinx MIT translator), runtime cache in progress |
+| N6 pipeline state and draws | #13 | binds, states (decoded via the driver), draws recorded; enums mapped; pipelines next |
 | N7 whole game, performance | #14 | not started |
-| NA AudioRenderer (`audren:u`) | — (new) | not started; the game can boot silent |
+| NA AudioRenderer (`audren:u`) | — (new) | **renders in process** (the sdk's own server + DSP code, DFC); output to the Mac next |
 
 ## Log
+
+### 2026-09-28 (late night): Vulkan on the Mac, shaders translated
+
+- **Shader translation settled (decision 2):** Ryujinx's MIT translator run offline (tools/maxwell/spirv_harness):
+  all 12,717 distinct Maxwell blocks (47,797 stages) become SPIR-V that passes spirv-val and compiles to Metal on
+  the M1. docs/nvn/TRANSLATOR.md has NVN's constant-bank layout (c[0] driver, c[1] constants, c[2] texture
+  handles, c[3+n] uniform blocks) and the descriptor-set scheme.
+- **First NVN frame path on Vulkan** (17c4c9c): MoltenVK device (portability), Metal surface, swapchain 2560x1440,
+  a VkImage per NVN texture, recorded command lists replayed at submit, window textures blitted and presented.
+  `NX_DUMP_FRAMES=N` writes every Nth presented texture to private/wonder/frames/ (the window can be behind).
+- **Formats and enums from the driver:** the format table (0xa1 entries: color families, depth/stencil, sRGB, BCn,
+  ASTC 4x4..12x12, BGR orders) mapped to VkFormat; NVN enums follow OpenGL's numbering from 1 (checked on Wonder's
+  decoded states: blend 5/6, depth LEQUAL 4, sampler trilinear 5/1, wrap 1 repeat / 7 clamp to edge).
+- **Draw recording** (31fc899, 53b66ef): programs, buffers, textures, vertex layouts, blend/color/mask/depth/polygon
+  states decoded through the driver's getters while recording; samplers decoded the same way.
+- In progress, in parallel: block-linear deswizzle (validated on the game's BNTX textures) and the runtime shader
+  cache (hash -> SPIR-V, reflection, the translator's support buffer).
 
 ### 2026-09-28 (night): the frame loop runs (7c9aa0c)
 

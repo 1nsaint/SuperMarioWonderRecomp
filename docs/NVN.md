@@ -140,7 +140,9 @@ Shaders need translating whichever level is chosen: games ship Maxwell machine c
 ## Decisions
 
 1. **License of this repository** (open, none yet): MIT keeps it simple; GPL allows reusing yuzu code.
-2. **Shader translator** (open): our own from the start, or an existing MIT translator first and ours later.
+2. **Shader translator: an existing MIT translator first** (decided 2026-09-28). Ryujinx's shader translator, run
+   offline, turns every one of Wonder's 12,717 Maxwell blocks into valid SPIR-V (docs/nvn/TRANSLATOR.md). Our own
+   translator stays the long-term goal and can be checked shader by shader against it.
 3. **First platform: macOS** (decided 2026-09-28). Apple M1 through MoltenVK. It has
    `VK_EXT_external_memory_host` (the "PC" pool path of N3 applies), extended dynamic state 1-3, dynamic rendering,
    timeline semaphores, descriptor indexing and native ASTC/BC. It lacks geometry shaders, transform feedback,
