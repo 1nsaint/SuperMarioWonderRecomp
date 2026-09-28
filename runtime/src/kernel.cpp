@@ -35,6 +35,9 @@ std::vector<KThread*> g_addr_waiters;
 
 thread_local KThread* t_self = nullptr;
 
+std::mutex g_all_lock;  // every thread ever created, for the hang report
+std::vector<std::weak_ptr<KThread>> g_all;
+
 
 }  // namespace
 
@@ -140,24 +143,13 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
     g_cv_waiters.push_back(self);
     store32(key, 1);
     if (block(lk, self, timeout)) return self->wait_result;
-    // Timed out: still on the condvar? Then re-acquire the mutex ourselves.
-    if (std::find(g_cv_waiters.begin(), g_cv_waiters.end(), self) != g_cv_waiters.end()) {
-        remove(g_cv_waiters, self);
-        bool others = std::any_of(g_cv_waiters.begin(), g_cv_waiters.end(), [&](KThread* t) { return t->wait_key == key; });
-        if (!others) store32(key, 0);
-        for (;;) {
-            uint32_t v = load32(mutex);
-            if (v == 0) {
-                if (cas32(mutex, 0, tag)) return 0xEA01;
-                continue;
-            }
-            if (!(v & kHandleWaitMask) && !cas32(mutex, v, v | kHandleWaitMask)) continue;
-            break;
-        }
-        self->wake = false;
-        g_mutex_waiters.push_back(self);
-    }
-    block(lk, self, -1);
+    // Timed out (not handed the mutex): leave the condvar, or the mutex queue a signal moved us to, and return
+    // without the mutex. Like Horizon: the SDK re-locks it itself (TimedWait -> InternalCriticalSection::Enter);
+    // returning with it held made that Enter wait on ourselves forever.
+    remove(g_cv_waiters, self);
+    remove(g_mutex_waiters, self);
+    bool others = std::any_of(g_cv_waiters.begin(), g_cv_waiters.end(), [&](KThread* t) { return t->wait_key == key; });
+    if (!others) store32(key, 0);
     return 0xEA01;
 }
 
@@ -330,7 +322,77 @@ static std::shared_ptr<KThread> new_thread(uint64_t entry, uint64_t arg, uint64_
     t->ctx.x[31] = sp;
     t->ctx.tpidrro = t->tls;
     t->handle = handle_add(t);
+    std::lock_guard al(g_all_lock);
+    g_all.push_back(t);
     return t;
+}
+
+// ---- hang report: when frames stop for a while, log what every guest thread is doing --------------------------
+
+static void report_threads() {
+    std::vector<std::shared_ptr<KThread>> all;
+    {
+        std::lock_guard al(g_all_lock);
+        for (auto& w : g_all)
+            if (auto t = w.lock()) all.push_back(t);
+    }
+    // The wait lists are read under the kernel lock when it can be had; a thread stuck holding it is itself news.
+    std::unique_lock lk(g_k, std::defer_lock);
+    for (int k = 0; k < 100 && !lk.try_lock(); k++) plat::sleep_ns(10'000'000);
+    if (!lk.owns_lock()) log("hang: kernel lock held by someone, reading without it");
+    auto in = [](const std::vector<KThread*>& v, KThread* t) { return std::find(v.begin(), v.end(), t) != v.end(); };
+    for (auto& t : all) {
+        if (!t->started || t->exited) continue;
+        const char* state = "running (guest code or a host call)";
+        uint64_t on = 0;
+        if (lk.owns_lock() && in(g_mutex_waiters, t.get())) {
+            state = "waits for mutex";
+            on = t->wait_mutex;
+        } else if (lk.owns_lock() && in(g_cv_waiters, t.get())) {
+            state = "waits on condvar";
+            on = t->wait_key;
+        } else if (lk.owns_lock() && in(g_addr_waiters, t.get())) {
+            state = "waits on address";
+            on = t->wait_addr;
+        }
+        log("hang: thread %llx (handle %x, entry %s): %s %llx", (unsigned long long)t->id, t->handle,
+            describe(t->entry).c_str(), state, (unsigned long long)on);
+        if (on && std::strcmp(state, "waits for mutex") == 0)
+            log("  mutex word %08x (owner handle %x)", load32(on), load32(on) & ~kHandleWaitMask);
+        backtrace(t->ctx);
+    }
+}
+
+static void watchdog(void*) {
+    uint64_t last = 0, since = plat::monotonic_ns();
+    bool reported = false;
+    for (;;) {
+        plat::sleep_ns(1'000'000'000);
+        // On request: a file named dump_threads in the data folder (e.g. adb shell touch .../dump_threads). Frames
+        // can keep coming while the game's logic is stuck (the render thread is separate).
+        std::string req = plat::data_root() + "/dump_threads";
+        if (FILE* f = plat::fopen_utf8(req, "rb")) {
+            std::fclose(f);
+            std::remove(req.c_str());
+            log("hang: thread dump requested");
+            report_threads();
+        }
+        uint64_t f = g_frame, now = plat::monotonic_ns();
+        if (f != last || plat::window_minimized()) {
+            last = f;
+            since = now;
+            reported = false;
+            continue;
+        }
+        if (f && !reported && now - since > 5'000'000'000ull) {
+            reported = true;
+            log("hang: no frame for 5 s after frame %llu; threads (two samples, 1 s apart):", (unsigned long long)f);
+            report_threads();
+            plat::sleep_ns(1'000'000'000);
+            log("hang: second sample");
+            report_threads();
+        }
+    }
 }
 
 uint32_t create_main_thread(uint64_t stack_size) {
@@ -342,7 +404,7 @@ uint32_t create_main_thread(uint64_t stack_size) {
     return t->handle;
 }
 
-void kernel_init() {}
+void kernel_init() { plat::start_thread(watchdog, nullptr, 1ull << 20); }
 
 // ---- dispatch -------------------------------------------------------------------------------------------------
 
