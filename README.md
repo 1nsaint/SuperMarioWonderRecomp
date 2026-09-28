@@ -33,7 +33,7 @@ Both sides are little endian, so no byte swapping. Details in [docs/FINDINGS.md]
 | Phase | What |
 |---|---|
 | 0 | Extraction and analysis |
-| 1 | AArch64 â†’ C++ recompiler: functions, jump tables, NEON, atomics |
+| 1 | AArch64 → C++ recompiler: functions, jump tables, NEON, atomics |
 | 2 | Runtime: loader, memory, threads, nn:: HLE |
 | 3 | Vulkan passthrough: first native pixels |
 | 4 | Audio, input, stability, full game |
