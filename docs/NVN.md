@@ -110,6 +110,15 @@ Shaders need translating whichever level is chosen: games ship Maxwell machine c
 - Conventions: depth range (-1..1 vs 0..1), window origin, viewport flips.
 - **Done when:** World 1-1 playable on PC.
 
+### NA: AudioRenderer (found in N1)
+
+- Wonder mixes through `nn::audio`'s **AudioRenderer** (`audren:u`), not AudioOut like Hades: the game describes
+  voices, wave buffers (PCM, ADPCM, Opus), sub/final mixes and effects (delay, reverb, I3DL2 reverb, aux, biquad)
+  and the service mixes them on the audio DSP. The service side is ours: parse the renderer's update buffers,
+  decode, mix at 48 kHz, apply effects, hand the result to the platform audio device.
+- Independent from the graphics phases: the game can run silent (a renderer that consumes buffers and reports
+  them played) until this lands.
+
 ### N7: whole game, performance, Android
 
 - Full playthrough; the tail of the API, rare formats, readbacks (GPU-written data the CPU reads).
@@ -128,8 +137,13 @@ Shaders need translating whichever level is chosen: games ship Maxwell machine c
 | Newer SDK services and online-only features | stubs, offline mode like Hades |
 | Legal exposure | own dumps only, no leaked material, repository stays private until decided otherwise |
 
-## Decisions (open)
+## Decisions
 
-1. **License of this repository** (none yet): MIT keeps it simple; GPL allows reusing yuzu code.
-2. **Shader translator**: our own from the start, or an existing MIT translator first and ours later.
-3. **First platform**: PC first (external host memory, easier debugging), then Android.
+1. **License of this repository** (open, none yet): MIT keeps it simple; GPL allows reusing yuzu code.
+2. **Shader translator** (open): our own from the start, or an existing MIT translator first and ours later.
+3. **First platform: macOS** (decided 2026-09-28). Apple M1 through MoltenVK. It has
+   `VK_EXT_external_memory_host` (the "PC" pool path of N3 applies), extended dynamic state 1-3, dynamic rendering,
+   timeline semaphores, descriptor indexing and native ASTC/BC. It lacks geometry shaders, transform feedback,
+   logicOp and `vertex_input_dynamic_state`. Details in [nvn/WONDER.md](nvn/WONDER.md). Android follows.
+
+Progress is logged in [../PROGRESS.md](../PROGRESS.md).
