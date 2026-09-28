@@ -130,6 +130,19 @@ uint64_t guest_call(CPU& c, uint64_t fn, std::initializer_list<uint64_t> args) {
     return r;
 }
 
+float guest_call_f(CPU& c, uint64_t fn, std::initializer_list<uint64_t> args) {
+    uint64_t saved[31];
+    std::memcpy(saved, c.x, sizeof saved);
+    V128 v0 = c.v[0];
+    size_t k = 0;
+    for (uint64_t a : args) c.x[k++] = a;
+    call(c, fn);
+    float r = c.v[0].f32[0];
+    std::memcpy(c.x, saved, sizeof saved);
+    c.v[0] = v0;
+    return r;
+}
+
 uint64_t scratch(CPU&, size_t size) {
     thread_local uint64_t page = 0;
     if (!page) page = kernel_alloc(0x1000);

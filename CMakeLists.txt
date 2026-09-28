@@ -71,6 +71,8 @@ set(NX_RUNTIME_SOURCES
     runtime/src/nvn/nvn_cmd.cpp
     runtime/src/nvn/nvn_state.cpp
     runtime/src/nvn/nvn_format.cpp
+    runtime/src/nvn/nvn_enums.cpp
+    runtime/src/nvn/nvn_sampler.cpp
     runtime/src/nvn/nvn_vk.cpp
     runtime/src/vk_bridge.cpp
     runtime/src/vk_gen.cpp

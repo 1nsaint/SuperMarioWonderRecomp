@@ -30,6 +30,9 @@ uint64_t guest_call(CPU& c, uint64_t fn, std::initializer_list<uint64_t> args);
 // Guest memory for out-parameters of driver calls: up to 0x1000 bytes private to the calling thread.
 uint64_t scratch(CPU& c, size_t size);
 
+// Same, for a function returning a float (in s0).
+float guest_call_f(CPU& c, uint64_t fn, std::initializer_list<uint64_t> args);
+
 // Calls the SDK driver's `name` (a getter of a builder or state object).
 inline uint64_t driver(CPU& c, const char* name, std::initializer_list<uint64_t> args) {
     return guest_call(c, real_proc(c, name), args);
@@ -96,9 +99,34 @@ struct Window : Object {
     int active = 0, next = 0, interval = 1;
 };
 
+// ---- samplers and descriptor pools --------------------------------------------------------------------------------
+
+struct SamplerInfo {  // NVN enums (nvn_sampler.cpp)
+    uint32_t min_filter = 0, mag_filter = 0, wrap[3] = {}, compare_mode = 0, compare_func = 0, reduction = 0;
+    float lod_min = 0, lod_max = 1000, lod_bias = 0, max_anisotropy = 1, border[4] = {};
+};
+
+struct DescriptorPool : Object {  // an NVNtexturePool or NVNsamplerPool
+    uint64_t pool = 0, offset = 0;
+    uint32_t count = 0;
+    std::map<uint32_t, uint64_t> textures;     // id -> guest NVNtexture*
+    std::map<uint32_t, SamplerInfo> samplers;  // id -> sampler state
+};
+
 // NVNformat -> VkFormat, and whether it is color (0), depth (1), stencil (2) or both (3) (nvn_format.cpp).
 VkFormat vk_format(uint32_t format);
 uint32_t format_aspect(uint32_t format);
+
+// NVN enums -> Vulkan (nvn_enums.cpp).
+VkBlendFactor vk_blend_factor(uint32_t f);
+VkBlendOp vk_blend_op(uint32_t e);
+VkCompareOp vk_compare(uint32_t f);
+VkStencilOp vk_stencil_op(uint32_t op);
+VkCullModeFlags vk_cull(uint32_t face);
+VkPrimitiveTopology vk_topology(uint32_t mode);
+VkIndexType vk_index_type(uint32_t type);
+uint32_t index_size(uint32_t type);
+VkFormat vk_vertex_format(uint32_t format);
 
 // ---- recorded commands ----------------------------------------------------------------------------------------
 // A command buffer records into a list of these; nvnQueueSubmitCommands replays the lists into Vulkan. State

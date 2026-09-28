@@ -11,7 +11,11 @@
 //   DrawElementsBaseVertex(..., baseVertex)         DrawElementsInstanced(..., baseVertex, baseInstance, instances)
 //   DrawArraysInstanced(cmd, mode, first, count, baseInstance, instances)
 // Shader stages are numbered 0 vertex, 1 fragment (the pairs the game binds), 5 compute.
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <set>
+#include <string>
 #include <vector>
 
 #include "nvn.h"
@@ -19,6 +23,27 @@
 namespace nx::nvn {
 
 namespace {
+
+// NX_NVN_STATES=1: log each distinct decoded state once (to check the NVN enum values against what the game uses).
+template <typename T>
+void log_state(const char* what, const T& s) {
+    static const bool on = std::getenv("NX_NVN_STATES") != nullptr;
+    if (!on) return;
+    static std::mutex lock;
+    static std::set<std::string> seen;
+    std::string key(reinterpret_cast<const char*>(&s), sizeof s);
+    std::lock_guard lk(lock);
+    if (!seen.insert(key).second || seen.size() > 200) return;
+    std::string words;
+    for (size_t k = 0; k + 4 <= sizeof s; k += 4) {
+        uint32_t w;
+        std::memcpy(&w, reinterpret_cast<const uint8_t*>(&s) + k, 4);
+        char b[16];
+        std::snprintf(b, sizeof b, " %x", w);
+        words += b;
+    }
+    log("nvn state %s:%s", what, words.c_str());
+}
 
 // ---- shaders and resources --------------------------------------------------------------------------------------
 
@@ -89,6 +114,7 @@ void BindVertexAttribState(CPU& c) {
         v[k].offset = uint32_t(ld<uint64_t>(tmp + 8));
         v[k].stream = uint32_t(driver(c, "nvnVertexAttribStateGetStreamIndex", {state}));
     }
+    for (auto& a : v) log_state("attrib", a);
     Cmd cmd{Cmd::BindVertexAttribs};
     cmd.n = n;
     record(c.x[0], cmd, v.data(), v.size() * sizeof(VertexAttrib));
@@ -117,6 +143,7 @@ void BindBlendState(CPU& c) {
     driver(c, "nvnBlendStateGetBlendEquation", {state, tmp, tmp + 4});
     b.eq_rgb = ld<uint32_t>(tmp), b.eq_a = ld<uint32_t>(tmp + 4);
     Cmd cmd{Cmd::BindBlendState};
+    log_state("blend", b);
     record(c.x[0], cmd, &b, sizeof b);
 }
 
@@ -127,6 +154,7 @@ void BindColorState(CPU& c) {
     s.alpha_test = uint32_t(driver(c, "nvnColorStateGetAlphaTest", {state}));
     s.logic_op = uint32_t(driver(c, "nvnColorStateGetLogicOp", {state}));
     Cmd cmd{Cmd::BindColorState};
+    log_state("color", s);
     record(c.x[0], cmd, &s, sizeof s);
 }
 
@@ -156,6 +184,7 @@ void BindDepthStencilState(CPU& c) {
         s.depth_pass[face] = ld<uint32_t>(tmp + 8);
     }
     Cmd cmd{Cmd::BindDepthStencilState};
+    log_state("depth", s);
     record(c.x[0], cmd, &s, sizeof s);
 }
 
@@ -167,6 +196,7 @@ void BindPolygonState(CPU& c) {
     s.mode = uint32_t(driver(c, "nvnPolygonStateGetPolygonMode", {state}));
     s.offset_enables = uint32_t(driver(c, "nvnPolygonStateGetPolygonOffsetEnables", {state}));
     Cmd cmd{Cmd::BindPolygonState};
+    log_state("polygon", s);
     record(c.x[0], cmd, &s, sizeof s);
 }
 
@@ -215,6 +245,7 @@ void DrawElementsBaseVertex(CPU& c) { draw_elements(c, int32_t(c.x[5]), 0, 1); }
 void DrawElementsInstanced(CPU& c) { draw_elements(c, int32_t(c.x[5]), int32_t(c.x[6]), int32_t(c.x[7])); }
 
 void ignore(CPU&) {}
+
 
 }  // namespace
 

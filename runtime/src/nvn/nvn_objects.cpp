@@ -198,24 +198,6 @@ NX_TEXTURE_GETTER(TextureGetDepthStencilMode, depth_stencil_mode)
 
 // ---- samplers and descriptor pools ----------------------------------------------------------------------------
 
-struct Sampler : Object {
-    uint64_t builder_copy[16] = {};  // raw builder bytes, decoded when the Vulkan sampler is made
-};
-
-void SamplerInitialize(CPU& c) {  // NVNboolean (NVNsampler*, const NVNsamplerBuilder*)
-    auto& s = make<Sampler>(c.x[0]);
-    std::memcpy(s.builder_copy, reinterpret_cast<const void*>(c.x[1]), sizeof s.builder_copy);
-    c.x[0] = 1;
-}
-
-void SamplerFinalize(CPU& c) { destroy(c.x[0]); }
-
-struct DescriptorPool : Object {
-    uint64_t pool = 0, offset = 0;
-    uint32_t count = 0;
-    std::map<uint32_t, uint64_t> entries;  // id -> guest texture / sampler (views: later)
-};
-
 // NVNboolean nvn{Texture,Sampler}PoolInitialize(pool, const NVNmemoryPool*, ptrdiff_t offset, int numDescriptors)
 void DescriptorPoolInitialize(CPU& c) {
     auto& d = make<DescriptorPool>(c.x[0]);
@@ -227,12 +209,11 @@ void DescriptorPoolInitialize(CPU& c) {
 
 void DescriptorPoolFinalize(CPU& c) { destroy(c.x[0]); }
 
-// nvnSamplerPoolRegisterSampler(pool, int id, const NVNsampler*); nvnTexturePoolRegisterTexture(pool, int id,
-// const NVNtexture*, const NVNtextureView*)
-void DescriptorPoolRegister(CPU& c) {
+// nvnTexturePoolRegisterTexture / RegisterImage(pool, int id, const NVNtexture*, const NVNtextureView*)
+void TexturePoolRegister(CPU& c) {
     if (auto* d = get<DescriptorPool>(c.x[0])) {
         std::lock_guard lk(objects_lock());
-        d->entries[uint32_t(c.x[1])] = c.x[2];
+        d->textures[uint32_t(c.x[1])] = c.x[2];
     }
 }
 
@@ -291,16 +272,12 @@ NX_HLE("nvnTextureGetMemoryPool", TextureGetMemoryPool);
 NX_HLE("nvnTextureGetMemoryOffset", TextureGetMemoryOffset);
 NX_HLE("nvnTextureGetStorageSize", TextureGetStorageSize);
 NX_HLE("nvnTextureGetDepthStencilMode", TextureGetDepthStencilMode);
-NX_HLE("nvnSamplerInitialize", SamplerInitialize);
-NX_HLE("nvnSamplerFinalize", SamplerFinalize);
 NX_HLE("nvnSamplerPoolInitialize", DescriptorPoolInitialize);
 NX_HLE("nvnTexturePoolInitialize", DescriptorPoolInitialize);
 NX_HLE("nvnSamplerPoolFinalize", DescriptorPoolFinalize);
 NX_HLE("nvnTexturePoolFinalize", DescriptorPoolFinalize);
-NX_HLE("nvnSamplerPoolRegisterSampler", DescriptorPoolRegister);
-NX_HLE("nvnSamplerPoolRegisterSamplerBuilder", DescriptorPoolRegister);
-NX_HLE("nvnTexturePoolRegisterTexture", DescriptorPoolRegister);
-NX_HLE("nvnTexturePoolRegisterImage", DescriptorPoolRegister);
+NX_HLE("nvnTexturePoolRegisterTexture", TexturePoolRegister);
+NX_HLE("nvnTexturePoolRegisterImage", TexturePoolRegister);
 NX_HLE("nvnSamplerPoolGetMemoryPool", DescriptorPoolGetMemoryPool);
 NX_HLE("nvnTexturePoolGetMemoryPool", DescriptorPoolGetMemoryPool);
 NX_HLE("nvnSamplerPoolGetMemoryOffset", DescriptorPoolGetMemoryOffset);
