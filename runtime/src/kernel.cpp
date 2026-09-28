@@ -474,7 +474,7 @@ void svc(CPU& c, uint32_t imm, uint64_t pc) {
             if (ns <= 0)
                 plat::yield();
             else
-                std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
+                plat::sleep_ns(ns);
             return;
         }
         case 0x0C: {  // GetThreadPriority(handle) -> prio

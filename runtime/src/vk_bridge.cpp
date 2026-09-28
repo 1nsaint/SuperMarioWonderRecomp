@@ -119,11 +119,19 @@ void w_vkEnumerateInstanceLayerProperties(CPU& c) {
 void w_vkCreateInstance(CPU& c) {  // (const VkInstanceCreateInfo*, alloc, VkInstance*)
     load_loader();
     VkInstanceCreateInfo ci = *reinterpret_cast<const VkInstanceCreateInfo*>(c.x[0]);
+    uint32_t nhave = 0;
+    host_enum_inst_ext(nullptr, &nhave, nullptr);
+    std::vector<VkExtensionProperties> have(nhave);
+    host_enum_inst_ext(nullptr, &nhave, have.data());
+    auto host_has = [&](const char* e) {
+        return std::any_of(have.begin(), have.end(), [&](const VkExtensionProperties& h) { return std::strcmp(h.extensionName, e) == 0; });
+    };
     std::vector<const char*> exts;
     for (uint32_t k = 0; k < ci.enabledExtensionCount; k++) {
         const char* e = ci.ppEnabledExtensionNames[k];
-        log("vkCreateInstance: game wants %s", e);
-        if (std::strcmp(e, VK_NN_VI_SURFACE_EXTENSION_NAME) != 0) exts.push_back(e);
+        bool ok = std::strcmp(e, VK_NN_VI_SURFACE_EXTENSION_NAME) != 0 && host_has(e);
+        log("vkCreateInstance: game wants %s%s", e, ok ? "" : " (not on this host, dropped)");
+        if (ok) exts.push_back(e);
     }
     auto add = [&](const char* e) {
         if (std::none_of(exts.begin(), exts.end(), [&](const char* x) { return std::strcmp(x, e) == 0; })) exts.push_back(e);
@@ -280,7 +288,29 @@ void w_vkGetDeviceQueue(CPU& c) {  // (device, family, index, VkQueue*)
 
 void w_vkCreateSwapchainKHR(CPU& c) {  // (device, const VkSwapchainCreateInfoKHR*, alloc, VkSwapchainKHR*)
     VkSwapchainCreateInfoKHR ci = *reinterpret_cast<const VkSwapchainCreateInfoKHR*>(c.x[1]);
-    ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;  // for screenshots
+    // What the Switch driver accepts is not what every host surface supports (Android/Adreno especially): keep
+    // the game's choices where the surface allows them, otherwise fall back to what it does.
+    if (g_physical) {
+        VkSurfaceCapabilitiesKHR caps{};
+        p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_physical, ci.surface, &caps);
+        if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+            ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;  // for screenshots
+        if (!(caps.supportedCompositeAlpha & ci.compositeAlpha))
+            for (VkCompositeAlphaFlagBitsKHR a : {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+                                                   VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR})
+                if (caps.supportedCompositeAlpha & a) {
+                    ci.compositeAlpha = a;
+                    break;
+                }
+        if (!(caps.supportedTransforms & ci.preTransform)) ci.preTransform = caps.currentTransform;
+        ci.minImageCount = std::max(ci.minImageCount, caps.minImageCount);
+        if (caps.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
+        uint32_t nm = 0;
+        p_vkGetPhysicalDeviceSurfacePresentModesKHR(g_physical, ci.surface, &nm, nullptr);
+        std::vector<VkPresentModeKHR> modes(nm);
+        p_vkGetPhysicalDeviceSurfacePresentModesKHR(g_physical, ci.surface, &nm, modes.data());
+        if (std::find(modes.begin(), modes.end(), ci.presentMode) == modes.end()) ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    }
     VkSwapchainKHR sc = VK_NULL_HANDLE;
     VkResult r = p_vkCreateSwapchainKHR(arg<VkDevice>(c.x[0]), &ci, nullptr, &sc);
     log("vkCreateSwapchainKHR %ux%u format %d, %u images, present mode %d -> %d", ci.imageExtent.width,
