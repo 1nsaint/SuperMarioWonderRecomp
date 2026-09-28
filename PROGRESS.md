@@ -12,8 +12,9 @@ NVN implemented over Vulkan (MoltenVK).
 | Phase | Issue | State |
 |---|---|---|
 | N0 shared core, per-game layout, probe | #7 | done for this track (Windows/Hades items left, not needed here) |
-| N1 CPU side: recompile, boot to `nvnBootstrapLoader` | #8 | **in progress**: recompiler complete for Wonder; runtime on macOS next |
-| N2 NVN reconnaissance (tracer, API.md) | #9 | not started |
+| N1 CPU side: recompile, boot to `nvnBootstrapLoader` | #8 | **done**: the game runs its frame loop on macOS (2,000+ frames, no crash) |
+| N2 NVN reconnaissance (tracer, API.md) | #9 | **mostly done**: tracer, driver addresses of all 534 procs, device info, signatures of the procs in use; API.md to write |
+| N3 (CPU side) | #10 | pools/GPU addresses, buffers, textures, samplers, programs, queues, windows, syncs on the CPU side; Vulkan next |
 | N3 device, pools, sync, window (first pixel) | #10 | not started |
 | N4 textures and samplers | #11 | not started |
 | N5 Maxwell shaders → SPIR-V | #12 | not started (shader inventory done) |
@@ -22,6 +23,72 @@ NVN implemented over Vulkan (MoltenVK).
 | NA AudioRenderer (`audren:u`) | — (new) | not started; the game can boot silent |
 
 ## Log
+
+### 2026-09-28 (night): the frame loop runs (7c9aa0c)
+
+Wonder boots on the Mac through every system and presents frames (`nvnQueuePresentTexture` #1..#32+, nothing on
+screen yet: the Vulkan side is next). What it took, in boot order:
+- **nn::init::Start** has an extra rtld callback in SDK 16; **VAMM** (nn::os virtual address memory) needs
+  `svcGetInfo(SystemResourceSizeTotal)` = main.npdm's 16 MiB; `nn::vi::GetDisplayVsyncEvent` (60 Hz event).
+- **NVN device info**: the 99 `nvnDeviceGetInteger` values read out of the SDK's own driver (jump tables at
+  sdk+451090 / sdk+440c80); the game requires API 55.15.
+- **Builders and state objects run in the SDK's own NVN driver** (recompiled), so their struct layout is exact;
+  our objects read them back through its getters. Its texture storage size needs the GPU driver, so block-linear
+  sizes are ours, from the driver's format table (sdk+d34198: block size and bytes per block per NVNformat).
+- **nn::hid** SDK 16 calls, **nn::pl** shared fonts (the firmware's fonts need master_key_16, not in our keys: any
+  TrueType font works because the game accepts already-decoded BFTTF data; the Mac's Arial Unicode for now).
+- **Programs**: `NVNshaderDataExt` = {code GPU address, control section pointer, 0} (0x18 bytes).
+- **Audio without writing a renderer**: the sdk carries the AudioRenderer server; `CreateAudioRendererManagerByHipc`
+  is redirected to `...ByDfc` (in process), the renderer maps its work buffer with svcMapTransferMemory (added),
+  a guest thread of ours calls `AudioRendererImpl::ExecuteAudioRendererRendering` every 5 ms (the sdk's DSP command
+  processor mixes on the CPU) and signals the game's renderer event (its handle was 0 in process). Output to the
+  Mac's speakers: next.
+- **TLS**: main has 16 bytes of `.tdata` ({-1, 0}) that must start every thread's static TLS (an allocator's
+  owner id); found through the module layout DT_INIT passes to `__nnmusl_init_dso` (slots 13/14).
+- **The frame deadlock**: `svcSetThreadCoreMask` was ignored, so every worker reported core 0 and the per-core job
+  queues of cores 1 and 2 were never drained. Found with `NX_TRACE_ADDR` (logs waits/signals on one address).
+- Then (4041ae5): `acc:u0` ListQualifiedUsers (the null pointer was an empty user list); **svcExitThread kept the
+  kernel lock** (a lock_guard across pthread_exit, which runs no destructors on macOS: everything froze at frame
+  ~50); **16 KiB host pages** (decommitting one 4 KiB guest page protected its neighbours: SIGBUS).
+- **Result: 90 s, 2,048+ frames presented, no crash.** The CPU side of the game runs: boot, save mount, audio frames,
+  the whole frame loop with clears, depth/stencil, conditional rendering, storage buffers. Next: pixels (N3-N6).
+
+### 2026-09-28 (evening): runtime on macOS, TIPC, NVN tracer
+
+- **Recompiler: 0 unhandled instructions** in both modules after the last additions (LSE atomics, `rshrn`,
+  `sadalp`, `ld3r`, `xpaclri`, fused `frsqrts`/`frecps`). Committed (b50bfe8). The SDK 16 handlers moved to
+  `recomp/emit_ext.py`, structured loads/stores to `recomp/emit_vldst.py` (output byte-identical).
+- **`runtime/src/platform_mac.cpp`**: mmap reservations (no MAP_FIXED_NOREPLACE on Darwin: hint + check), pthreads,
+  SDL3 window with a Metal view (Cocoa needs the main thread: the game runs on its own 64 MiB-stack thread, window
+  work is queued to the main loop), `VK_EXT_metal_surface` from the CAMetalLayer, SDL3 gamepad + keyboard sampled
+  on the main thread, SDL3 audio stream fed from the submitted buffers, signal crash handler.
+- **CMake macOS branch** (`-DNX_GAME=wonder`, SDL3 + Homebrew Vulkan headers/loader). The whole shared runtime
+  compiled on macOS with no source changes. `sdk` (140 MB of C++) builds in 69 s with `-j6`.
+- **`games/wonder/game.cpp`**; module images via `tools/nso2bin.py`; `private/wonder/extract/romfs` links to the
+  RomFS.
+- **TIPC** in `ipc.cpp`: SDK 12+ talks to `sm:` with TIPC (command = message type - 16, no SFCI/SFCO, result
+  first in the response). CMIF unchanged.
+- **Boot**: DT_INIT's init-status load is found by following `adrp` targets (SDK 16 interleaves another `adrp`;
+  the old fixed-offset decode would have read garbage).
+- **N2 started**: `runtime/src/nvn/nvn_trace.cpp` HLEs `nvnBootstrapLoader` and `nvnDeviceGetProcAddress`; every
+  proc we do not implement gets a tracing thunk (arguments, caller) writing `private/wonder/nvn_trace.txt`.
+  `hle_address_or()` makes thunks at run time (the thunk table no longer reallocates while other threads call).
+- **Shaders (N5 recon, done, ac772e3):** `tools/maxwell/containers.py` parses SARC / FSHA / BNSH / VFXB / agl BAHS.
+  Wonder has **47,797 stages** (23,752 vertex, 23,752 pixel, 293 compute, **no geometry or tessellation**, good
+  news for MoltenVK) and **12,717 distinct Maxwell code blocks (55 MB)**. The NVN control section layout (program
+  offset/size, constants, sampler slots, compute work-group size) is in `docs/nvn/SHADERS.md`. Ui2d layouts even
+  ship 66 `.glsl` sources, useful as a reference.
+- **Next shader step (in progress, parallel):** evaluating Ryujinx's MIT shader translator offline on those blocks
+  (a .NET harness, SPIR-V validated with `spirv-val`), to decide plan decision 2.
+- **First boot attempt:** `cannot reserve modules at 0x40_0000_0000`. macOS on Apple silicon refuses fixed
+  mappings in `0x10_0000_0000..0x6F_FFFF_FFFF`, and the dyld shared cache (system frameworks, pulled in by SDL3)
+  sits at `0x1_8000_0000..~0x3_0000_0000`. The macOS guest layout now starts at `0x3_0000_0000` (still inside
+  Horizon's 39 bits); `NX_BASE` is per host and generated code uses `NX_BASE + offset`, so one generated tree
+  serves every platform (docs/RUNTIME.md).
+- **nn::fs:** 5 SDK 16 functions added (MountRom without cache, ReadFile with ReadOption, SetFileSize,
+  IsSaveDataExisting, DeleteDirectoryRecursively).
+- **Audio finding:** the SDK 16 `sdk` carries the AudioRenderer *server* too, reachable in process through
+  `CreateAudioRendererManagerByDfc`: phase NA may mostly come for free.
 
 ### 2026-09-28
 
@@ -65,9 +132,10 @@ layouts (`Layout/*.blarc`).
 
 ## Next
 
-1. Commit the recompiler work (branch `feat/nvn-n1-wonder-cpu`, stacked on `feat/nvn-n0-core-split`).
-2. `runtime/src/platform_mac.cpp` (SDL3 window/input/audio, MoltenVK surface), CMake for macOS.
-3. `games/wonder/game.cpp`, module images (`tools/nso2bin.py`), build `main` + `sdk` + runtime on the Mac.
-4. Boot: TIPC `sm:`, new SVCs and IPC commands of SDK 16, offline stubs for friends/NEX/bcat/prepo, until the
-   first `nvnBootstrapLoader` call.
-5. N2: HLE `nvnBootstrapLoader` / `nvnDeviceGetProcAddress` with a logging thunk per proc.
+1. Link `wonder` on macOS (`game_main` is ~630 MB of C++, ~15 min on the M1 with `-j6`) and run the first boot.
+2. Fix what SDK 16 breaks on the way to `nvnBootstrapLoader` (services, SVCs, TLS layout, offline stubs for
+   friends/NEX/bcat/prepo).
+3. N2 trace up to the first present; `docs/nvn/API.md` from the trace.
+4. N3: device, queue, memory pools (`VK_EXT_external_memory_host`), window: a clear colour through NVN.
+
+Branch: `feat/nvn-n1-wonder-cpu`, stacked on `feat/nvn-n0-core-split`.
