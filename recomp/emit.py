@@ -11,7 +11,7 @@ import struct
 import capstone
 from capstone import arm64_const as A
 
-B = "NX_BASE"
+B = "NXB"
 
 CC = {
     A.ARM64_CC_EQ: "c.zf", A.ARM64_CC_NE: "!c.zf", A.ARM64_CC_HS: "c.cf", A.ARM64_CC_LO: "!c.cf",
@@ -109,12 +109,13 @@ class Reg:
 
 
 class Emitter:
-    def __init__(self, an):
+    def __init__(self, an, prefix="sub"):
         self.an = an
         self.m = an.module
         self.cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
         self.cs.detail = True
         self.entries = {f.start for f in an.functions}
+        self.prefix = prefix
         self.unhandled = collections.Counter()
         self.handled = 0
 
@@ -124,7 +125,7 @@ class Emitter:
         return Reg(i.reg_name(o.reg))
 
     def fn(self, addr):
-        return f"sub_{addr:08X}"
+        return f"{self.prefix}_{addr:08X}"
 
     def shifted(self, i, o, bits):
         """Value of a register/immediate second operand with shift or extend applied, as uint{bits}."""
@@ -304,6 +305,58 @@ class Emitter:
     i_prfm = i_nop
     i_prfum = i_nop
     i_yield = i_nop
+
+    i_wfe = i_nop
+    i_wfi = i_nop
+    i_sev = i_nop
+    i_sevl = i_nop
+    def i_dc(self, f, i, ops):
+        if "zva" in i.op_str:  # zero a 64-byte block (DCZID_EL0 reports 64)
+            r = Reg(i.op_str.split(",")[1].strip())
+            return f"std::memset(reinterpret_cast<void*>(c.x[{r.n}] & ~63ull), 0, 64);"
+        return ";"  # cache maintenance
+
+    i_ic = i_nop
+    i_autia1716 = i_nop
+    i_autib1716 = i_nop
+    i_pacia1716 = i_nop
+    i_pacib1716 = i_nop
+
+    def crc(self, i, ops, poly, size):
+        d, n, m = (self.regop(i, o) for o in ops[:3])
+        return d.w(f"nx::crc32<{size}>({n.r()}, {m.r()}, {poly:#x}u)")
+
+    def i_crc32b(self, f, i, ops):
+        return self.crc(i, ops, 0xEDB88320, 1)
+
+    def i_crc32h(self, f, i, ops):
+        return self.crc(i, ops, 0xEDB88320, 2)
+
+    def i_crc32w(self, f, i, ops):
+        return self.crc(i, ops, 0xEDB88320, 4)
+
+    def i_crc32x(self, f, i, ops):
+        return self.crc(i, ops, 0xEDB88320, 8)
+
+    def i_crc32cb(self, f, i, ops):
+        return self.crc(i, ops, 0x82F63B78, 1)
+
+    def i_crc32ch(self, f, i, ops):
+        return self.crc(i, ops, 0x82F63B78, 2)
+
+    def i_crc32cw(self, f, i, ops):
+        return self.crc(i, ops, 0x82F63B78, 4)
+
+    def i_crc32cx(self, f, i, ops):
+        return self.crc(i, ops, 0x82F63B78, 8)
+
+    def i_ngc(self, f, i, ops):
+        d = self.regop(i, ops[0])
+        return d.w(f"{u(d.bits)}({u(d.bits)}(~{self.regop(i, ops[1]).r()}) + c.cf)")
+
+    def i_ngcs(self, f, i, ops):
+        d = self.regop(i, ops[0])
+        return d.w(f"nx::adds{d.bits}(c, 0, {u(d.bits)}(~{self.regop(i, ops[1]).r()}), c.cf)")
 
     def i_dmb(self, f, i, ops):
         return "nx::barrier();"
@@ -1629,6 +1682,50 @@ class Emitter:
 
     i_shrn2 = i_shrn
 
+    def i_sqshrn(self, f, i, ops):
+        return self.narrow(i, ops, "nx::sat<int{dbits}_t>({a} >> {n})", src_kind="s", dst_kind="s")
+
+    i_sqshrn2 = i_sqshrn
+
+    def i_sqrshrn(self, f, i, ops):
+        return self.narrow(i, ops, "nx::sat<int{dbits}_t>(({a} + (int64_t(1) << ({n} - 1))) >> {n})",
+                           src_kind="s", dst_kind="s")
+
+    i_sqrshrn2 = i_sqrshrn
+
+    def i_sqadd(self, f, i, ops):
+        bits = self.vinfo(ops[0])[0]
+        return self.v_bin(i, ops, f"nx::sat<int{bits}_t>(int64_t(a) + int64_t(b))", signed=True)
+
+    def i_sqsub(self, f, i, ops):
+        bits = self.vinfo(ops[0])[0]
+        return self.v_bin(i, ops, f"nx::sat<int{bits}_t>(int64_t(a) - int64_t(b))", signed=True)
+
+    def i_uqadd(self, f, i, ops):
+        bits = self.vinfo(ops[0])[0]
+        return self.v_bin(i, ops, f"(uint64_t(a) + uint64_t(b)) > uint{bits}_t(~0ull) ? uint{bits}_t(~0ull) : a + b")
+
+    def i_uqsub(self, f, i, ops):
+        return self.v_bin(i, ops, "a > b ? a - b : 0")
+
+    def i_uaddlv(self, f, i, ops):
+        d, a = self.regop(i, ops[0]), self.regop(i, ops[1])
+        bits, n = self.vinfo(ops[1])
+        return (f"{{ uint64_t s_ = 0; for (int k = 0; k < {n}; k++) s_ += c.v[{a.n}].u{bits}[k]; "
+                f"nx::V128 r = nx::vzero(); r.u{bits * 2}[0] = uint{bits * 2}_t(s_); c.v[{d.n}] = r; }}")
+
+    def i_smaxv(self, f, i, ops):
+        d, a = self.regop(i, ops[0]), self.regop(i, ops[1])
+        bits, n = self.vinfo(ops[1])
+        return (f"{{ int{bits}_t s_ = c.v[{a.n}].s{bits}[0]; for (int k = 1; k < {n}; k++) s_ = c.v[{a.n}].s{bits}[k] > s_ ? c.v[{a.n}].s{bits}[k] : s_; "
+                f"nx::V128 r = nx::vzero(); r.s{bits}[0] = s_; c.v[{d.n}] = r; }}")
+
+    def i_frsqrts(self, f, i, ops):
+        return self.fbin(i, ops, "nx::frsqrts(a, b)")
+
+    def i_frecps(self, f, i, ops):
+        return self.fbin(i, ops, "2.0f - a * b")
+
     def i_sqxtun(self, f, i, ops):
         return self.narrow(i, ops, "nx::sat<uint{dbits}_t>({a})", src_kind="s")
 
@@ -1816,8 +1913,9 @@ class Emitter:
             a = f"c.x[{Reg(i.reg_name(mem.mem.base)).n}]"
         parts = [f"uint64_t a = {a};"]
         esz = bits // 8
-        if o0.vector_index != -1:  # single lane
-            lane = o0.vector_index
+        lane_m = re.search(r"\}\[(\d+)\]", i.op_str)  # capstone omits the lane index on multi-register lists
+        if o0.vector_index != -1 or lane_m:  # single lane
+            lane = o0.vector_index if o0.vector_index != -1 else int(lane_m.group(1))
             for k, r in enumerate(rs):
                 if store:
                     parts.append(f"nx::st<uint{bits}_t>(a + {k * esz}, c.v[{r.n}].u{bits}[{lane}]);")

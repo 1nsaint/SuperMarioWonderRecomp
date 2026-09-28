@@ -128,6 +128,7 @@ def make_state(rng, i, tid):
 
 RUNNER_HEAD = r"""
 #include <nx/cpu.h>
+#define NXB 0x4000000000ull
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>

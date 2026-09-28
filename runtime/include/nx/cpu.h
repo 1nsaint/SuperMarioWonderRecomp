@@ -167,6 +167,16 @@ inline uint16_t bswap(uint16_t v) { return __builtin_bswap16(v); }
 inline uint32_t bswap(uint32_t v) { return __builtin_bswap32(v); }
 inline uint64_t bswap(uint64_t v) { return __builtin_bswap64(v); }
 
+// CRC32 / CRC32C (reflected polynomials), `size` bytes of `data` into `acc`.
+template <int size>
+inline uint32_t crc32(uint32_t acc, uint64_t data, uint32_t poly) {
+    for (int k = 0; k < size * 8; k++) {
+        uint32_t bit = (acc ^ uint32_t(data >> k)) & 1;
+        acc = (acc >> 1) ^ (bit ? poly : 0);
+    }
+    return acc;
+}
+
 inline uint64_t ror64(uint64_t v, unsigned s) { return std::rotr(v, int(s & 63)); }
 inline uint32_t ror32(uint32_t v, unsigned s) { return std::rotr(v, int(s & 31)); }
 inline uint64_t asr64(uint64_t v, unsigned s) { return uint64_t(int64_t(v) >> (s & 63)); }
@@ -316,6 +326,13 @@ inline F fmin_(F a, F b) {
     if (std::isnan(a) || std::isnan(b)) return a + b;
     if (a == 0 && b == 0) return std::signbit(a) ? a : b;
     return a < b ? a : b;
+}
+
+// FRSQRTS/FRECPS: (0 * inf) gives the exact step result instead of NaN.
+template <typename F>
+inline F frsqrts(F a, F b) {
+    if ((std::isinf(a) && b == 0) || (a == 0 && std::isinf(b))) return F(1.5);
+    return (F(3) - a * b) / F(2);
 }
 
 // ---- vector helpers -----------------------------------------------------------------------------------------

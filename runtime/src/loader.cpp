@@ -1,0 +1,235 @@
+// Module loader and dynamic linker (what rtld does on Horizon), indirect-call dispatch and HLE thunks.
+#include <algorithm>
+#include <cstdarg>
+#include <cstdio>
+#include <fstream>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <windows.h>
+
+#include <nx/runtime.h>
+
+namespace nx {
+
+bool g_trace = false;
+
+namespace {
+
+std::mutex g_log_lock;
+FILE* g_log_file = nullptr;
+
+std::vector<LoadedModule> g_modules;
+std::unordered_map<std::string, uint64_t> g_exports;
+
+struct Thunk {
+    std::string name;
+    HleFn fn;
+};
+std::vector<Thunk> g_thunks;
+std::unordered_map<std::string, uint64_t> g_thunk_by_name;
+
+std::unordered_map<std::string, HleFn>& registry() {
+    static std::unordered_map<std::string, HleFn> r;
+    return r;
+}
+
+thread_local const char* t_missing_name = nullptr;
+
+}  // namespace
+
+// ---- logging --------------------------------------------------------------------------------------------------
+
+void log(const char* fmt, ...) {
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    std::lock_guard lk(g_log_lock);
+    if (!g_log_file) g_log_file = std::fopen("nx.log", "w");
+    std::fprintf(stderr, "%s\n", buf);
+    if (g_log_file) {
+        std::fprintf(g_log_file, "%s\n", buf);
+        std::fflush(g_log_file);
+    }
+}
+
+void fatal(const char* fmt, ...) {
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    log("FATAL: %s", buf);
+    std::fflush(stderr);
+    ExitProcess(1);
+}
+
+// ---- HLE registry ---------------------------------------------------------------------------------------------
+
+HleRegistrar::HleRegistrar(const char* name, HleFn fn) { registry()[name] = fn; }
+
+HleFn hle_lookup(const char* name) {
+    auto it = registry().find(name);
+    return it == registry().end() ? nullptr : it->second;
+}
+
+static void missing_stub(CPU& c) {
+    // Name comes from the thunk that dispatched here.
+    log("missing import called: %s (lr %s) -> 0", t_missing_name, describe(c.x[30]).c_str());
+    c.x[0] = 0;
+}
+
+uint64_t hle_address(const char* name) {
+    auto it = g_thunk_by_name.find(name);
+    if (it != g_thunk_by_name.end()) return it->second;
+    HleFn fn = hle_lookup(name);
+    uint64_t addr = kThunkBase + g_thunks.size() * 16;
+    g_thunks.push_back({name, fn ? fn : missing_stub});
+    g_thunk_by_name[name] = addr;
+    return addr;
+}
+
+// ---- dispatch -------------------------------------------------------------------------------------------------
+
+const LoadedModule* module_at(uint64_t addr) {
+    for (auto& m : g_modules)
+        if (addr - m.base < m.size) return &m;
+    return nullptr;
+}
+
+std::string describe(uint64_t addr) {
+    char buf[512];
+    if (addr - kThunkBase < kThunkSize) {
+        size_t i = (addr - kThunkBase) / 16;
+        snprintf(buf, sizeof buf, "hle:%s", i < g_thunks.size() ? g_thunks[i].name.c_str() : "?");
+        return buf;
+    }
+    const LoadedModule* m = module_at(addr);
+    if (!m) {
+        snprintf(buf, sizeof buf, "%llx", (unsigned long long)addr);
+        return buf;
+    }
+    uint64_t off = addr - m->base;
+    // Nearest preceding function symbol.
+    const Symbol* best = nullptr;
+    for (size_t k = 0; k < m->info->symbol_count; k++) {
+        const Symbol& s = m->info->symbols[k];
+        if (s.imported || s.type != 2 || s.value > off) continue;
+        if (!best || s.value > best->value) best = &s;
+    }
+    if (best && off - best->value < 0x10000)
+        snprintf(buf, sizeof buf, "%s+%llx (%s+%llx)", m->info->name, (unsigned long long)off, best->name,
+                 (unsigned long long)(off - best->value));
+    else
+        snprintf(buf, sizeof buf, "%s+%llx", m->info->name, (unsigned long long)off);
+    return buf;
+}
+
+void call(CPU& c, uint64_t t) {
+    for (auto& m : g_modules) {
+        uint64_t off = t - m.base;
+        if (off < m.info->text_size) {
+            Fn fn = m.table[off >> 2];
+            if (!fn) fatal("call into the middle of a function: %s (lr %s)", describe(t).c_str(), describe(c.x[30]).c_str());
+            fn(c);
+            return;
+        }
+    }
+    uint64_t off = t - kThunkBase;
+    if (off < kThunkSize && off / 16 < g_thunks.size()) {
+        const Thunk& th = g_thunks[off / 16];
+        if (g_trace) log("hle %s", th.name.c_str());
+        const char* prev = t_missing_name;
+        t_missing_name = th.name.c_str();
+        th.fn(c);
+        t_missing_name = prev;
+        return;
+    }
+    fatal("call to %llx (%s), lr %s", (unsigned long long)t, describe(t).c_str(), describe(c.x[30]).c_str());
+}
+
+[[noreturn]] void unimpl(CPU& c, uint64_t pc, const char* what) {
+    fatal("unimplemented instruction at %s: %s (lr %s)", describe(pc).c_str(), what, describe(c.x[30]).c_str());
+}
+
+// ---- loading and linking --------------------------------------------------------------------------------------
+
+uint64_t find_symbol(const char* name) {
+    auto it = g_exports.find(name);
+    return it == g_exports.end() ? 0 : it->second;
+}
+
+void load_modules(const ModuleInfo* const* mods, size_t count, const std::string& data_dir) {
+    // Map every module first so symbols of all of them are known before relocating.
+    for (size_t i = 0; i < count; i++) {
+        const ModuleInfo* mi = mods[i];
+        uint64_t image = mi->data + mi->data_size;
+        uint64_t size = ((mi->bss + mi->bss_size) + 0xFFF) & ~0xFFFull;
+        if (!commit(mi->base, size)) fatal("cannot commit module %s", mi->name);
+        std::string path = data_dir + "/" + mi->name + ".bin";
+        std::ifstream f(path, std::ios::binary);
+        if (!f) fatal("missing %s (run tools/nso2bin.py)", path.c_str());
+        f.read(reinterpret_cast<char*>(mi->base), std::streamsize(image));
+        if (uint64_t(f.gcount()) != image) fatal("%s: expected %llx bytes", path.c_str(), (unsigned long long)image);
+        vm_set(mi->base + mi->text, mi->text_size, kMemCode, 5);
+        vm_set(mi->base + mi->ro, mi->ro_size, kMemCode, 1);
+        vm_set(mi->base + mi->data, size - mi->data, kMemCodeData, 3);
+
+        LoadedModule lm{mi, mi->base, size, new Fn[mi->text_size / 4]()};
+        for (size_t k = 0; k < mi->func_count; k++) lm.table[mi->funcs[k].offset / 4] = mi->funcs[k].fn;
+        g_modules.push_back(lm);
+
+        for (size_t k = 0; k < mi->symbol_count; k++) {
+            const Symbol& s = mi->symbols[k];
+            if (s.imported || !s.name[0] || s.bind == 0) continue;  // skip locals
+            auto it = g_exports.find(s.name);
+            if (it == g_exports.end() || s.bind == 1)  // global beats weak; first global wins
+                if (it == g_exports.end()) g_exports[s.name] = mi->base + s.value;
+        }
+        log("loaded %s at %llx (%llu functions, %llu relocs)", mi->name, (unsigned long long)mi->base,
+            (unsigned long long)mi->func_count, (unsigned long long)mi->reloc_count);
+    }
+
+    size_t hle = 0, missing = 0, linked = 0;
+    for (auto& lm : g_modules) {
+        const ModuleInfo* mi = lm.info;
+        for (size_t k = 0; k < mi->reloc_count; k++) {
+            const Reloc& r = mi->relocs[k];
+            uint64_t* slot = reinterpret_cast<uint64_t*>(lm.base + r.offset);
+            if (r.type == R_AARCH64_RELATIVE) {
+                *slot = lm.base + uint64_t(r.addend);
+                continue;
+            }
+            if (r.type != R_AARCH64_GLOB_DAT && r.type != R_AARCH64_JUMP_SLOT && r.type != R_AARCH64_ABS64) {
+                log("%s: relocation type %u at %llx not handled", mi->name, r.type, (unsigned long long)r.offset);
+                continue;
+            }
+            const Symbol& s = mi->symbols[r.sym];
+            uint64_t target = 0;
+            if (s.type == 2 || s.imported) {
+                if (hle_lookup(s.name)) {
+                    target = hle_address(s.name);
+                    hle++;
+                }
+            }
+            if (!target) {
+                target = find_symbol(s.name);
+                if (target) linked++;
+            }
+            if (!target && !s.imported) target = lm.base + s.value;
+            if (!target) {
+                // Unresolved: functions get a logging stub; data stays null.
+                if (s.type == 2 || s.type == 0) target = hle_address(s.name);
+                missing++;
+            }
+            *slot = target + uint64_t(r.addend);
+        }
+    }
+    log("linked: %zu to HLE, %zu across modules, %zu unresolved", hle, linked, missing);
+}
+
+}  // namespace nx

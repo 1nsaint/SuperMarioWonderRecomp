@@ -1,16 +1,14 @@
 """Recompile an NSO module to C++.
 
-Usage: python -m recomp <module.nso> <out dir> [--only 0xADDR ...]
+Usage: python -m recomp <module.nso> <out dir> --name main --base 0x4000000000 [--only 0xADDR ...]
 
-Writes:
-  funcs.h         declarations of every recompiled function
-  table.cpp       guest offset -> host function table
-  imports.cpp     GOT slot -> import name table (resolved by the runtime)
+Writes (all symbols are prefixed with the module name, so several modules link into one program):
+  funcs.h         NXB (the module's load address) and declarations of every recompiled function
+  table.cpp       nx::ModuleInfo: guest offset -> function, relocations, symbols, init arrays, segments
   code_NNN.cpp    the functions, split into translation units
   report.txt      coverage: unhandled instructions, unresolved indirect branches
 """
 import argparse
-import collections
 import os
 import time
 
@@ -19,27 +17,35 @@ from . import analysis, emit, nso
 INSNS_PER_FILE = 12000
 
 
+def cstr(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("nso")
     ap.add_argument("out")
+    ap.add_argument("--name", default="main")
+    ap.add_argument("--base", default="0x4000000000")
     ap.add_argument("--only", nargs="*", default=None, help="only these function addresses (debug)")
     args = ap.parse_args()
+    base = int(args.base, 0)
+    name = args.name
 
     t = time.time()
-    m = nso.load(args.nso)
+    m = nso.load(args.nso, name)
     an = analysis.analyze(m)
     print(f"analysis: {len(an.functions)} functions, {len(an.jump_tables)} jump tables ({time.time() - t:.1f}s)")
 
     os.makedirs(args.out, exist_ok=True)
-    e = emit.Emitter(an)
+    e = emit.Emitter(an, prefix=name)
     funcs = an.functions
     if args.only:
         want = {int(x, 16) for x in args.only}
         funcs = [f for f in funcs if f.start in want]
 
     with open(os.path.join(args.out, "funcs.h"), "w") as h:
-        h.write("#pragma once\n#include <nx/cpu.h>\n\n")
+        h.write(f"#pragma once\n#include <nx/cpu.h>\n\n#undef NXB\n#define NXB {base:#x}ull\n\n")
         for f in an.functions:
             h.write(f"void {e.fn(f.start)}(nx::CPU& c);\n")
 
@@ -49,37 +55,20 @@ def main():
         cur.append(e.function(f))
         cur_n += (f.end - f.start) // 4
         if cur_n >= INSNS_PER_FILE or k == len(funcs) - 1:
-            name = f"code_{len(files):03d}.cpp"
-            with open(os.path.join(args.out, name), "w") as out:
+            fname = f"code_{len(files):03d}.cpp"
+            with open(os.path.join(args.out, fname), "w") as out:
                 out.write('#include "funcs.h"\n\n')
                 out.write("\n\n".join(cur))
                 out.write("\n")
-            files.append(name)
+            files.append(fname)
             cur, cur_n = [], 0
-        if k % 2000 == 0:
+        if k % 4000 == 0:
             print(f"  emitted {k}/{len(funcs)} functions ({time.time() - t:.0f}s)")
 
-    with open(os.path.join(args.out, "table.cpp"), "w") as out:
-        out.write('#include "funcs.h"\n#include <nx/module.h>\n\n')
-        out.write("const nx::FuncEntry nx_functions[] = {\n")
-        for f in an.functions:
-            out.write(f"    {{{f.start:#x}, {e.fn(f.start)}}},\n")
-        out.write("};\n")
-        out.write(f"const size_t nx_function_count = {len(an.functions)};\n")
-
-    with open(os.path.join(args.out, "imports.cpp"), "w") as out:
-        out.write('#include <nx/module.h>\n\n')
-        slots = sorted(an.got_imports.items())
-        out.write("const nx::ImportSlot nx_imports[] = {\n")
-        for got, name in slots:
-            out.write(f'    {{{got:#x}, "{name}"}},\n')
-        out.write("};\n")
-        out.write(f"const size_t nx_import_count = {len(slots)};\n")
+    write_table(os.path.join(args.out, "table.cpp"), m, an, e, name, base)
 
     with open(os.path.join(args.out, "report.txt"), "w") as out:
-        total = e.handled + sum(e.unhandled.values())
-        out.write(f"functions {len(funcs)}, instructions {total}, handled {e.handled}, "
-                  f"unhandled {sum(e.unhandled.values())}\n")
+        out.write(f"functions {len(funcs)}, handled {e.handled}, unhandled {sum(e.unhandled.values())}\n")
         out.write(f"jump tables {len(an.jump_tables)}, unresolved br (indirect tail calls) {len(an.unresolved_br)}\n\n")
         for mn, n in e.unhandled.most_common():
             out.write(f"{n:8} {mn}\n")
@@ -87,6 +76,36 @@ def main():
           f"({time.time() - t:.0f}s)")
     for mn, n in e.unhandled.most_common(30):
         print(f"  {n:7} {mn}")
+
+
+def write_table(path, m, an, e, name, base):
+    with open(path, "w") as out:
+        out.write('#include "funcs.h"\n#include <nx/module.h>\n\n')
+        out.write("static const nx::FuncEntry funcs[] = {\n")
+        for f in an.functions:
+            out.write(f"    {{{f.start:#x}, {e.fn(f.start)}}},\n")
+        out.write("};\n\n")
+        out.write("static const nx::Reloc relocs[] = {\n")
+        for r in m.relocs:
+            out.write(f"    {{{r.offset:#x}, {r.type}, {r.sym}, {r.addend}ll}},\n")
+        out.write("};\n\n")
+        out.write("static const nx::Symbol symbols[] = {\n")
+        for s in m.symbols:
+            out.write(f"    {{{cstr(s.name)}, {s.value:#x}, {s.size}, {s.type}, {s.bind}, {int(s.imported)}}},\n")
+        out.write("};\n\n")
+        ia = ", ".join(f"{a:#x}" for a in m.init_array + [0])
+        fa = ", ".join(f"{a:#x}" for a in m.fini_array + [0])
+        out.write(f"static const uint64_t init_array[] = {{{ia}}};\n")
+        out.write(f"static const uint64_t fini_array[] = {{{fa}}};\n\n")
+        out.write(f"extern const nx::ModuleInfo nx_module_{name} = {{\n")
+        out.write(f"    {cstr(name)}, {base:#x}ull,\n")
+        out.write(f"    {m.text[0]:#x}, {m.text[1]:#x}, {m.ro[0]:#x}, {m.ro[1]:#x}, "
+                  f"{m.data[0]:#x}, {m.data[1]:#x}, {m.bss[0]:#x}, {m.bss[1]:#x},\n")
+        out.write(f"    funcs, {len(an.functions)},\n")
+        out.write(f"    relocs, {len(m.relocs)},\n")
+        out.write(f"    symbols, {len(m.symbols)},\n")
+        out.write(f"    init_array, {len(m.init_array)}, fini_array, {len(m.fini_array)},\n")
+        out.write("};\n")
 
 
 if __name__ == "__main__":

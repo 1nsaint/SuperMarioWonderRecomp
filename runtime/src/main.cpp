@@ -1,0 +1,132 @@
+// Boot: map and link the recompiled modules (what rtld does), create the main thread and enter
+// nn::init::Start(main thread handle, main module base, init, fini) like rtld's _start.
+#include <cstdlib>
+#include <string>
+
+#include <windows.h>
+
+#include <nx/runtime.h>
+
+#include "kernel.h"
+
+extern const nx::ModuleInfo nx_module_main;
+extern const nx::ModuleInfo nx_module_sdk;
+
+namespace nx {
+
+uint64_t mrs(CPU& c, uint32_t sysreg) {
+    switch (sysreg) {
+        case 0xDF02:  // CNTVCT_EL0
+        case 0xDF01:  // CNTPCT_EL0
+            return system_tick();
+        case 0xDF00:  // CNTFRQ_EL0
+            return 19200000;
+        case 0xD807:  // DCZID_EL0: DC ZVA allowed, 64-byte blocks
+            return 4;
+        case 0xC000:  // MIDR_EL1 (Cortex-A57)
+            return 0x411FD071;
+        default:
+            log("mrs %#x at lr %s", sysreg, describe(c.x[30]).c_str());
+            return 0;
+    }
+}
+
+void msr(CPU& c, uint32_t sysreg, uint64_t value) {
+    log("msr %#x = %llx at lr %s", sysreg, (unsigned long long)value, describe(c.x[30]).c_str());
+}
+
+// Module initializers. Each module's DT_INIT (at +0x30 in both main and sdk, see .dynamic) registers the module's
+// TLS and unwind info with __nnmusl_init_dso and runs its init_array.
+constexpr uint64_t kDtInit = 0x30;
+
+static void call_preserving(CPU& c, uint64_t target) {
+    uint64_t saved[13];
+    for (int r = 19; r <= 31; r++) saved[r - 19] = c.x[r];
+    call(c, target);
+    for (int r = 19; r <= 31; r++) c.x[r] = saved[r - 19];
+}
+
+// DT_INIT starts with `adrp x19, page; ldr w8, [x19, #off]`: the word where it keeps __nnmusl_init_dso's result.
+static uint64_t init_status_addr(const ModuleInfo& m) {
+    uint64_t pc = m.base + kDtInit + 0x10;
+    uint32_t adrp = ld<uint32_t>(pc), ldr = ld<uint32_t>(pc + 4);
+    int64_t imm = int64_t(((adrp >> 5) & 0x7FFFF) << 2 | ((adrp >> 29) & 3)) << 43 >> 31;  // sign-extended << 12
+    return (pc & ~0xFFFull) + uint64_t(imm) + ((ldr >> 10) & 0xFFF) * 4;
+}
+
+// Run a module's initializers the way rtld does: DT_INIT registers the module with the libc (TLS, unwind info);
+// when that registration reports 1 the constructors are left to the loader, so we run the init_array.
+static void init_module(CPU& c, const ModuleInfo& m) {
+    call_preserving(c, m.base + kDtInit);
+    uint32_t status = ld<uint32_t>(init_status_addr(m));
+    if (status == 1)
+        for (size_t k = 0; k < m.init_count; k++) call_preserving(c, m.base + m.init_array[k]);
+    log("%s initializers done (init_dso %u, %zu constructors)", m.name, status, status == 1 ? m.init_count : 0);
+}
+
+// rtld's initializer callback: the SDK module's constructors (they only need the OS layer and libc0).
+static void rtld_init(CPU& c) { init_module(c, nx_module_sdk); }
+
+// nnMain, as called by nn::init::Start: the program's constructors need its allocator, which nninitStartup has
+// set up by now, so they run here, right before the real nnMain.
+static void nn_main(CPU& c) {
+    init_module(c, nx_module_main);
+    log("entering nnMain");
+    uint64_t real = 0;
+    for (size_t k = 0; k < nx_module_main.symbol_count; k++)
+        if (!nx_module_main.symbols[k].imported && std::string(nx_module_main.symbols[k].name) == "nnMain")
+            real = nx_module_main.base + nx_module_main.symbols[k].value;
+    call(c, real);
+}
+NX_HLE("nnMain", nn_main);
+static void rtld_fini(CPU&) {}
+static void process_return(CPU&) {
+    log("nn::init::Start returned");
+    ExitProcess(0);
+}
+NX_HLE("__rtld_init", rtld_init);
+NX_HLE("__rtld_fini", rtld_fini);
+NX_HLE("__process_return", process_return);
+
+}  // namespace nx
+
+static LONG WINAPI crash_handler(EXCEPTION_POINTERS* e) {
+    using namespace nx;
+    auto* r = e->ExceptionRecord;
+    uint64_t info = r->NumberParameters > 1 ? r->ExceptionInformation[1] : 0;
+    log("CRASH: exception %08lx at host %p, data address %llx", r->ExceptionCode, r->ExceptionAddress,
+        (unsigned long long)info);
+    CPU& c = current_cpu();
+    log("  guest lr %s  sp %llx", describe(c.x[30]).c_str(), (unsigned long long)c.x[31]);
+    backtrace(c);
+    for (int k = 0; k < 31; k += 4)
+        log("  x%-2d %016llx %016llx %016llx %016llx", k, (unsigned long long)c.x[k], (unsigned long long)c.x[k + 1],
+            (unsigned long long)c.x[k + 2], (unsigned long long)(k + 3 < 32 ? c.x[k + 3] : 0));
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+int main(int argc, char** argv) {
+    using namespace nx;
+    SetUnhandledExceptionFilter(crash_handler);
+    if (const char* t = std::getenv("NX_TRACE")) g_trace = *t == '1';
+    std::string data = argc > 1 ? argv[1] : "private/analysis";
+
+    memory_init();
+    kernel_init();
+    const ModuleInfo* mods[] = {&nx_module_main, &nx_module_sdk};
+    load_modules(mods, 2, data);
+
+    uint32_t main_thread = create_main_thread(16ull << 20);
+    CPU& c = current_cpu();
+    uint64_t start = find_symbol("_ZN2nn4init5StartEmmPFvvES2_");
+    if (!start) fatal("nn::init::Start not found");
+    c.x[0] = main_thread;
+    c.x[1] = nx_module_main.base;
+    c.x[2] = hle_address("__rtld_init");
+    c.x[3] = hle_address("__rtld_fini");
+    c.x[30] = hle_address("__process_return");
+    log("entering nn::init::Start at %s", describe(start).c_str());
+    call(c, start);
+    log("returned from nn::init::Start");
+    return 0;
+}

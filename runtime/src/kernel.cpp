@@ -1,0 +1,650 @@
+// A small Horizon kernel: handles, threads, synchronization (mutex/condvar/address arbitration), events,
+// memory and GetInfo. Services (IPC) live in ipc.cpp.
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+#include <windows.h>
+
+#include "kernel.h"
+
+namespace nx {
+
+namespace {
+
+constexpr uint32_t kHandleWaitMask = 0x40000000;
+constexpr uint32_t kPseudoCurrentThread = 0xFFFF8000;
+constexpr uint32_t kPseudoCurrentProcess = 0xFFFF8001;
+
+std::recursive_mutex g_k;              // the "kernel lock"
+std::condition_variable_any g_cv;      // any change of waitable state
+std::unordered_map<uint32_t, std::shared_ptr<KObject>> g_handles;
+uint32_t g_next_handle = 0x10000;
+std::atomic<uint64_t> g_next_thread_id{0x50};
+uint64_t g_heap_size = 0;
+
+std::vector<KThread*> g_mutex_waiters;  // FIFO
+std::vector<KThread*> g_cv_waiters;
+std::vector<KThread*> g_addr_waiters;
+
+thread_local KThread* t_self = nullptr;
+
+LARGE_INTEGER qpc_freq() {
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return f;
+}
+
+}  // namespace
+
+uint32_t handle_add(std::shared_ptr<KObject> o) {
+    std::lock_guard lk(g_k);
+    uint32_t h = g_next_handle++;
+    g_handles[h] = std::move(o);
+    return h;
+}
+
+std::shared_ptr<KObject> handle_get(uint32_t h) {
+    std::lock_guard lk(g_k);
+    if (h == kPseudoCurrentThread && t_self) return t_self->self.lock();
+    auto it = g_handles.find(h);
+    return it == g_handles.end() ? nullptr : it->second;
+}
+
+void handle_close(uint32_t h) {
+    std::lock_guard lk(g_k);
+    g_handles.erase(h);
+}
+
+void notify_all() { g_cv.notify_all(); }
+
+KThread* self_thread() { return t_self; }
+
+CPU& current_cpu() { return t_self->ctx; }
+
+uint64_t system_tick() {
+    static const LARGE_INTEGER f = qpc_freq();
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return uint64_t(double(t.QuadPart) * 19200000.0 / double(f.QuadPart));
+}
+
+// ---- waiting --------------------------------------------------------------------------------------------------
+
+// Wait (with g_k held) until `self->wake` or timeout (ns, <0 = forever). Returns false on timeout.
+static bool block(std::unique_lock<std::recursive_mutex>& lk, KThread* self, int64_t timeout_ns) {
+    if (timeout_ns < 0) {
+        g_cv.wait(lk, [&] { return self->wake; });
+        return true;
+    }
+    auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
+    return g_cv.wait_until(lk, until, [&] { return self->wake; });
+}
+
+static void remove(std::vector<KThread*>& v, KThread* t) { v.erase(std::remove(v.begin(), v.end(), t), v.end()); }
+
+static uint32_t load32(uint64_t a) { return __atomic_load_n(reinterpret_cast<uint32_t*>(a), __ATOMIC_SEQ_CST); }
+static void store32(uint64_t a, uint32_t v) { __atomic_store_n(reinterpret_cast<uint32_t*>(a), v, __ATOMIC_SEQ_CST); }
+static bool cas32(uint64_t a, uint32_t expected, uint32_t v) {
+    return __atomic_compare_exchange_n(reinterpret_cast<uint32_t*>(a), &expected, v, false, __ATOMIC_SEQ_CST,
+                                       __ATOMIC_SEQ_CST);
+}
+
+// Hand the mutex at `addr` to its next waiter (or clear it).
+static void unlock_mutex(uint64_t addr) {
+    KThread* next = nullptr;
+    int more = 0;
+    for (KThread* t : g_mutex_waiters)
+        if (t->wait_mutex == addr) {
+            if (!next)
+                next = t;
+            else
+                more++;
+        }
+    if (!next) {
+        store32(addr, 0);
+        return;
+    }
+    remove(g_mutex_waiters, next);
+    store32(addr, next->wait_tag | (more ? kHandleWaitMask : 0));
+    next->wake = true;
+    next->wait_result = 0;
+    notify_all();
+}
+
+// ---- svc implementations --------------------------------------------------------------------------------------
+
+static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) {
+    std::unique_lock lk(g_k);
+    KThread* self = t_self;
+    if (load32(addr) != (owner | kHandleWaitMask)) return 0;
+    self->wake = false;
+    self->wait_mutex = addr;
+    self->wait_tag = tag;
+    g_mutex_waiters.push_back(self);
+    block(lk, self, -1);
+    return self->wait_result;
+}
+
+static uint32_t svc_arbitrate_unlock(uint64_t addr) {
+    std::unique_lock lk(g_k);
+    unlock_mutex(addr);
+    return 0;
+}
+
+static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
+    std::unique_lock lk(g_k);
+    KThread* self = t_self;
+    unlock_mutex(mutex);
+    self->wake = false;
+    self->wait_mutex = mutex;
+    self->wait_key = key;
+    self->wait_tag = tag;
+    self->wait_result = 0;
+    g_cv_waiters.push_back(self);
+    store32(key, 1);
+    if (block(lk, self, timeout)) return self->wait_result;
+    // Timed out: still on the condvar? Then re-acquire the mutex ourselves.
+    if (std::find(g_cv_waiters.begin(), g_cv_waiters.end(), self) != g_cv_waiters.end()) {
+        remove(g_cv_waiters, self);
+        bool others = std::any_of(g_cv_waiters.begin(), g_cv_waiters.end(), [&](KThread* t) { return t->wait_key == key; });
+        if (!others) store32(key, 0);
+        for (;;) {
+            uint32_t v = load32(mutex);
+            if (v == 0) {
+                if (cas32(mutex, 0, tag)) return 0xEA01;
+                continue;
+            }
+            if (!(v & kHandleWaitMask) && !cas32(mutex, v, v | kHandleWaitMask)) continue;
+            break;
+        }
+        self->wake = false;
+        g_mutex_waiters.push_back(self);
+    }
+    block(lk, self, -1);
+    return 0xEA01;
+}
+
+static uint32_t svc_signal_process_wide_key(uint64_t key, int32_t count) {
+    std::unique_lock lk(g_k);
+    int n = 0;
+    for (size_t i = 0; i < g_cv_waiters.size() && (count <= 0 || n < count);) {
+        KThread* t = g_cv_waiters[i];
+        if (t->wait_key != key) {
+            i++;
+            continue;
+        }
+        g_cv_waiters.erase(g_cv_waiters.begin() + i);
+        n++;
+        // Try to give it the mutex right away.
+        for (;;) {
+            uint32_t v = load32(t->wait_mutex);
+            if (v == 0) {
+                if (!cas32(t->wait_mutex, 0, t->wait_tag)) continue;
+                t->wake = true;
+                t->wait_result = 0;
+                break;
+            }
+            if (!(v & kHandleWaitMask) && !cas32(t->wait_mutex, v, v | kHandleWaitMask)) continue;
+            g_mutex_waiters.push_back(t);
+            break;
+        }
+    }
+    bool others = std::any_of(g_cv_waiters.begin(), g_cv_waiters.end(), [&](KThread* t) { return t->wait_key == key; });
+    if (!others) store32(key, 0);
+    notify_all();
+    return 0;
+}
+
+static uint32_t svc_wait_for_address(uint64_t addr, uint32_t type, int32_t value, int64_t timeout) {
+    std::unique_lock lk(g_k);
+    KThread* self = t_self;
+    int32_t cur = int32_t(load32(addr));
+    switch (type) {
+        case 0:  // WaitIfLessThan
+            if (!(cur < value)) return 0xFA01;
+            break;
+        case 1:  // DecrementAndWaitIfLessThan
+            if (!(cur < value)) return 0xFA01;
+            store32(addr, uint32_t(cur - 1));
+            break;
+        case 2:  // WaitIfEqual
+            if (cur != value) return 0xFA01;
+            break;
+        default:
+            return 0xF001;
+    }
+    if (timeout == 0) return 0xEA01;
+    self->wake = false;
+    self->wait_addr = addr;
+    self->wait_result = 0;
+    g_addr_waiters.push_back(self);
+    if (!block(lk, self, timeout)) {
+        remove(g_addr_waiters, self);
+        return 0xEA01;
+    }
+    return self->wait_result;
+}
+
+static int wake_addr(uint64_t addr, int32_t count) {
+    int n = 0;
+    for (size_t i = 0; i < g_addr_waiters.size() && (count <= 0 || n < count);) {
+        KThread* t = g_addr_waiters[i];
+        if (t->wait_addr != addr) {
+            i++;
+            continue;
+        }
+        g_addr_waiters.erase(g_addr_waiters.begin() + i);
+        t->wake = true;
+        t->wait_result = 0;
+        n++;
+    }
+    notify_all();
+    return n;
+}
+
+static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t value, int32_t count) {
+    std::unique_lock lk(g_k);
+    int waiters = int(std::count_if(g_addr_waiters.begin(), g_addr_waiters.end(), [&](KThread* t) { return t->wait_addr == addr; }));
+    switch (type) {
+        case 0:  // Signal
+            break;
+        case 1:  // SignalAndIncrementIfEqual
+            if (!cas32(addr, uint32_t(value), uint32_t(value + 1))) return 0xFA01;
+            break;
+        case 2: {  // SignalAndModifyByWaitingCountIfEqual
+            int32_t updated = value;
+            if (count <= 0)
+                updated = waiters ? value - 2 : value + 1;
+            else if (waiters)
+                updated = waiters <= count ? value - 1 : value;
+            else
+                updated = value + 1;
+            if (!cas32(addr, uint32_t(value), uint32_t(updated))) return 0xFA01;
+            break;
+        }
+        default:
+            return 0xF001;
+    }
+    wake_addr(addr, count);
+    return 0;
+}
+
+static uint32_t svc_wait_synchronization(CPU& c, uint64_t handles, int32_t count, int64_t timeout) {
+    std::unique_lock lk(g_k);
+    std::vector<std::shared_ptr<KObject>> objs;
+    for (int i = 0; i < count; i++) {
+        auto o = handle_get(ld<uint32_t>(handles + 4 * i));
+        if (!o) return 0xE401;  // invalid handle
+        objs.push_back(o);
+    }
+    auto ready = [&]() -> int {
+        for (int i = 0; i < count; i++)
+            if (objs[i]->signaled()) return i;
+        return -1;
+    };
+    auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout < 0 ? 0 : timeout);
+    KThread* self = t_self;
+    self->cancel = false;
+    for (;;) {
+        int i = ready();
+        if (i >= 0) {
+            c.x[1] = uint32_t(i);
+            objs[i]->consume();
+            return 0;
+        }
+        if (self->cancel) {
+            self->cancel = false;
+            return 0xEC01;
+        }
+        if (timeout == 0) return 0xEA01;
+        if (timeout < 0)
+            g_cv.wait(lk);
+        else if (g_cv.wait_until(lk, until) == std::cv_status::timeout && ready() < 0)
+            return 0xEA01;
+    }
+}
+
+// ---- threads --------------------------------------------------------------------------------------------------
+
+static DWORD WINAPI thread_main(void* p) {
+    KThread* t = static_cast<KThread*>(p);
+    t_self = t;
+    call(t->ctx, t->entry);
+    // Returning from the entry point is like svcExitThread.
+    std::lock_guard lk(g_k);
+    t->exited = true;
+    notify_all();
+    return 0;
+}
+
+static std::shared_ptr<KThread> new_thread(uint64_t entry, uint64_t arg, uint64_t sp, int prio, int core) {
+    auto t = std::make_shared<KThread>();
+    t->self = t;
+    t->id = g_next_thread_id++;
+    t->entry = entry;
+    t->prio = prio;
+    t->core = core;
+    t->tls = kernel_alloc(0x1000);  // one TLS page per thread (0x200 used)
+    t->ctx.x[0] = arg;
+    t->ctx.x[31] = sp;
+    t->ctx.tpidrro = t->tls;
+    t->handle = handle_add(t);
+    return t;
+}
+
+uint32_t create_main_thread(uint64_t stack_size) {
+    uint64_t stack = kernel_alloc(stack_size);
+    vm_set(stack, stack_size, kMemStack, 3);
+    auto t = new_thread(0, 0, stack + stack_size, 44, 0);
+    t->started = true;
+    t_self = t.get();
+    return t->handle;
+}
+
+void kernel_init() {}
+
+// ---- dispatch -------------------------------------------------------------------------------------------------
+
+static void write_meminfo(uint64_t p, const VmInfo& v) {
+    st<uint64_t>(p + 0, v.addr);
+    st<uint64_t>(p + 8, v.size);
+    st<uint32_t>(p + 16, v.state);
+    st<uint32_t>(p + 20, 0);  // attribute
+    st<uint32_t>(p + 24, v.perm);
+    st<uint32_t>(p + 28, 0);
+    st<uint32_t>(p + 32, 0);
+    st<uint32_t>(p + 36, 0);
+}
+
+// Guest call stack from the AArch64 frame records (x29 -> [prev x29, lr]).
+void backtrace(CPU& c) {
+    log("  at lr %s", describe(c.x[30]).c_str());
+    uint64_t fp = c.x[29];
+    for (int k = 0; k < 24 && fp && (fp & 7) == 0; k++) {
+        const VmInfo v = vm_query(fp);
+        if (v.state == kMemFree) break;
+        uint64_t lr = ld<uint64_t>(fp + 8);
+        if (!lr) break;
+        log("  #%-2d %s", k, describe(lr).c_str());
+        fp = ld<uint64_t>(fp);
+    }
+}
+
+static uint64_t get_info(uint32_t type, uint32_t handle, uint64_t sub, uint32_t& rc) {
+    rc = 0;
+    switch (type) {
+        case 0: return 0xF;                         // AllowedCpuIdBitmask
+        case 1: return 0xFFFFFFFFFFFFFFFFull >> 0;  // AllowedThreadPriorityMask
+        case 2: return kAliasBase;
+        case 3: return kAliasSize;
+        case 4: return kHeapBase;
+        case 5: return kHeapMax;
+        case 6: return 0xCD500000;  // TotalMemoryAvailable (~3.2 GiB, like an application)
+        case 7: return g_heap_size + 0x4000000;
+        case 8: return 0;  // IsCurrentProcessBeingDebugged
+        case 9: return 0;  // ResourceLimit handle
+        case 10: return 0;  // IdleTickCount
+        case 11: return 0x1234567890ABCDEFull ^ sub;  // RandomEntropy
+        case 12: return kAddressSpaceBase;
+        case 13: return kAddressSpaceSize;
+        case 14: return kStackBase;
+        case 15: return kStackSize;
+        case 16: return 0;  // SystemResourceSizeTotal
+        case 17: return 0;
+        case 18: return 0x0100535012974000ull;  // ProgramId
+        case 20: return 0;  // UserExceptionContextAddress
+        case 21: return 0xCD500000;
+        case 22: return g_heap_size + 0x4000000;
+        case 23: return 1;  // IsApplication
+        case 0xF0000002: return 0;  // ThreadTickCount
+        default:
+            log("svcGetInfo: unknown type %u sub %llu", type, (unsigned long long)sub);
+            rc = 0xF001;
+            return 0;
+    }
+}
+
+void svc(CPU& c, uint32_t imm, uint64_t pc) {
+    if (g_trace) log("svc %#x from %s", imm, describe(pc).c_str());
+    uint32_t rc = 0;
+    switch (imm) {
+        case 0x01: {  // SetHeapSize(size) -> addr
+            uint64_t size = c.x[1];
+            if (size > kHeapMax) {
+                rc = 0xD001;
+                break;
+            }
+            if (size > g_heap_size) commit(kHeapBase + g_heap_size, size - g_heap_size);
+            vm_set(kHeapBase, kHeapMax, kMemInaccessible, 0);
+            if (size) vm_set(kHeapBase, size, kMemHeap, 3);
+            g_heap_size = size;
+            c.x[1] = kHeapBase;
+            break;
+        }
+        case 0x02:  // SetMemoryPermission
+        case 0x03:  // SetMemoryAttribute
+            break;
+        case 0x04: {  // MapMemory(dst, src, size): src becomes inaccessible, so a copy behaves the same
+            uint64_t dst = c.x[0], src = c.x[1], size = c.x[2];
+            commit(dst, size);
+            std::memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<void*>(src), size);
+            vm_set(dst, size, dst - kStackBase < kStackSize ? kMemStack : kMemAlias, 3);
+            break;
+        }
+        case 0x05: {  // UnmapMemory(dst, src, size)
+            uint64_t dst = c.x[0], src = c.x[1], size = c.x[2];
+            std::memcpy(reinterpret_cast<void*>(src), reinterpret_cast<void*>(dst), size);
+            decommit(dst, size);
+            vm_set(dst, size, kMemFree, 0);
+            break;
+        }
+        case 0x06: {  // QueryMemory(meminfo*, pageinfo*, addr)
+            write_meminfo(c.x[0], vm_query(c.x[2]));
+            c.x[1] = 0;
+            break;
+        }
+        case 0x07:
+            log("svcExitProcess");
+            ExitProcess(0);
+        case 0x08: {  // CreateThread(entry x1, arg x2, stack_top x3, prio w4, core w5) -> handle
+            auto t = new_thread(c.x[1], c.x[2], c.x[3], int(c.x[4]), int32_t(c.x[5]));
+            c.x[1] = t->handle;
+            if (g_trace) log("CreateThread %s handle %x", describe(t->entry).c_str(), t->handle);
+            break;
+        }
+        case 0x09: {  // StartThread(handle)
+            auto t = std::dynamic_pointer_cast<KThread>(handle_get(uint32_t(c.x[0])));
+            if (!t) {
+                rc = 0xE401;
+                break;
+            }
+            t->started = true;
+            t->host = CreateThread(nullptr, 8 << 20, thread_main, t.get(), 0, nullptr);
+            break;
+        }
+        case 0x0A: {  // ExitThread
+            std::lock_guard lk(g_k);
+            t_self->exited = true;
+            notify_all();
+            ExitThread(0);
+        }
+        case 0x0B: {  // SleepThread(ns)
+            int64_t ns = int64_t(c.x[0]);
+            if (ns <= 0)
+                SwitchToThread();
+            else
+                std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
+            return;
+        }
+        case 0x0C: {  // GetThreadPriority(handle) -> prio
+            auto t = std::dynamic_pointer_cast<KThread>(handle_get(uint32_t(c.x[1])));
+            c.x[1] = t ? t->prio : 44;
+            break;
+        }
+        case 0x0D: {  // SetThreadPriority(handle, prio)
+            auto t = std::dynamic_pointer_cast<KThread>(handle_get(uint32_t(c.x[0])));
+            if (t) t->prio = int(c.x[1]);
+            break;
+        }
+        case 0x0E: {  // GetThreadCoreMask(handle) -> core, mask
+            auto t = std::dynamic_pointer_cast<KThread>(handle_get(uint32_t(c.x[2])));
+            c.x[1] = t ? uint32_t(t->core) : 0;
+            c.x[2] = 0xF;
+            break;
+        }
+        case 0x0F:  // SetThreadCoreMask
+            break;
+        case 0x10:  // GetCurrentProcessorNumber
+            c.x[0] = t_self ? uint32_t(std::max(t_self->core, 0)) : 0;
+            return;
+        case 0x11: {  // SignalEvent(handle)
+            auto e = std::dynamic_pointer_cast<KEvent>(handle_get(uint32_t(c.x[0])));
+            if (!e) {
+                rc = 0xE401;
+                break;
+            }
+            std::lock_guard lk(g_k);
+            e->state->signaled = true;
+            notify_all();
+            break;
+        }
+        case 0x12:    // ClearEvent(handle)
+        case 0x17: {  // ResetSignal(handle)
+            auto e = std::dynamic_pointer_cast<KEvent>(handle_get(uint32_t(c.x[0])));
+            if (!e) {
+                rc = 0xE401;
+                break;
+            }
+            std::lock_guard lk(g_k);
+            if (imm == 0x17 && !e->state->signaled) rc = 0xFA01;
+            e->state->signaled = false;
+            break;
+        }
+        case 0x13: {  // MapSharedMemory(handle, addr, size, perm)
+            auto s = std::dynamic_pointer_cast<KSharedMemory>(handle_get(uint32_t(c.x[0])));
+            if (!s) {
+                rc = 0xE401;
+                break;
+            }
+            rc = map_shared_memory(*s, c.x[1], c.x[2]);
+            break;
+        }
+        case 0x14:  // UnmapSharedMemory
+            break;
+        case 0x15: {  // CreateTransferMemory(addr x1, size x2, perm w3) -> handle
+            auto tm = std::make_shared<KTransferMemory>();
+            tm->addr = c.x[1];
+            tm->size = c.x[2];
+            c.x[1] = handle_add(tm);
+            break;
+        }
+        case 0x16:  // CloseHandle
+            handle_close(uint32_t(c.x[0]));
+            break;
+        case 0x18:  // WaitSynchronization(out idx, handles x1, count w2, timeout x3)
+            rc = svc_wait_synchronization(c, c.x[1], int32_t(c.x[2]), int64_t(c.x[3]));
+            break;
+        case 0x19: {  // CancelSynchronization(thread handle)
+            auto t = std::dynamic_pointer_cast<KThread>(handle_get(uint32_t(c.x[0])));
+            std::lock_guard lk(g_k);
+            if (t) t->cancel = true;
+            notify_all();
+            break;
+        }
+        case 0x1A:
+            rc = svc_arbitrate_lock(uint32_t(c.x[0]), c.x[1], uint32_t(c.x[2]));
+            break;
+        case 0x1B:
+            rc = svc_arbitrate_unlock(c.x[0]);
+            break;
+        case 0x1C:
+            rc = svc_wait_process_wide_key(c.x[0], c.x[1], uint32_t(c.x[2]), int64_t(c.x[3]));
+            break;
+        case 0x1D:
+            rc = svc_signal_process_wide_key(c.x[0], int32_t(c.x[1]));
+            break;
+        case 0x1E:  // GetSystemTick
+            c.x[0] = system_tick();
+            return;
+        case 0x1F: {  // ConnectToNamedPort(name x1) -> handle
+            rc = ipc_connect(reinterpret_cast<const char*>(c.x[1]), c.x[1] ? &c.x[1] : nullptr);
+            break;
+        }
+        case 0x21:  // SendSyncRequest(handle)
+            rc = ipc_request(c, uint32_t(c.x[0]), t_self->tls, 0x100);
+            break;
+        case 0x22:  // SendSyncRequestWithUserBuffer(buf, size, handle)
+            rc = ipc_request(c, uint32_t(c.x[2]), c.x[0], c.x[1]);
+            break;
+        case 0x24:  // GetProcessId
+            c.x[1] = 0x51;
+            break;
+        case 0x25: {  // GetThreadId(handle) -> id
+            auto t = std::dynamic_pointer_cast<KThread>(handle_get(uint32_t(c.x[1])));
+            c.x[1] = t ? t->id : 0;
+            break;
+        }
+        case 0x26:  // Break(reason, arg, size)
+            if (c.x[2] == 4 && c.x[1]) {
+                uint32_t r = ld<uint32_t>(c.x[1]);
+                log("abort with Result %#x (module %u, description %u)", r, r & 0x1FF, (r >> 9) & 0x1FFF);
+            }
+            backtrace(c);
+            fatal("svcBreak(%llx, %llx, %llx) from %s", (unsigned long long)c.x[0], (unsigned long long)c.x[1],
+                  (unsigned long long)c.x[2], describe(c.x[30]).c_str());
+        case 0x27: {  // OutputDebugString(str, len)
+            std::string s(reinterpret_cast<const char*>(c.x[0]), c.x[1]);
+            while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+            log("[guest] %s", s.c_str());
+            break;
+        }
+        case 0x28:
+            fatal("svcReturnFromException(%llx)", (unsigned long long)c.x[0]);
+        case 0x29: {  // GetInfo(type w1, handle w2, sub x3) -> x1
+            c.x[1] = get_info(uint32_t(c.x[1]), uint32_t(c.x[2]), c.x[3], rc);
+            break;
+        }
+        case 0x2A:  // FlushEntireDataCache
+            break;
+        case 0x2C:  // MapPhysicalMemory(addr, size)
+            commit(c.x[0], c.x[1]);
+            vm_set(c.x[0], c.x[1], kMemHeap, 3);
+            break;
+        case 0x2D:  // UnmapPhysicalMemory
+            decommit(c.x[0], c.x[1]);
+            vm_set(c.x[0], c.x[1], c.x[0] - kAliasBase < kAliasSize ? kMemFree : kMemInaccessible, 0);
+            break;
+        case 0x34:
+            rc = svc_wait_for_address(c.x[0], uint32_t(c.x[1]), int32_t(c.x[2]), int64_t(c.x[3]));
+            break;
+        case 0x35:
+            rc = svc_signal_to_address(c.x[0], uint32_t(c.x[1]), int32_t(c.x[2]), int32_t(c.x[3]));
+            break;
+        case 0x36:  // SynchronizePreemptionState
+            break;
+        case 0x45: {  // CreateEvent -> write handle x1, read handle x2
+            auto st = std::make_shared<EventState>();
+            auto w = std::make_shared<KEvent>();
+            auto r = std::make_shared<KEvent>();
+            w->state = r->state = st;
+            c.x[1] = handle_add(w);
+            c.x[2] = handle_add(r);
+            break;
+        }
+        default:
+            log("unhandled svc %#x from %s (x0 %llx x1 %llx x2 %llx)", imm, describe(pc).c_str(),
+                (unsigned long long)c.x[0], (unsigned long long)c.x[1], (unsigned long long)c.x[2]);
+            rc = 0;
+    }
+    c.x[0] = rc;
+}
+
+}  // namespace nx
