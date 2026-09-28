@@ -34,9 +34,12 @@ add_executable(hades
     runtime/src/hle_fs.cpp
     runtime/src/svc_account.cpp
     runtime/src/hle_ro.cpp
+    runtime/src/hle_vi.cpp
+    runtime/src/hle_hid.cpp
+    runtime/src/hle_net.cpp
 )
 target_include_directories(hades PRIVATE runtime/include runtime/src)
-target_link_libraries(hades PRIVATE game_main game_sdk)
+target_link_libraries(hades PRIVATE game_main game_sdk xinput)
 # Static tables (and HLE registrars) must not be dropped by the linker.
 if(MSVC)
     # Keep host allocations low so the guest ranges (0x40_0000_0000..0x80_0000_0000) are always free.
