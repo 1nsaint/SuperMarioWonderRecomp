@@ -22,6 +22,7 @@ void OpenDefaultDisplay(CPU& c) {
 void CreateLayer(CPU& c) {
     void* w = plat::create_window();
     log("vi: layer created -> native window %p", w);
+    plat::release_window(w);
     st<uint64_t>(c.x[0], kFakeLayer);
     c.x[0] = 0;
 }

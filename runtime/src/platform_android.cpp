@@ -53,6 +53,7 @@ namespace {
 android_app* g_app = nullptr;
 std::string g_root;
 std::atomic<ANativeWindow*> g_window{nullptr};
+std::atomic<uint64_t> g_window_gen{0};  // bumped for every new window
 std::atomic<bool> g_visible{false};
 }  // namespace
 
@@ -249,6 +250,10 @@ void* create_window() {
     ANativeWindow_acquire(w);
     return w;
 }
+
+void release_window(void* w) { ANativeWindow_release(static_cast<ANativeWindow*>(w)); }
+
+uint64_t window_generation() { return g_window_gen; }
 
 bool window_minimized() { return !g_visible || !g_window; }
 
@@ -459,6 +464,14 @@ bool audio_open(AudioDone done) {
     return ok;
 }
 
+void audio_pause(bool paused) {
+    if (!g_stream) return;
+    if (paused)
+        AAudioStream_requestPause(g_stream);
+    else
+        AAudioStream_requestStart(g_stream);
+}
+
 bool audio_submit(const void* data, size_t bytes, void* ctx) {
     if (!g_stream) return false;
     std::lock_guard lk(g_audio);
@@ -534,6 +547,7 @@ void on_cmd(android_app* app, int32_t cmd) {
     switch (cmd) {
         case APP_CMD_INIT_WINDOW:
             g_window = app->window;
+            g_window_gen++;
             g_visible = true;
             break;
         case APP_CMD_TERM_WINDOW:  // the window goes away once this returns
@@ -544,6 +558,12 @@ void on_cmd(android_app* app, int32_t cmd) {
             g_visible = g_window != nullptr;
             break;
         case APP_CMD_LOST_FOCUS:
+            break;
+        case APP_CMD_PAUSE:  // home, app switcher, screen off: the game holds (no window), so does its sound
+            audio_pause(true);
+            break;
+        case APP_CMD_RESUME:
+            audio_pause(false);
             break;
     }
 }

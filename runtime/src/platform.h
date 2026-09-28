@@ -41,7 +41,9 @@ std::string data_root();
 std::string setting(const std::string& key);  // a player setting: config.txt (Android), NX_<KEY> (PC); "" if unset          // where private/ lives ("private" on PC, the app's external files dir on Android)
 
 // ---- display, input, audio ----
-void* create_window();       // native window handle for the Vulkan surface (HWND / ANativeWindow*)
+void* create_window();       // native window handle for the Vulkan surface (HWND / ANativeWindow*), kept alive
+void release_window(void* w);  // done with a handle from create_window
+uint64_t window_generation();  // changes when the OS replaced the window (Android: app back from the background)
 bool window_minimized();     // no surface to draw to (minimized / app in background)
 void window_size(uint32_t& w, uint32_t& h);  // client size in pixels
 
@@ -66,6 +68,7 @@ using AudioDone = void (*)(void* ctx);
 bool audio_open(AudioDone done);
 bool audio_submit(const void* data, size_t bytes, void* ctx);  // false: no device (caller paces itself)
 uint32_t audio_queued();
+void audio_pause(bool paused);  // app in the background
 
 // Vulkan: the loader's vkGetInstanceProcAddr and the surface extension of this platform.
 void* vulkan_get_instance_proc_addr();

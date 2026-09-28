@@ -23,11 +23,13 @@ SPECIAL = {
     "vkGetPhysicalDeviceQueueFamilyProperties", "vkGetPhysicalDeviceQueueFamilyProperties2",
     "vkGetPhysicalDeviceQueueFamilyProperties2KHR", "vkQueuePresentKHR", "vkGetDeviceQueue", "vkCreateSwapchainKHR",
     "vkAcquireNextImageKHR", "vkGetSwapchainImagesKHR", "vkDestroySwapchainKHR", "vkWaitForFences",
+    "vkGetPhysicalDeviceSurfaceSupportKHR", "vkGetPhysicalDeviceSurfaceCapabilitiesKHR", "vkGetPhysicalDeviceSurfaceFormatsKHR", "vkGetPhysicalDeviceSurfacePresentModesKHR", "vkDestroySurfaceKHR",
 }
 # Host pointers the hand-written bridges still need are declared anyway (without a wrapper).
 POINTER_ONLY = {"vkGetPhysicalDeviceQueueFamilyProperties", "vkGetPhysicalDeviceQueueFamilyProperties2",
                 "vkQueuePresentKHR", "vkGetDeviceQueue", "vkCreateSwapchainKHR", "vkAcquireNextImageKHR",
-                "vkGetSwapchainImagesKHR", "vkDestroySwapchainKHR", "vkWaitForFences"}
+                "vkGetSwapchainImagesKHR", "vkDestroySwapchainKHR", "vkWaitForFences",
+                "vkGetPhysicalDeviceSurfaceSupportKHR", "vkGetPhysicalDeviceSurfaceCapabilitiesKHR", "vkGetPhysicalDeviceSurfaceFormatsKHR", "vkGetPhysicalDeviceSurfacePresentModesKHR", "vkDestroySurfaceKHR"}
 PLATFORMS = {None, "win32", "vi", "android"}
 FLOAT_TYPES = {"float", "double"}
 

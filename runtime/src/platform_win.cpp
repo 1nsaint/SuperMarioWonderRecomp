@@ -65,6 +65,9 @@ void exit_process(int code) { ExitProcess(UINT(code)); }
 void sleep_ns(int64_t ns) { std::this_thread::sleep_for(std::chrono::nanoseconds(ns)); }
 void yield() { SwitchToThread(); }
 void set_thread_name(const char*) {}
+void release_window(void*) {}
+uint64_t window_generation() { return 1; }
+void audio_pause(bool) {}
 
 std::string setting(const std::string& key) {
     std::string env = "NX_";

@@ -2700,8 +2700,6 @@ NX_HLE("vkDestroyShaderModule", w_vkDestroyShaderModule);
 
 
 PFN_vkDestroySurfaceKHR p_vkDestroySurfaceKHR = nullptr;
-static void w_vkDestroySurfaceKHR(CPU& c) { p_vkDestroySurfaceKHR(arg<VkInstance>(c.x[0]), arg<VkSurfaceKHR>(c.x[1]), nullptr); }
-NX_HLE("vkDestroySurfaceKHR", w_vkDestroySurfaceKHR);
 
 
 
@@ -3763,8 +3761,6 @@ NX_HLE("vkGetPhysicalDeviceSurfaceCapabilities2KHR", w_vkGetPhysicalDeviceSurfac
 
 
 PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR = nullptr;
-static void w_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(CPU& c) { c.x[0] = ret_u64(p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(arg<VkPhysicalDevice>(c.x[0]), arg<VkSurfaceKHR>(c.x[1]), arg<VkSurfaceCapabilitiesKHR*>(c.x[2]))); }
-NX_HLE("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", w_vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
 
 
 
@@ -3775,8 +3771,6 @@ NX_HLE("vkGetPhysicalDeviceSurfaceFormats2KHR", w_vkGetPhysicalDeviceSurfaceForm
 
 
 PFN_vkGetPhysicalDeviceSurfaceFormatsKHR p_vkGetPhysicalDeviceSurfaceFormatsKHR = nullptr;
-static void w_vkGetPhysicalDeviceSurfaceFormatsKHR(CPU& c) { c.x[0] = ret_u64(p_vkGetPhysicalDeviceSurfaceFormatsKHR(arg<VkPhysicalDevice>(c.x[0]), arg<VkSurfaceKHR>(c.x[1]), arg<uint32_t*>(c.x[2]), arg<VkSurfaceFormatKHR*>(c.x[3]))); }
-NX_HLE("vkGetPhysicalDeviceSurfaceFormatsKHR", w_vkGetPhysicalDeviceSurfaceFormatsKHR);
 
 
 #if defined(VK_USE_PLATFORM_WIN32_KHR)
@@ -3787,14 +3781,10 @@ NX_HLE("vkGetPhysicalDeviceSurfacePresentModes2EXT", w_vkGetPhysicalDeviceSurfac
 
 
 PFN_vkGetPhysicalDeviceSurfacePresentModesKHR p_vkGetPhysicalDeviceSurfacePresentModesKHR = nullptr;
-static void w_vkGetPhysicalDeviceSurfacePresentModesKHR(CPU& c) { c.x[0] = ret_u64(p_vkGetPhysicalDeviceSurfacePresentModesKHR(arg<VkPhysicalDevice>(c.x[0]), arg<VkSurfaceKHR>(c.x[1]), arg<uint32_t*>(c.x[2]), arg<VkPresentModeKHR*>(c.x[3]))); }
-NX_HLE("vkGetPhysicalDeviceSurfacePresentModesKHR", w_vkGetPhysicalDeviceSurfacePresentModesKHR);
 
 
 
 PFN_vkGetPhysicalDeviceSurfaceSupportKHR p_vkGetPhysicalDeviceSurfaceSupportKHR = nullptr;
-static void w_vkGetPhysicalDeviceSurfaceSupportKHR(CPU& c) { c.x[0] = ret_u64(p_vkGetPhysicalDeviceSurfaceSupportKHR(arg<VkPhysicalDevice>(c.x[0]), arg<uint32_t>(c.x[1]), arg<VkSurfaceKHR>(c.x[2]), arg<VkBool32*>(c.x[3]))); }
-NX_HLE("vkGetPhysicalDeviceSurfaceSupportKHR", w_vkGetPhysicalDeviceSurfaceSupportKHR);
 
 
 
