@@ -107,9 +107,20 @@ bool commit(uint64_t addr, uint64_t size) {
     return mprotect(reinterpret_cast<void*>(a), e - a, PROT_READ | PROT_WRITE) == 0;
 }
 
+// The guest frees 4 KiB pages; Apple silicon pages are 16 KiB, and mprotect would take the neighbours of a partly
+// freed page with it (SIGBUS in Wonder when nn::os's VAMM unmapped single pages). Only whole host pages are
+// released; the freed part of a shared one is zeroed, which is what the guest would see if it maps it again.
 void decommit(uint64_t addr, uint64_t size) {
-    madvise(reinterpret_cast<void*>(addr), size, MADV_FREE);
-    mprotect(reinterpret_cast<void*>(addr), size, PROT_NONE);
+    uint64_t page = uint64_t(getpagesize());
+    uint64_t lo = (addr + page - 1) & ~(page - 1), hi = (addr + size) & ~(page - 1);
+    if (lo >= hi) {
+        std::memset(reinterpret_cast<void*>(addr), 0, size);
+        return;
+    }
+    if (addr < lo) std::memset(reinterpret_cast<void*>(addr), 0, lo - addr);
+    if (hi < addr + size) std::memset(reinterpret_cast<void*>(hi), 0, addr + size - hi);
+    madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_FREE);
+    mprotect(reinterpret_cast<void*>(lo), hi - lo, PROT_NONE);
 }
 
 // ---- threads and time -----------------------------------------------------------------------------------------

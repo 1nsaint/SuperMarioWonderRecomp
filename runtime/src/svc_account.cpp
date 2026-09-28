@@ -97,6 +97,8 @@ void account(Service& s) {
     s.cmds[100] = [](IpcCtx&) { return 0u; };                       // InitializeApplicationInfo (old)
     s.cmds[101] = [](IpcCtx& c) { c.push_object(manager_for_application()); return 0u; };
     s.cmds[140] = [](IpcCtx&) { return 0u; };  // InitializeApplicationInfo
+    s.cmds[141] = [](IpcCtx& c) { write_uid_list(c); return 0u; };  // ListQualifiedUsers (SDK 16)
+    s.cmds[160] = [](IpcCtx&) { return 0u; };                       // InitializeApplicationInfoV2 (SDK 16)
     s.cmds[150] = [](IpcCtx& c) { c.push<uint8_t>(0); return 0u; };  // IsUserAccountSwitchLocked
 }
 

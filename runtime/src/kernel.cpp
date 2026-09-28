@@ -617,9 +617,13 @@ void svc(CPU& c, uint32_t imm, uint64_t pc) {
             break;
         }
         case 0x0A: {  // ExitThread
-            std::lock_guard lk(g_k);
-            t_self->exited = true;
-            notify_all();
+            {
+                // The lock must be released before the host thread ends: pthread_exit runs no C++ destructors on
+                // macOS, so a lock_guard alive across it kept the kernel locked for good (Wonder, ~frame 50).
+                std::lock_guard lk(g_k);
+                t_self->exited = true;
+                notify_all();
+            }
             plat::exit_thread();
         }
         case 0x0B: {  // SleepThread(ns)
