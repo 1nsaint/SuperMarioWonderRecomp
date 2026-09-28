@@ -68,6 +68,27 @@ CPU& current_cpu() { return t_self->ctx; }
 
 uint64_t system_tick() { return plat::monotonic_ns() * 192 / 10000; }  // 19.2 MHz
 
+// nn::os::GetSystemTick. Hades' main loop (nnMain, main+2496fc) polls it without pause until its fixed step is
+// due: on the Switch that thread owns a core, on a phone it pins a big core at 100% (80% of that thread's time was
+// clock reads) and the heat lowers everyone's clocks. A thread asking again within 20 us, 50 times in a row, is
+// spinning: let it sleep 0.5 ms (the loop keeps sub-millisecond precision against a 16.6 ms step).
+static void hle_get_system_tick(CPU& c) {
+    if (KThread* t = t_self) {
+        uint64_t now = plat::monotonic_ns();
+        if (now - t->last_tick_call < 20'000) {
+            if (++t->tick_spins >= 50) {
+                t->tick_spins = 0;
+                plat::sleep_ns(500'000);
+            }
+        } else {
+            t->tick_spins = 0;
+        }
+        t->last_tick_call = plat::monotonic_ns();
+    }
+    c.x[0] = system_tick();
+}
+NX_HLE("_ZN2nn2os13GetSystemTickEv", hle_get_system_tick);
+
 // ---- waiting --------------------------------------------------------------------------------------------------
 
 // Wait (with g_k held) until `self->wake` or timeout (ns, <0 = forever). Returns false on timeout.
@@ -298,6 +319,10 @@ static uint32_t svc_wait_synchronization(CPU& c, uint64_t handles, int32_t count
 static void thread_main(void* p) {
     KThread* t = static_cast<KThread*>(p);
     t_self = t;
+    t->host_tid = plat::current_thread_id();
+    char name[16];
+    std::snprintf(name, sizeof name, "g%llx", (unsigned long long)t->id);
+    plat::set_thread_name(name);
     call(t->ctx, t->entry);
     // Returning from the entry point is like svcExitThread.
     std::lock_guard lk(g_k);
@@ -377,6 +402,32 @@ static void watchdog(void*) {
             log("hang: thread dump requested");
             report_threads();
         }
+        // A file named profile (optionally holding a number of seconds): sample every guest thread's host pc into
+        // profile.txt next to it.
+        req = plat::data_root() + "/profile";
+        if (FILE* f = plat::fopen_utf8(req, "rb")) {
+            int seconds = 10;
+            if (std::fscanf(f, "%d", &seconds) != 1 || seconds <= 0) seconds = 10;
+            std::fclose(f);
+            std::remove(req.c_str());
+            std::vector<int64_t> tids;
+            std::vector<const uint64_t*> lrs;
+            std::vector<std::shared_ptr<KThread>> keep;  // alive while sampled
+            {
+                std::lock_guard al(g_all_lock);
+                for (auto& w : g_all)
+                    if (auto t = w.lock(); t && t->host_tid && !t->exited) {
+                        tids.push_back(t->host_tid);
+                        lrs.push_back(&t->ctx.x[30]);
+                        keep.push_back(t);
+                        log("profile: thread %llx is host tid %lld (entry %s)", (unsigned long long)t->id,
+                            (long long)t->host_tid, describe(t->entry).c_str());
+                    }
+            }
+            log("profile: sampling %zu threads for %d s", tids.size(), seconds);
+            bool ok = plat::profile(tids.data(), lrs.data(), tids.size(), seconds, plat::data_root() + "/profile.txt");
+            log("profile: %s", ok ? "written to profile.txt" : "not available on this platform");
+        }
         uint64_t f = g_frame, now = plat::monotonic_ns();
         if (f != last || plat::window_minimized()) {
             last = f;
@@ -401,6 +452,7 @@ uint32_t create_main_thread(uint64_t stack_size) {
     auto t = new_thread(0, 0, stack + stack_size, 44, 0);
     t->started = true;
     t_self = t.get();
+    t->host_tid = plat::current_thread_id();
     return t->handle;
 }
 
@@ -533,10 +585,23 @@ void svc(CPU& c, uint32_t imm, uint64_t pc) {
         }
         case 0x0B: {  // SleepThread(ns)
             int64_t ns = int64_t(c.x[0]);
-            if (ns <= 0)
-                plat::yield();
-            else
+            if (ns > 0) {
                 plat::sleep_ns(ns);
+                return;
+            }
+            // Yield (0, -1, -2). On the Switch a thread yielding in a loop only takes time nobody else wants; here
+            // each yield is a syscall on a real core (the network thread polls a flag this way and burned a whole
+            // core, heating the phone). Many yields in a row (64 within 1 ms of each other): sleep 0.2 ms.
+            KThread* t = t_self;
+            uint64_t now = plat::monotonic_ns();
+            if (now - t->last_yield > 1'000'000) t->yields = 0;
+            t->last_yield = now;
+            if (++t->yields < 64) {
+                plat::yield();
+            } else {
+                t->yields = 0;
+                plat::sleep_ns(200'000);
+            }
             return;
         }
         case 0x0C: {  // GetThreadPriority(handle) -> prio

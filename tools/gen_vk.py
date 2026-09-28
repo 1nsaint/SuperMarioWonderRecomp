@@ -22,12 +22,12 @@ SPECIAL = {
     "vkDestroyDebugUtilsMessengerEXT", "vkDestroyDebugReportCallbackEXT",
     "vkGetPhysicalDeviceQueueFamilyProperties", "vkGetPhysicalDeviceQueueFamilyProperties2",
     "vkGetPhysicalDeviceQueueFamilyProperties2KHR", "vkQueuePresentKHR", "vkGetDeviceQueue", "vkCreateSwapchainKHR",
-    "vkAcquireNextImageKHR", "vkGetSwapchainImagesKHR", "vkDestroySwapchainKHR",
+    "vkAcquireNextImageKHR", "vkGetSwapchainImagesKHR", "vkDestroySwapchainKHR", "vkWaitForFences",
 }
 # Host pointers the hand-written bridges still need are declared anyway (without a wrapper).
 POINTER_ONLY = {"vkGetPhysicalDeviceQueueFamilyProperties", "vkGetPhysicalDeviceQueueFamilyProperties2",
                 "vkQueuePresentKHR", "vkGetDeviceQueue", "vkCreateSwapchainKHR", "vkAcquireNextImageKHR",
-                "vkGetSwapchainImagesKHR", "vkDestroySwapchainKHR"}
+                "vkGetSwapchainImagesKHR", "vkDestroySwapchainKHR", "vkWaitForFences"}
 PLATFORMS = {None, "win32", "vi", "android"}
 FLOAT_TYPES = {"float", "double"}
 

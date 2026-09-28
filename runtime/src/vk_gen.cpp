@@ -4562,8 +4562,6 @@ NX_HLE("vkUpdateVideoSessionParametersKHR", w_vkUpdateVideoSessionParametersKHR)
 
 
 PFN_vkWaitForFences p_vkWaitForFences = nullptr;
-static void w_vkWaitForFences(CPU& c) { c.x[0] = ret_u64(p_vkWaitForFences(arg<VkDevice>(c.x[0]), arg<uint32_t>(c.x[1]), arg<const VkFence*>(c.x[2]), arg<VkBool32>(c.x[3]), arg<uint64_t>(c.x[4]))); }
-NX_HLE("vkWaitForFences", w_vkWaitForFences);
 
 
 

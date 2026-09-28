@@ -15,6 +15,8 @@ extern const nx::ModuleInfo nx_module_sdk;
 
 namespace nx {
 
+void apply_game_settings();  // game_settings.cpp
+
 uint64_t mrs(CPU& c, uint32_t sysreg) {
     switch (sysreg) {
         case 0xDF02:  // CNTVCT_EL0
@@ -76,6 +78,7 @@ static void rtld_fini(CPU&) {}
 static void nn_main(CPU& c) {
     init_module(c, nx_module_sdk);
     init_module(c, nx_module_main);
+    apply_game_settings();
     log("entering nnMain");
     uint64_t real = 0;
     for (size_t k = 0; k < nx_module_main.symbol_count; k++)

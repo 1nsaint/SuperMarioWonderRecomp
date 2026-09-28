@@ -1,6 +1,7 @@
 // Windows host: memory, threads, time, files, the game window (F11 / Alt+Enter fullscreen), XInput + keyboard,
 // XAudio2, the Vulkan loader and win32 surface, crash handler, hardware watchpoints (NX_WATCH) and main().
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -63,6 +64,16 @@ void exit_thread() { ExitThread(0); }
 void exit_process(int code) { ExitProcess(UINT(code)); }
 void sleep_ns(int64_t ns) { std::this_thread::sleep_for(std::chrono::nanoseconds(ns)); }
 void yield() { SwitchToThread(); }
+void set_thread_name(const char*) {}
+
+std::string setting(const std::string& key) {
+    std::string env = "NX_";
+    for (char ch : key) env += char(std::toupper(static_cast<unsigned char>(ch)));
+    const char* v = std::getenv(env.c_str());
+    return v ? v : "";
+}
+int64_t current_thread_id() { return int64_t(GetCurrentThreadId()); }
+bool profile(const int64_t*, const uint64_t* const*, size_t, int, const std::string&) { return false; }
 
 uint64_t monotonic_ns() {
     static const LARGE_INTEGER f = [] {

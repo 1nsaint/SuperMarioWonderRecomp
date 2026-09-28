@@ -21,6 +21,11 @@ struct KThread : KObject {
     CPU ctx{};
     uint64_t tls = 0;
     uint64_t entry = 0;
+    int64_t host_tid = 0;
+    uint64_t last_yield = 0;  // svcSleepThread(0) back-off
+    uint32_t yields = 0;
+    uint64_t last_tick_call = 0;  // nn::os::GetSystemTick back-off
+    uint32_t tick_spins = 0;
     int prio = 44, core = 0;
     bool started = false, exited = false, cancel = false;
     // wait state (under the kernel lock)

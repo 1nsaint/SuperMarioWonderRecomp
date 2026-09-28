@@ -20,6 +20,13 @@ void start_thread(ThreadFn fn, void* arg, size_t stack_size);
 [[noreturn]] void exit_process(int code);
 void sleep_ns(int64_t ns);
 void yield();
+void set_thread_name(const char* name);
+int64_t current_thread_id();  // the host OS thread id
+// Samples the given threads (thread CPU time, 1 kHz) for `seconds`: host pc, a few host frames and the guest lr
+// (read through guest_lr[k], the thread's x30). Writes one line per sample to `path`:
+//   <tid> <guest lr> <module>:<offset> [<module>:<offset> ...]   (host pc first, then callers)
+// False where not implemented.
+bool profile(const int64_t* tids, const uint64_t* const* guest_lr, size_t count, int seconds, const std::string& path);  // the host thread's name (debuggers, profilers, top)
 uint64_t monotonic_ns();
 
 // ---- files ----
@@ -30,7 +37,8 @@ bool make_dirs(const std::string& path);
 
 // ---- output ----
 void log_line(const char* line);  // stderr / logcat
-std::string data_root();          // where private/ lives ("private" on PC, the app's external files dir on Android)
+std::string data_root();
+std::string setting(const std::string& key);  // a player setting: config.txt (Android), NX_<KEY> (PC); "" if unset          // where private/ lives ("private" on PC, the app's external files dir on Android)
 
 // ---- display, input, audio ----
 void* create_window();       // native window handle for the Vulkan surface (HWND / ANativeWindow*)

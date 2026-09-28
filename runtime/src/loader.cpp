@@ -57,7 +57,11 @@ void log(const char* fmt, ...) {
 #else
         std::string def = plat::data_root() + "/../nx.log";
 #endif
-        g_log_file = std::fopen(path ? path : def.c_str(), "w");
+        std::string file = path ? path : def;
+        // Keep the previous session's log (a problem report should survive reopening the game).
+        std::remove((file + ".prev").c_str());
+        std::rename(file.c_str(), (file + ".prev").c_str());
+        g_log_file = std::fopen(file.c_str(), "w");
     }
     plat::log_line(buf);
     if (g_log_file) {

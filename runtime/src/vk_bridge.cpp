@@ -2,6 +2,7 @@
 // device creation (extension filtering), the Switch surface (VK_NN_vi_surface -> VK_KHR_win32_surface), physical
 // device order (discrete GPU first) and debug callbacks (guest function pointers the host must never call).
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <unordered_map>
@@ -9,6 +10,11 @@
 #include <vector>
 
 #include "vk_gen.h"
+
+namespace nx {
+void log_game_settings();  // game_settings.cpp
+void apply_game_settings();
+}
 
 namespace nx::vk {
 
@@ -31,7 +37,7 @@ const std::unordered_set<std::string> kSpecial = {
     "vkCreateDebugReportCallbackEXT", "vkDestroyInstance", "vkEnumeratePhysicalDevices",
     "vkDestroyDebugUtilsMessengerEXT", "vkDestroyDebugReportCallbackEXT", "vkGetPhysicalDeviceQueueFamilyProperties",
     "vkGetPhysicalDeviceQueueFamilyProperties2", "vkGetPhysicalDeviceQueueFamilyProperties2KHR", "vkQueuePresentKHR", "vkGetDeviceQueue", "vkCreateSwapchainKHR",
-    "vkAcquireNextImageKHR", "vkGetSwapchainImagesKHR", "vkDestroySwapchainKHR",
+    "vkAcquireNextImageKHR", "vkGetSwapchainImagesKHR", "vkDestroySwapchainKHR", "vkWaitForFences",
 };
 
 void load_loader() {
@@ -118,6 +124,9 @@ void w_vkEnumerateInstanceLayerProperties(CPU& c) {
 
 void w_vkCreateInstance(CPU& c) {  // (const VkInstanceCreateInfo*, alloc, VkInstance*)
     load_loader();
+    // The engine resets its settings to their registered defaults when it loads its configuration (early in
+    // nnMain); the renderer, starting here, is what reads the display ones. Apply the player's settings again.
+    apply_game_settings();
     VkInstanceCreateInfo ci = *reinterpret_cast<const VkInstanceCreateInfo*>(c.x[0]);
     uint32_t nhave = 0;
     host_enum_inst_ext(nullptr, &nhave, nullptr);
@@ -274,6 +283,16 @@ void w_vkCreateViSurfaceNN(CPU& c) {  // (instance, const VkViSurfaceCreateInfoN
 // image index. Hosts that hand out more images (Android: 4+) get a virtual swapchain: the game sees 3 plain images
 // and each present copies the rendered one into the host image acquired for it.
 constexpr uint32_t kMaxGuestImages = 3;
+
+// Where the frame time goes, reported with the fps line: host time spent blocked in fence waits (GPU behind),
+// acquire and present, summed over the report interval.
+std::atomic<uint64_t> g_wait_fence_ns{0}, g_wait_acquire_ns{0}, g_wait_present_ns{0};
+
+struct Timed {
+    std::atomic<uint64_t>& sum;
+    uint64_t t0 = plat::monotonic_ns();
+    ~Timed() { sum += plat::monotonic_ns() - t0; }
+};
 
 struct SwapchainInfo {
     VkDevice device;
@@ -552,8 +571,15 @@ void wait_while_minimized() {
     while (plat::window_minimized()) plat::sleep_ns(50'000'000);
 }
 
+void w_vkWaitForFences(CPU& c) {  // (device, count, const VkFence*, waitAll, timeout)
+    Timed t{g_wait_fence_ns};
+    c.x[0] = ret_u64(p_vkWaitForFences(arg<VkDevice>(c.x[0]), uint32_t(c.x[1]), arg<const VkFence*>(c.x[2]),
+                                       VkBool32(c.x[3]), c.x[4]));
+}
+
 void w_vkAcquireNextImageKHR(CPU& c) {  // (device, swapchain, timeout, semaphore, fence, uint32_t* index)
     wait_while_minimized();
+    Timed timed{g_wait_acquire_ns};
     // The game's semaphore and fence go to the host acquire: they signal when the host image is free, which is
     // what the copy on present writes. The game gets the next virtual image.
     auto it = g_swapchains.find(c.x[1]);
@@ -689,15 +715,31 @@ void w_vkQueuePresentKHR(CPU& c) {
     std::vector<uint32_t> host_indices;
     std::vector<VkSemaphore> copied;
     copy_virtual(queue, pi, host_indices, copied);
+    uint64_t tp = plat::monotonic_ns();
     VkResult r = p_vkQueuePresentKHR(queue, &pi);
+    g_wait_present_ns += plat::monotonic_ns() - tp;
     nx::g_frame = frames + 1;
     if (extra) {
         p_vkQueueWaitIdle(queue);
         p_vkDestroySemaphore(g_swapchains.begin()->second.device, extra, nullptr);
     }
+    // Worst frame (time between presents) of the interval: what is felt as stutter.
+    static uint64_t prev_present = 0, worst = 0;
+    uint64_t now_ns = plat::monotonic_ns();
+    if (prev_present) worst = std::max(worst, now_ns - prev_present);
+    prev_present = now_ns;
+    if (frames == 0) log_game_settings();
     if (++frames == 1 || frames % 300 == 0) {
-        double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        log("vk: frame %llu presented (%d), %.1f fps average", (unsigned long long)frames, r, frames / s);
+        static auto last = t0;
+        auto now = std::chrono::steady_clock::now();
+        double s = std::chrono::duration<double>(now - t0).count(), ds = std::chrono::duration<double>(now - last).count();
+        auto per_frame = [](std::atomic<uint64_t>& a) { return a.exchange(0) / 300.0 / 1e6; };
+        log("vk: frame %llu presented (%d), %.1f fps (last %.1f s), %.1f average; worst %.1f ms; per frame: "
+            "fences %.2f ms, acquire %.2f ms, present %.2f ms",
+            (unsigned long long)frames, r, frames == 1 ? 0.0 : 300 / ds, ds, frames / s, worst / 1e6,
+            per_frame(g_wait_fence_ns), per_frame(g_wait_acquire_ns), per_frame(g_wait_present_ns));
+        last = now;
+        worst = 0;
     }
     c.x[0] = ret_u64(r);
 }
@@ -724,6 +766,7 @@ NX_HLE("vkGetPhysicalDeviceQueueFamilyProperties2KHR", w_vkGetPhysicalDeviceQueu
 NX_HLE("vkCreateViSurfaceNN", w_vkCreateViSurfaceNN);
 NX_HLE("vkQueuePresentKHR", w_vkQueuePresentKHR);
 NX_HLE("vkAcquireNextImageKHR", w_vkAcquireNextImageKHR);
+NX_HLE("vkWaitForFences", w_vkWaitForFences);
 NX_HLE("vkGetDeviceQueue", w_vkGetDeviceQueue);
 NX_HLE("vkCreateSwapchainKHR", w_vkCreateSwapchainKHR);
 NX_HLE("vkGetSwapchainImagesKHR", w_vkGetSwapchainImagesKHR);

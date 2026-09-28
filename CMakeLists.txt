@@ -45,6 +45,7 @@ set(NX_RUNTIME_SOURCES
     runtime/src/hle_audio.cpp
     runtime/src/vk_bridge.cpp
     runtime/src/vk_gen.cpp
+    runtime/src/game_settings.cpp
 )
 
 # Vulkan headers (the same registry version tools/gen_vk.py generated from). The loader comes with the GPU driver.

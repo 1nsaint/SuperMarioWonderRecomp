@@ -22,11 +22,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_ANDROID_KHR
@@ -110,6 +112,100 @@ void sleep_ns(int64_t ns) {
 }
 
 void yield() { sched_yield(); }
+void set_thread_name(const char* name) { pthread_setname_np(pthread_self(), name); }
+int64_t current_thread_id() { return gettid(); }
+
+// ---- sampling profiler (simpleperf is not always allowed on retail phones) ------------------------------------
+
+namespace {
+constexpr uint32_t kMaxSamples = 1u << 18;
+constexpr int kFrames = 12;
+struct Sample {
+    int32_t tid;
+    uint64_t guest_lr;
+    uint64_t pc[kFrames];  // host pc, lr, then return addresses from the frame-pointer chain
+};
+std::atomic<uint32_t> g_nsamples{0};
+Sample* g_samples = nullptr;
+const int64_t* g_prof_tids = nullptr;
+const uint64_t* const* g_prof_lr = nullptr;
+size_t g_prof_count = 0;
+
+void on_sample(int, siginfo_t*, void* uc) {
+    uint32_t i = g_nsamples.fetch_add(1, std::memory_order_relaxed);
+    if (i >= kMaxSamples) return;
+    Sample& s = g_samples[i];
+    const mcontext_t& m = static_cast<ucontext_t*>(uc)->uc_mcontext;
+    s.tid = gettid();
+    s.guest_lr = 0;
+    for (size_t k = 0; k < g_prof_count; k++)
+        if (g_prof_tids[k] == s.tid) s.guest_lr = *g_prof_lr[k];
+    std::memset(s.pc, 0, sizeof s.pc);
+    s.pc[0] = m.pc;
+    s.pc[1] = m.regs[30];
+    // Frame records (fp -> [prev fp, lr]) on this thread's stack only: between sp and sp + 256 MiB, going up.
+    uint64_t fp = m.regs[29], lo = m.sp, hi = m.sp + (256ull << 20);
+    for (int k = 2; k < kFrames && fp >= lo && fp < hi && (fp & 7) == 0; k++) {
+        const uint64_t* rec = reinterpret_cast<const uint64_t*>(fp);
+        s.pc[k] = rec[1];
+        if (rec[0] <= fp) break;
+        fp = rec[0];
+    }
+}
+}  // namespace
+
+bool profile(const int64_t* tids, const uint64_t* const* guest_lr, size_t count, int seconds, const std::string& path) {
+    if (!g_samples) g_samples = new Sample[kMaxSamples];
+    g_prof_tids = tids;
+    g_prof_lr = guest_lr;
+    g_prof_count = count;
+    g_nsamples = 0;
+    struct sigaction sa{};
+    sa.sa_sigaction = on_sample;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGPROF, &sa, nullptr);
+    std::vector<timer_t> timers;
+    for (size_t k = 0; k < count; k++) {
+        // The thread's CPU-time clock (Linux: MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED)).
+        clockid_t clock = clockid_t((~uint32_t(tids[k]) << 3) | 6);
+        sigevent sev{};
+        sev.sigev_notify = SIGEV_THREAD_ID;
+        sev.sigev_signo = SIGPROF;
+        sev.sigev_notify_thread_id = int(tids[k]);
+        timer_t t;
+        if (timer_create(clock, &sev, &t) != 0) continue;
+        itimerspec its{{0, 1'000'000}, {0, 1'000'000}};
+        timer_settime(t, 0, &its, nullptr);
+        timers.push_back(t);
+    }
+    sleep_ns(int64_t(seconds) * 1'000'000'000);
+    for (timer_t t : timers) timer_delete(t);
+    sleep_ns(10'000'000);
+    g_prof_count = 0;
+    uint32_t n = std::min(g_nsamples.load(), kMaxSamples);
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) return false;
+    Dl_info self{};
+    dladdr(reinterpret_cast<void*>(&on_sample), &self);
+    for (uint32_t i = 0; i < n; i++) {
+        const Sample& s = g_samples[i];
+        std::fprintf(f, "%d %llx", s.tid, (unsigned long long)s.guest_lr);
+        for (int k = 0; k < kFrames && s.pc[k]; k++) {
+            Dl_info d{};
+            if (dladdr(reinterpret_cast<void*>(s.pc[k]), &d) && d.dli_fbase) {
+                const char* name = d.dli_fbase == self.dli_fbase ? "self" : d.dli_fname;
+                const char* slash = std::strrchr(name, '/');
+                std::fprintf(f, " %s:%llx", slash ? slash + 1 : name,
+                             (unsigned long long)(s.pc[k] - uint64_t(d.dli_fbase)));
+            } else {
+                std::fprintf(f, " ?:%llx", (unsigned long long)s.pc[k]);
+            }
+        }
+        std::fputc('\n', f);
+    }
+    std::fclose(f);
+    return true;
+}
 
 uint64_t monotonic_ns() {
     timespec ts;
@@ -132,10 +228,11 @@ void log_line(const char* line) { __android_log_write(ANDROID_LOG_INFO, "hades",
 
 std::string data_root() { return g_root; }
 
-static std::string config(const std::string& key) {
+std::string setting(const std::string& key) {
     std::ifstream f(g_root + "/config.txt");
     std::string line;
     while (std::getline(f, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
         auto eq = line.find('=');
         if (eq != std::string::npos && line.substr(0, eq) == key) return line.substr(eq + 1);
     }
@@ -144,15 +241,19 @@ static std::string config(const std::string& key) {
 
 // ---- window ---------------------------------------------------------------------------------------------------
 
+// The window handed out stays valid for good (we hold a reference): Android destroys the activity's window when
+// the app goes to the background or the screen locks (APP_CMD_TERM_WINDOW), and until then we wait for one.
 void* create_window() {
-    while (!g_window) sleep_ns(10'000'000);
-    return g_window.load();
+    ANativeWindow* w;
+    while (!(w = g_window.load())) sleep_ns(10'000'000);
+    ANativeWindow_acquire(w);
+    return w;
 }
 
 bool window_minimized() { return !g_visible || !g_window; }
 
 void window_size(uint32_t& w, uint32_t& h) {
-    std::string r = config("resolution");
+    std::string r = setting("resolution");
     unsigned cw = 0, ch = 0;
     if (!r.empty() && std::sscanf(r.c_str(), "%ux%u", &cw, &ch) == 2 && cw && ch) {
         w = cw;
@@ -162,6 +263,7 @@ void window_size(uint32_t& w, uint32_t& h) {
     ANativeWindow* win = static_cast<ANativeWindow*>(create_window());
     // The phone's own screen, landscape.
     int32_t a = ANativeWindow_getWidth(win), b = ANativeWindow_getHeight(win);
+    ANativeWindow_release(win);
     w = uint32_t(std::max(a, b));
     h = uint32_t(std::min(a, b));
 }
@@ -395,6 +497,8 @@ int vulkan_create_surface(void* instance, void* native_window, uint64_t* surface
 
 namespace {
 
+struct sigaction g_previous[32];  // the handlers before ours (debuggerd's)
+
 void crash(int sig, siginfo_t* info, void* uc) {
     nx::log("CRASH: signal %d, fault address %p", sig, info->si_addr);
     if (nx::self_thread()) {
@@ -404,6 +508,13 @@ void crash(int sig, siginfo_t* info, void* uc) {
             nx::log("  x%-2d %016llx %016llx %016llx %016llx", k, (unsigned long long)c.x[k],
                     (unsigned long long)c.x[k + 1], (unsigned long long)c.x[k + 2], (unsigned long long)c.x[k + 3]);
         nx::backtrace(c);
+    }
+    // Hand the signal to the previous handler, Android's debuggerd: it logs the host backtrace (a tombstone).
+    const struct sigaction& prev = g_previous[sig];
+    if (prev.sa_flags & SA_SIGINFO) {
+        if (prev.sa_sigaction) prev.sa_sigaction(sig, info, uc);
+    } else if (prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN && prev.sa_handler) {
+        prev.sa_handler(sig);
     }
     _exit(128 + sig);
 }
@@ -425,7 +536,8 @@ void on_cmd(android_app* app, int32_t cmd) {
             g_window = app->window;
             g_visible = true;
             break;
-        case APP_CMD_TERM_WINDOW:
+        case APP_CMD_TERM_WINDOW:  // the window goes away once this returns
+            g_window = nullptr;
             g_visible = false;
             break;
         case APP_CMD_GAINED_FOCUS:
@@ -491,7 +603,7 @@ extern "C" void android_main(android_app* app) {
     struct sigaction sa{};
     sa.sa_sigaction = crash;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(s, &sa, nullptr);
+    for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(s, &sa, &g_previous[s]);
 
     nx::log("Hades (Switch recomp) on Android, data at %s", g_root.c_str());
     static bool started = false;
