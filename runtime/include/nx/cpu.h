@@ -84,8 +84,12 @@ struct JmpState {
 // reads; left to itself it kept adds32/adds64 as calls in the huge generated functions).
 #if defined(_MSC_VER)
 #define NX_INLINE __forceinline
+#define NX_RESTRICT
 #else
 #define NX_INLINE inline __attribute__((always_inline))
+// The generated functions' CPU context: guest memory never overlaps it (the guest cannot see the host heap), so the
+// compiler may keep guest registers in host registers across guest loads and stores instead of reloading them.
+#define NX_RESTRICT __restrict
 #endif
 
 // ---- memory -------------------------------------------------------------------------------------------------

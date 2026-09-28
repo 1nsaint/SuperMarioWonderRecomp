@@ -240,7 +240,7 @@ class Emitter:
                 stmt += f" nx::trace_sp(c, {B} + {a:#x}ull);"
             body.append((a, f"{stmt} // {i.mnemonic} {i.op_str}"))
             last_term = i.mnemonic in ("b", "br", "ret", "udf", "brk") or stmt.endswith("return; }")
-        out = [f"void {self.fn(f.start)}(nx::CPU& c) {{"]
+        out = [f"void {self.fn(f.start)}(nx::CPU& NX_RESTRICT c) {{"]
         sj = self.setjmp_sites
         if sj:
             # Functions that call setjmp run inside a try: a longjmp on one of their buffers resumes after the call.
