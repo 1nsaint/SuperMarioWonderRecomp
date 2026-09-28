@@ -70,9 +70,11 @@ void window_thread(std::atomic<bool>* ready) {
     wc.lpszClassName = L"HadesRecomp";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
-    // 16:9, about 80% of the screen height, centred.
+    // The render resolution's aspect (NX_RESOLUTION, default 16:9), about 80% of the screen height, centred.
+    unsigned rw = 16, rh = 9;
+    if (const char* r = std::getenv("NX_RESOLUTION")) std::sscanf(r, "%ux%u", &rw, &rh);
     int sh = GetSystemMetrics(SM_CYSCREEN);
-    int ch = std::max(720, sh * 8 / 10), cw = ch * 16 / 9;
+    int ch = std::max(540, sh * 8 / 10), cw = int(int64_t(ch) * rw / std::max(1u, rh));
     RECT r{0, 0, cw, ch};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     int w = r.right - r.left, h = r.bottom - r.top;

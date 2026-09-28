@@ -126,6 +126,27 @@ static void nn_main(CPU& c) {
 }
 NX_HLE("nnMain", nn_main);
 
+// Render resolution. nnMain sets the game's output size to 1280x720 in two globals (main+0x8ccd98 and
+// main+0x8ccec0: {u32 width, u32 height}) and then calls nn::time::Initialize before creating the renderer; that
+// import is our hook to put NX_RESOLUTION=WxH there instead.
+static void time_initialize(CPU& c) {
+    if (const char* r = std::getenv("NX_RESOLUTION")) {
+        unsigned w = 0, h = 0;
+        if (std::sscanf(r, "%ux%u", &w, &h) == 2 && w && h) {
+            for (uint64_t off : {0x8ccd98ull, 0x8ccec0ull}) {
+                uint64_t p = nx_module_main.base + off;
+                if (ld<uint32_t>(p) == 1280 && ld<uint32_t>(p + 4) == 720) {
+                    st<uint32_t>(p, w);
+                    st<uint32_t>(p + 4, h);
+                }
+            }
+            log("render resolution %ux%u", w, h);
+        }
+    }
+    call(c, find_symbol("_ZN2nn4time10InitializeEv"));
+}
+NX_HLE("_ZN2nn4time10InitializeEv", time_initialize);
+
 // longjmp(buf, val): unwinds the host stack to the recompiled function that called setjmp on buf.
 static void long_jmp(CPU& c) { throw LongJmp{c.x[0], uint32_t(c.x[1])}; }
 NX_HLE("longjmp", long_jmp);
