@@ -1,4 +1,7 @@
 // nn::hid at the API level: Npad state from an XInput controller or the keyboard. Vibration is accepted and dropped.
+#include <string>
+#include <vector>
+
 #include <windows.h>
 #include <xinput.h>
 
@@ -30,8 +33,41 @@ struct Pad {
     int32_t lx = 0, ly = 0, rx = 0, ry = 0;
 };
 
+// Scripted input for automated runs: NX_INPUT="3300:A,3900:A,4200:Down" holds the button for 8 frames from the
+// given presented frame.
+struct Scripted {
+    uint64_t frame;
+    uint64_t buttons;
+};
+
+std::vector<Scripted> input_script() {
+    std::vector<Scripted> v;
+    const char* e = std::getenv("NX_INPUT");
+    if (!e) return v;
+    std::string s = e;
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t comma = s.find(',', pos);
+        std::string item = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        size_t colon = item.find(':');
+        if (colon != std::string::npos) {
+            std::string b = item.substr(colon + 1);
+            uint64_t bits = b == "A" ? kA : b == "B" ? kB : b == "X" ? kX : b == "Y" ? kY : b == "Plus" ? kPlus :
+                            b == "Minus" ? kMinus : b == "Up" ? kUp : b == "Down" ? kDown : b == "Left" ? kLeft :
+                            b == "Right" ? kRight : b == "L" ? kL : b == "R" ? kR : 0;
+            v.push_back({std::strtoull(item.c_str(), nullptr, 10), bits});
+        }
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return v;
+}
+
 Pad read_pad() {
     Pad p;
+    static const std::vector<Scripted> script = input_script();
+    for (const auto& s : script)
+        if (g_frame >= s.frame && g_frame < s.frame + 8) p.buttons |= s.buttons;
     XINPUT_STATE xs{};
     if (XInputGetState(0, &xs) == ERROR_SUCCESS) {
         const auto& g = xs.Gamepad;

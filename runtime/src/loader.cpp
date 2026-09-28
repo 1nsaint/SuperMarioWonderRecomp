@@ -15,6 +15,7 @@
 namespace nx {
 
 bool g_trace = false;
+std::atomic<uint64_t> g_frame{0};
 
 namespace {
 

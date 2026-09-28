@@ -53,6 +53,33 @@ uint64_t mrs(CPU& c, uint32_t sysreg);
 void msr(CPU& c, uint32_t sysreg, uint64_t value);
 void trace_sp(CPU& c, uint64_t pc);  // debug (NX_TRACE_SP at recompile time)
 
+// ---- setjmp / longjmp -----------------------------------------------------------------------------------------
+// A guest longjmp throws LongJmp; the recompiled function that called setjmp on that buffer catches it, restores
+// the callee-saved registers it saved at setjmp time and resumes right after the setjmp call.
+
+struct LongJmp {
+    uint64_t buf;
+    uint64_t val;
+};
+
+struct JmpState {
+    uint64_t buf = 0;
+    uint64_t x[13];  // x19..x30, sp
+    uint64_t d[8];   // d8..d15
+    void save(const CPU& c) {
+        buf = c.x[0];
+        for (int k = 0; k < 13; k++) x[k] = c.x[19 + k];
+        for (int k = 0; k < 8; k++) d[k] = c.v[8 + k].u64[0];
+    }
+    void restore(CPU& c) const {
+        for (int k = 0; k < 13; k++) c.x[19 + k] = x[k];
+        for (int k = 0; k < 8; k++) {
+            c.v[8 + k].u64[0] = d[k];
+            c.v[8 + k].u64[1] = 0;
+        }
+    }
+};
+
 // ---- memory -------------------------------------------------------------------------------------------------
 
 template <typename T>

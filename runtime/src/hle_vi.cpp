@@ -35,11 +35,14 @@ void window_thread(std::atomic<bool>* ready) {
     wc.lpszClassName = L"HadesRecomp";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
-    RECT r{0, 0, 1920, 1080};
+    // Windowed, the size the game renders at (720p), centred on the primary screen.
+    RECT r{0, 0, 1280, 720};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    int w = r.right - r.left, h = r.bottom - r.top;
+    int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2, y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
     g_window = CreateWindowW(wc.lpszClassName, L"Hades (Switch recomp)", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                             CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr,
-                             wc.hInstance, nullptr);
+                             std::max(0, x), std::max(0, y), w, h, nullptr, nullptr, wc.hInstance, nullptr);
+    SetForegroundWindow(g_window);
     *ready = true;
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {

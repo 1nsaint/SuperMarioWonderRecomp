@@ -1,4 +1,4 @@
-# SwitchGamesRecomp
+﻿# SwitchGamesRecomp
 
 Static recompilation of Nintendo Switch 1 games (AArch64) to native PC, CPU and GPU. First target: **Hades** (Supergiant, 0100535012974000).
 
@@ -6,15 +6,17 @@ No game data here. Everything derived from the game, keys and firmware stays in 
 
 ## Status
 
-**Hades boots to the main menu natively on PC**: the CPU code is recompiled (main + Nintendo's SDK, 3.0M AArch64
+**Hades runs natively on PC, from boot to gameplay**: the CPU code is recompiled (main + Nintendo's SDK, 3.0M AArch64
 instructions), the game's own Vulkan renderer (The Forge) runs on the host GPU through generated bridges, no
 emulation anywhere. RTX 3050 laptop, 1280x720, 143 fps (vsync).
 
 | Logo | Main menu |
 |---|---|
 | ![logo](docs/media/first-frame-logo.png) | ![menu](docs/media/main-menu.png) |
+| **Intro** | **Gameplay** |
+| ![intro](docs/media/intro.png) | ![gameplay](docs/media/gameplay.png) |
 
-Next: input into the menu and gameplay, audio output, native resolution. See the phase issues.
+Next: audio output, native resolution, C++ exceptions, a full run through the game. See the phase issues.
 
 ## Approach
 
@@ -31,7 +33,7 @@ Both sides are little endian, so no byte swapping. Details in [docs/FINDINGS.md]
 | Phase | What |
 |---|---|
 | 0 | Extraction and analysis |
-| 1 | AArch64 → C++ recompiler: functions, jump tables, NEON, atomics |
+| 1 | AArch64 â†’ C++ recompiler: functions, jump tables, NEON, atomics |
 | 2 | Runtime: loader, memory, threads, nn:: HLE |
 | 3 | Vulkan passthrough: first native pixels |
 | 4 | Audio, input, stability, full game |

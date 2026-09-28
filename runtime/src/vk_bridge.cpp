@@ -441,6 +441,7 @@ void w_vkQueuePresentKHR(CPU& c) {
     VkSemaphore extra = VK_NULL_HANDLE;
     if (std::find(shots.begin(), shots.end(), frames + 1) != shots.end()) capture(queue, pi, frames + 1, extra);
     VkResult r = p_vkQueuePresentKHR(queue, &pi);
+    nx::g_frame = frames + 1;
     if (extra) {
         p_vkQueueWaitIdle(queue);
         p_vkDestroySemaphore(g_swapchains.begin()->second.device, extra, nullptr);

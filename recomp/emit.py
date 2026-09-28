@@ -213,6 +213,7 @@ class Emitter:
 
     def function(self, f):
         self.labels = set()
+        self.setjmp_sites = []
         body = []
         code = bytes(self.m.image[f.start:f.end])
         insns = {}
@@ -240,6 +241,13 @@ class Emitter:
             body.append((a, f"{stmt} // {i.mnemonic} {i.op_str}"))
             last_term = i.mnemonic in ("b", "br", "ret", "udf", "brk") or stmt.endswith("return; }")
         out = [f"void {self.fn(f.start)}(nx::CPU& c) {{"]
+        sj = self.setjmp_sites
+        if sj:
+            # Functions that call setjmp run inside a try: a longjmp on one of their buffers resumes after the call.
+            out.append(f"    nx::JmpState js_[{len(sj)}]; int jr_ = -1;")
+            out.append("    for (;;) { try {")
+            cases = " ".join(f"case {k}: goto L_{a:X};" for k, a in enumerate(sj))
+            out.append(f"    switch (jr_) {{ {cases} default: break; }}")
         for a, stmt in body:
             if a in self.labels:
                 out.append(f"L_{a:X}:;")
@@ -248,6 +256,14 @@ class Emitter:
             # Falls off the end: continue into whatever follows.
             out.append("    " + (f"{self.fn(f.end)}(c);" if f.end in self.entries else
                                  f"nx::call(c, {B} + {f.end:#x}ull);"))
+        if sj:
+            out.append("    return;")
+            out.append("    } catch (const nx::LongJmp& e_) {")
+            out.append("        jr_ = -1;")
+            out.append(f"        for (int k = 0; k < {len(sj)}; k++) if (js_[k].buf == e_.buf) {{ jr_ = k; break; }}")
+            out.append("        if (jr_ < 0) throw;")
+            out.append("        js_[jr_].restore(c); c.x[0] = e_.val ? e_.val : 1;")
+            out.append("    } }")
         out.append("}")
         return "\n".join(out)
 
@@ -269,6 +285,12 @@ class Emitter:
 
     def i_bl(self, f, i, ops):
         t = self.target(ops[0])
+        if self.an.plt.get(t) in ("setjmp", "_setjmp", "__setjmp"):
+            # setjmp: remember the callee-saved state; a later longjmp on this buffer lands at the next label.
+            k = len(self.setjmp_sites)
+            self.setjmp_sites.append(i.address + 4)
+            self.labels.add(i.address + 4)
+            return f"js_[{k}].save(c); c.x[0] = 0;"
         call = f"{self.fn(t)}(c);" if t in self.entries else f"nx::call(c, {B} + {t:#x}ull);"
         return f"c.x[30] = {B} + {i.address + 4:#x}ull; {call}"
 

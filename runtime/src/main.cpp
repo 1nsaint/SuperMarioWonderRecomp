@@ -125,6 +125,11 @@ static void nn_main(CPU& c) {
     call(c, real);
 }
 NX_HLE("nnMain", nn_main);
+
+// longjmp(buf, val): unwinds the host stack to the recompiled function that called setjmp on buf.
+static void long_jmp(CPU& c) { throw LongJmp{c.x[0], uint32_t(c.x[1])}; }
+NX_HLE("longjmp", long_jmp);
+NX_HLE("_longjmp", long_jmp);
 static void rtld_fini(CPU&) {}
 static void process_return(CPU&) {
     log("nn::init::Start returned");
