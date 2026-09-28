@@ -463,6 +463,7 @@ int main() {
         while (SDL_PollEvent(&e)) {
             switch (e.type) {
             case SDL_EVENT_QUIT:
+                nx::log("platform: quit requested (window closed / Cmd-Q)");
                 exit_process(0);
             case SDL_EVENT_WINDOW_MINIMIZED:
             case SDL_EVENT_WINDOW_HIDDEN:

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -31,6 +32,7 @@ std::unordered_map<uint32_t, std::shared_ptr<KObject>> g_handles;
 uint32_t g_next_handle = 0x10000;
 std::atomic<uint64_t> g_next_thread_id{0x50};
 uint64_t g_heap_size = 0;
+
 
 std::vector<KThread*> g_mutex_waiters;  // FIFO
 std::vector<KThread*> g_cv_waiters;
@@ -72,6 +74,8 @@ void notify_all() {
 }
 
 KThread* self_thread() { return t_self; }
+
+uint64_t heap_size() { return g_heap_size; }
 
 CPU& current_cpu() { return t_self->ctx; }
 
@@ -217,7 +221,19 @@ static uint32_t svc_signal_process_wide_key(uint64_t key, int32_t count) {
     return 0;
 }
 
+// NX_TRACE_ADDR=<hex>: log every wait on and signal to that address (lost wakeups in the guest's sync objects).
+static uint64_t trace_addr() {
+    static uint64_t a = [] {
+        const char* e = std::getenv("NX_TRACE_ADDR");
+        return e ? std::strtoull(e, nullptr, 16) : 0ull;
+    }();
+    return a;
+}
+
 static uint32_t svc_wait_for_address(uint64_t addr, uint32_t type, int32_t value, int64_t timeout) {
+    if (addr == trace_addr())
+        log("arb: thread %x waits on %llx type %u value %d (memory %d) timeout %lld", t_self ? t_self->handle : 0,
+            (unsigned long long)addr, type, value, int32_t(load32(addr)), (long long)timeout);
     std::unique_lock lk(g_k);
     KThread* self = t_self;
     int32_t cur = int32_t(load32(addr));
@@ -263,6 +279,9 @@ static int wake_addr(uint64_t addr, int32_t count) {
 }
 
 static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t value, int32_t count) {
+    if (addr == trace_addr())
+        log("arb: thread %x signals %llx type %u value %d count %d (memory %d)", t_self ? t_self->handle : 0,
+            (unsigned long long)addr, type, value, count, int32_t(load32(addr)));
     std::unique_lock lk(g_k);
     int waiters = int(std::count_if(g_addr_waiters.begin(), g_addr_waiters.end(), [&](KThread* t) { return t->wait_addr == addr; }));
     switch (type) {
@@ -356,6 +375,7 @@ static std::shared_ptr<KThread> new_thread(uint64_t entry, uint64_t arg, uint64_
     // Static TLS block for the thread (what rtld and the libc provide on Horizon): the thread pointer, stored at
     // TLS region +0x1F0 where nn::os loads TPIDR_EL0 from. main's TLS is 0x440 bytes of .tbss at tp+0x10.
     uint64_t block = kernel_alloc(0x4000);
+    init_tls_block(block);  // main's .tdata initial values (Wonder: 16 bytes, {-1, 0}); the rest is .tbss, zero
     st<uint64_t>(t->tls + 0x1F0, block);
     t->ctx.tpidr = block;
     t->ctx.x[0] = arg;
@@ -538,40 +558,6 @@ void backtrace(CPU& c) {
     }
 }
 
-static uint64_t get_info(uint32_t type, uint32_t handle, uint64_t sub, uint32_t& rc) {
-    rc = 0;
-    switch (type) {
-        case 0: return 0xF;                         // AllowedCpuIdBitmask
-        case 1: return 0xFFFFFFFFFFFFFFFFull >> 0;  // AllowedThreadPriorityMask
-        case 2: return kAliasBase;
-        case 3: return kAliasSize;
-        case 4: return kHeapBase;
-        case 5: return kHeapMax;
-        case 6: return 0xCD500000;  // TotalMemoryAvailable (~3.2 GiB, like an application)
-        case 7: return g_heap_size + 0x4000000;
-        case 8: return 0;  // IsCurrentProcessBeingDebugged
-        case 9: return 0;  // ResourceLimit handle
-        case 10: return 0;  // IdleTickCount
-        case 11: return 0x1234567890ABCDEFull ^ sub;  // RandomEntropy
-        case 12: return kAddressSpaceBase;
-        case 13: return kAddressSpaceSize;
-        case 14: return kStackBase;
-        case 15: return kStackSize;
-        case 16: return game::kInfo.system_resource_size;  // SystemResourceSizeTotal
-        case 17: return 0;
-        case 18: return game::kInfo.program_id;  // ProgramId
-        case 20: return 0;  // UserExceptionContextAddress
-        case 21: return 0xCD500000;
-        case 22: return g_heap_size + 0x4000000;
-        case 23: return 1;  // IsApplication
-        case 0xF0000002: return 0;  // ThreadTickCount
-        default:
-            log("svcGetInfo: unknown type %u sub %llu", type, (unsigned long long)sub);
-            rc = 0xF001;
-            return 0;
-    }
-}
-
 void svc(CPU& c, uint32_t imm, uint64_t pc) {
     if (g_trace) log("svc %#x from %s", imm, describe(pc).c_str());
     uint32_t rc = 0;
@@ -672,7 +658,8 @@ void svc(CPU& c, uint32_t imm, uint64_t pc) {
             c.x[2] = 0xF;
             break;
         }
-        case 0x0F:  // SetThreadCoreMask
+        case 0x0F:  // SetThreadCoreMask(handle, ideal core, mask)
+            rc = set_thread_core_mask(uint32_t(c.x[0]), int32_t(c.x[1]), c.x[2]);
             break;
         case 0x10:  // GetCurrentProcessorNumber
             c.x[0] = t_self ? uint32_t(std::max(t_self->core, 0)) : 0;
@@ -811,6 +798,12 @@ void svc(CPU& c, uint32_t imm, uint64_t pc) {
             c.x[2] = handle_add(r);
             break;
         }
+        case 0x51:  // MapTransferMemory(handle, addr, size, perm)
+            rc = map_transfer_memory(uint32_t(c.x[0]), c.x[1], c.x[2]);
+            break;
+        case 0x52:  // UnmapTransferMemory(handle, addr, size)
+            rc = unmap_transfer_memory(uint32_t(c.x[0]), c.x[1], c.x[2]);
+            break;
         default:
             log("unhandled svc %#x from %s (x0 %llx x1 %llx x2 %llx)", imm, describe(pc).c_str(),
                 (unsigned long long)c.x[0], (unsigned long long)c.x[1], (unsigned long long)c.x[2]);

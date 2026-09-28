@@ -83,6 +83,50 @@ void GetNpadState(CPU& c) {
     st<uint32_t>(out + 32, 1);  // IsConnected
 }
 
+// GetNpadStates(State* out, int count, const u32& id) -> number written: the newest first. One sample: the current
+// one for player 1's full-key style, a not-connected one otherwise.
+void GetNpadStatesFullKey(CPU& c) {
+    uint64_t out = c.x[0], id_ref = c.x[2];
+    if (int(c.x[1]) < 1) {
+        c.x[0] = 0;
+        return;
+    }
+    c.x[0] = out;
+    c.x[1] = id_ref;
+    GetNpadState(c);
+    c.x[0] = 1;
+}
+
+void GetNpadStatesOther(CPU& c) {
+    if (int(c.x[1]) < 1) {
+        c.x[0] = 0;
+        return;
+    }
+    std::memset(reinterpret_cast<void*>(c.x[0]), 0, 0x28);
+    st<int64_t>(c.x[0], int64_t(g_sampling));
+    c.x[0] = 1;
+}
+
+// MouseState {s64 sampling; s32 x, y, dx, dy, wheel dx, wheel dy; u32 buttons; u32 attributes}: no mouse.
+void GetMouseStates(CPU& c) {
+    if (int(c.x[1]) < 1) {
+        c.x[0] = 0;
+        return;
+    }
+    std::memset(reinterpret_cast<void*>(c.x[0]), 0, 0x28);
+    st<int64_t>(c.x[0], int64_t(g_sampling));
+    c.x[0] = 1;
+}
+
+// KeyboardState {s64 sampling; u64 modifiers; u8 keys[32]}: nothing pressed (the keyboard drives the pad).
+void GetKeyboardState(CPU& c) {
+    std::memset(reinterpret_cast<void*>(c.x[0]), 0, 0x30);
+    st<int64_t>(c.x[0], int64_t(g_sampling));
+}
+
+void zero(CPU& c) { c.x[0] = 0; }
+void one(CPU& c) { c.x[0] = 1; }
+
 void GetNpadStyleSet(CPU& c) { c.x[0] = ld<uint32_t>(c.x[0]) == 0 ? kStyleFullKey : 0; }
 
 void BindNpadStyleSetUpdateEvent(CPU& c) {  // (const u32& id, SystemEventType*, EventClearMode)
@@ -117,5 +161,26 @@ NX_HLE("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjN
 NX_HLE("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", noop);
 NX_HLE("_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", noop);
 NX_HLE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE", ShowControllerSupport);
+// SDK 16 (Super Mario Bros. Wonder)
+NX_HLE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj", GetNpadStatesFullKey);
+NX_HLE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj", GetNpadStatesOther);
+NX_HLE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj", GetNpadStatesOther);
+NX_HLE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", GetNpadStatesOther);
+NX_HLE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj", GetNpadStatesOther);
+NX_HLE("_ZN2nn3hid15InitializeMouseEv", noop);
+NX_HLE("_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi", GetMouseStates);
+NX_HLE("_ZN2nn3hid18InitializeKeyboardEv", noop);
+NX_HLE("_ZN2nn3hid16GetKeyboardStateEPNS0_13KeyboardStateE", GetKeyboardState);
+NX_HLE("_ZN2nn3hid14DisconnectNpadERKj", noop);
+NX_HLE("_ZN2nn3hid18SwapNpadAssignmentERKjS2_", noop);
+NX_HLE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKj", noop);
+NX_HLE("_ZN2nn3hid21StartLrAssignmentModeEv", noop);
+NX_HLE("_ZN2nn3hid20StopLrAssignmentModeEv", noop);
+NX_HLE("_ZN2nn3hid20GetNpadJoyAssignmentERKj", zero);  // dual
+NX_HLE("_ZN2nn3hid20IsVibrationPermittedEv", one);
+NX_HLE("_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", noop);
+NX_HLE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", noop);
+NX_HLE("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", noop);
+NX_HLE("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE", zero);
 
 }  // namespace nx

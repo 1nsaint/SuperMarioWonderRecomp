@@ -3,6 +3,7 @@
 
 #include <condition_variable>
 #include <memory>
+#include <vector>
 #include <string>
 
 #include <nx/runtime.h>
@@ -63,6 +64,16 @@ void handle_close(uint32_t h);
 void notify_all();
 KThread* self_thread();
 void backtrace(CPU& c);
+uint64_t heap_size();  // svcSetHeapSize's current size
+
+// svc_process.cpp
+uint64_t get_info(uint32_t type, uint32_t handle, uint64_t sub, uint32_t& rc);
+uint32_t set_thread_core_mask(uint32_t handle, int32_t ideal, uint64_t mask);
+uint32_t map_transfer_memory(uint32_t handle, uint64_t addr, uint64_t size);
+uint32_t unmap_transfer_memory(uint32_t handle, uint64_t addr, uint64_t size);
+// Initial static TLS of main (its .tdata), copied to tp+0x10 of every thread created afterwards.
+void set_tls_template(uint64_t start, uint64_t end);
+void init_tls_block(uint64_t block);
 
 // ipc.cpp
 uint32_t ipc_connect(const char* port, uint64_t* out_handle);

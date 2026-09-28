@@ -53,6 +53,7 @@ set(NX_RUNTIME_SOURCES
     runtime/src/svc_am.cpp
     runtime/src/svc_misc.cpp
     runtime/src/svc_time.cpp
+    runtime/src/svc_process.cpp
     runtime/src/hle_fs.cpp
     runtime/src/svc_account.cpp
     runtime/src/hle_ro.cpp
@@ -60,8 +61,13 @@ set(NX_RUNTIME_SOURCES
     runtime/src/hle_hid.cpp
     runtime/src/hle_net.cpp
     runtime/src/hle_audio.cpp
+    runtime/src/hle_pl.cpp
     runtime/src/nvn/nvn_trace.cpp
     runtime/src/nvn/nvn_device.cpp
+    runtime/src/nvn/nvn_objects.cpp
+    runtime/src/nvn/nvn_texture_layout.cpp
+    runtime/src/nvn/nvn_program.cpp
+    runtime/src/nvn/nvn_queue.cpp
     runtime/src/vk_bridge.cpp
     runtime/src/vk_gen.cpp
     runtime/src/vk_present.cpp

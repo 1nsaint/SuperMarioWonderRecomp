@@ -1,21 +1,23 @@
-// NVN entry points (docs/NVN.md, phase N2).
+// NVN entry points (docs/NVN.md, phases N2-N3).
 //
 // The game links one NVN symbol, nvnBootstrapLoader, and asks it for nvnDeviceGetProcAddress; every other NVN
-// function is then fetched by name, the same shape as vkGetInstanceProcAddr. Both are HLE here, so the SDK's NVN
-// driver never runs. A name we implement (an NX_HLE with the NVN name) gets its function; any other name gets a
-// tracing stub that records the call and its arguments and returns a neutral value, so the trace goes as far as it
-// can. The trace is written to <data root>/nvn_trace.txt: one line per call (the first kFullCalls of each proc),
-// then a count per proc at exit.
+// function is then fetched by name, the same shape as vkGetInstanceProcAddr. Both are HLE here. For each name:
+//   - one we implement (an NX_HLE with the NVN name): our function;
+//   - a builder or state object proc (pure struct setters/getters): the SDK driver's own, recompiled (see nvn.h);
+//   - anything else: a tracing stub that records the call and returns a neutral value, so the trace goes as far
+//     as it can.
+// The trace is <data root>/nvn_trace.txt: one line per call (the first kFullCalls of each proc), each proc's
+// driver address ("# real"), and a count per proc at exit.
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <regex>
 #include <string>
 
-#include <nx/runtime.h>
-
+#include "nvn.h"
 #include "platform.h"
 
 namespace nx {
@@ -34,7 +36,7 @@ std::string guest_str(uint64_t addr) {
     return std::string(reinterpret_cast<const char*>(addr), strnlen(reinterpret_cast<const char*>(addr), 256));
 }
 
-void write_line(const char* line) {
+void write_line(const char* line) {  // g_lock held
     if (!g_trace_file) {
         g_trace_file = plat::fopen_utf8(plat::data_root() + "/nvn_trace.txt", "w");
         std::atexit([] {
@@ -74,34 +76,21 @@ void trace_stub(CPU& c) {
     c.x[0] = std::strstr(name, "Initialize") ? 1 : 0;
 }
 
-// Where the SDK's own NVN driver implements `name` (its nvnBootstrapLoader, recompiled, still exported by sdk):
-// the reference for signatures and constants, recorded in the trace as "# real <name> = sdk+<offset>".
-void note_real_proc(CPU& c, const std::string& name) {
-    static uint64_t real_loader = find_symbol("nvnBootstrapLoader");
-    static uint64_t scratch = kernel_alloc(0x1000);
-    if (!real_loader || name.size() >= 0x1000) return;
-    std::memcpy(reinterpret_cast<void*>(scratch), name.c_str(), name.size() + 1);
-    uint64_t saved[31];
-    std::memcpy(saved, c.x, sizeof saved);
-    c.x[0] = scratch;
-    call(c, real_loader);
-    uint64_t real = c.x[0];
-    std::memcpy(c.x, saved, sizeof saved);
-    std::lock_guard lk(g_lock);
-    write_line(("# real " + name + " = " + describe(real)).c_str());
+// Builders, state objects and texture views only store and return fields: the driver's own code serves them.
+bool driver_serves(const std::string& name) {
+    static const std::regex pure(
+        "nvn(\\w+Builder\\w+|(Blend|Color|DepthStencil|Multisample|Polygon|VertexAttrib|VertexStream|ChannelMask)"
+        "State\\w+|TextureView\\w+)");
+    return std::regex_match(name, pure) && !std::getenv("NX_NVN_NO_DRIVER");
 }
 
 uint64_t proc_address(CPU& c, const std::string& name) {
     if (name.empty()) return 0;
-    static std::mutex seen_lock;
-    static std::map<std::string, bool> seen;
-    bool first;
-    {
-        std::lock_guard lk(seen_lock);
-        first = !seen[name];
-        seen[name] = true;
-    }
-    if (first && std::getenv("NX_NVN_REAL")) note_real_proc(c, name);
+    static const bool note_all = std::getenv("NX_NVN_REAL") != nullptr;  // record every proc's driver address
+    if (note_all) nvn::real_proc(c, name.c_str());
+    if (hle_lookup(name.c_str())) return hle_address(name.c_str());
+    if (driver_serves(name))
+        if (uint64_t real = nvn::real_proc(c, name.c_str())) return real;
     return hle_address_or(name.c_str(), trace_stub);
 }
 
@@ -127,5 +116,55 @@ void nvn_device_get_proc_address(CPU& c) {
 
 NX_HLE("nvnBootstrapLoader", nvn_bootstrap_loader);
 NX_HLE("nvnDeviceGetProcAddress", nvn_device_get_proc_address);
+
+namespace nvn {
+
+uint64_t guest_call(CPU& c, uint64_t fn, std::initializer_list<uint64_t> args) {
+    uint64_t saved[31];
+    std::memcpy(saved, c.x, sizeof saved);
+    size_t k = 0;
+    for (uint64_t a : args) c.x[k++] = a;
+    call(c, fn);
+    uint64_t r = c.x[0];
+    std::memcpy(c.x, saved, sizeof saved);
+    return r;
+}
+
+uint64_t real_proc(CPU& c, const char* name) {
+    static std::mutex lock;
+    static std::map<std::string, uint64_t> cache;
+    {
+        std::lock_guard lk(lock);
+        auto it = cache.find(name);
+        if (it != cache.end()) return it->second;
+    }
+    static uint64_t loader = find_symbol("nvnBootstrapLoader");  // the sdk's export (imports are HLE)
+    static uint64_t scratch = kernel_alloc(0x1000);
+    uint64_t real = 0;
+    size_t len = std::strlen(name);
+    if (loader && len < 0x1000) {
+        std::lock_guard lk(lock);  // one scratch buffer
+        std::memcpy(reinterpret_cast<void*>(scratch), name, len + 1);
+        real = guest_call(c, loader, {scratch});
+        cache[name] = real;
+    }
+    {
+        std::lock_guard lk(g_lock);
+        write_line(("# real " + std::string(name) + " = " + describe(real)).c_str());
+    }
+    return real;
+}
+
+std::mutex& objects_lock() {
+    static std::mutex m;
+    return m;
+}
+
+std::map<uint64_t, std::unique_ptr<Object>>& objects() {
+    static std::map<uint64_t, std::unique_ptr<Object>> m;
+    return m;
+}
+
+}  // namespace nvn
 
 }  // namespace nx

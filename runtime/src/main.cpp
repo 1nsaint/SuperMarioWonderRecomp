@@ -1,6 +1,7 @@
 // Boot: map and link the recompiled modules (what rtld does), create the main thread and enter
 // nn::init::Start(main thread handle, main module base, init, fini) like rtld's _start.
 // The platform's entry point (platform_win.cpp / platform_android.cpp) calls nx::boot().
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -27,6 +28,8 @@ uint64_t mrs(CPU& c, uint32_t sysreg) {
             return 4;
         case 0xC000:  // MIDR_EL1 (Cortex-A57)
             return 0x411FD071;
+        case 0xD801:  // CTR_EL0 (Cortex-A57: 64-byte lines, PIPT instruction cache)
+            return 0x8444C004;
         default:
             log("mrs %#x at lr %s", sysreg, describe(c.x[30]).c_str());
             return 0;
@@ -68,6 +71,26 @@ static uint64_t init_status_addr(const ModuleInfo& m) {
         }
     }
     fatal("%s: DT_INIT does not load its init status as expected", m.name);
+}
+
+// DT_INIT hands __nnmusl_init_dso the module's layout: consecutive GOT slots it loads with adrp + ldr. Slots 13
+// and 14 are the start and end of the module's .tdata (checked on SDK 16: Wonder's main 0x359cc18..0x359cc28,
+// sdk empty). Returns false when the pattern is not there (SDK 9 modules have no .tdata to worry about).
+static bool tdata_range(const ModuleInfo& m, uint64_t& start, uint64_t& end) {
+    uint64_t page[32] = {}, lo = ~0ull, hi = 0;
+    for (uint64_t pc = m.base + kDtInit; pc < m.base + kDtInit + 0x100; pc += 4) {
+        uint32_t w = ld<uint32_t>(pc);
+        if ((w & 0x9F000000) == 0x90000000) {  // adrp
+            int64_t imm = int64_t(((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)) << 43 >> 31;
+            page[w & 31] = (pc & ~0xFFFull) + uint64_t(imm);
+        } else if ((w & 0xFFC00000) == 0xF9400000 && page[(w >> 5) & 31]) {  // ldr xT, [xN, #imm]
+            uint64_t slot = page[(w >> 5) & 31] + ((w >> 10) & 0xFFF) * 8;
+            lo = std::min(lo, slot), hi = std::max(hi, slot);
+        }
+    }
+    if (hi < lo || (hi - lo) / 8 + 1 < 15) return false;
+    start = ld<uint64_t>(lo + 13 * 8), end = ld<uint64_t>(lo + 14 * 8);
+    return start <= end && end - start <= 0x1000 && start >= m.base && end <= m.base + 0x10000000;
 }
 
 static void init_module(CPU& c, const ModuleInfo& m) {
@@ -122,6 +145,11 @@ void boot() {
     const ModuleInfo* mods[] = {&nx_module_main, &nx_module_sdk};
     load_modules(mods, 2, plat::data_root() + "/analysis");
 
+    uint64_t tdata = 0, tdata_end = 0;
+    if (tdata_range(nx_module_main, tdata, tdata_end) && tdata_end > tdata) {
+        set_tls_template(tdata, tdata_end);
+        log("main .tdata: %llu bytes", (unsigned long long)(tdata_end - tdata));
+    }
     uint32_t main_thread = create_main_thread(16ull << 20);
     CPU& c = current_cpu();
     c.x[0] = main_thread;
