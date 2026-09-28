@@ -4,8 +4,22 @@ project(SwitchGamesRecomp C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Generated code of the game (python -m recomp <nso> private/gen/<module> --name <module> --base ...). Never committed.
-set(NX_GEN_DIR "${CMAKE_SOURCE_DIR}/private/gen" CACHE PATH "Recompiled module sources")
+# The game this build is for: games/<NX_GAME>/ holds what only that game needs (game.cpp: nx/game.h), the shared
+# runtime is the rest. One build directory per game.
+set(NX_GAME "hades" CACHE STRING "Game to build (a folder under games/)")
+set(NX_GAME_DIR "${CMAKE_SOURCE_DIR}/games/${NX_GAME}")
+if(NOT EXISTS "${NX_GAME_DIR}/game.cpp")
+    message(FATAL_ERROR "games/${NX_GAME}/game.cpp not found")
+endif()
+
+# Generated code of the game (python -m recomp <nso> <gen dir>/<module> --name <module> --base ...). Never committed.
+# Hades keeps the layout from before there were other games (private/gen); the others use private/<game>/gen.
+if(NX_GAME STREQUAL "hades")
+    set(NX_GEN_DEFAULT "${CMAKE_SOURCE_DIR}/private/gen")
+else()
+    set(NX_GEN_DEFAULT "${CMAKE_SOURCE_DIR}/private/${NX_GAME}/gen")
+endif()
+set(NX_GEN_DIR "${NX_GEN_DEFAULT}" CACHE PATH "Recompiled module sources")
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     add_compile_options(-Wno-unused-label -Wno-unused-value -Wno-parentheses-equality -Wno-unused-variable
@@ -47,8 +61,9 @@ set(NX_RUNTIME_SOURCES
     runtime/src/vk_bridge.cpp
     runtime/src/vk_gen.cpp
     runtime/src/vk_present.cpp
-    runtime/src/game_settings.cpp
 )
+file(GLOB NX_GAME_SOURCES CONFIGURE_DEPENDS "${NX_GAME_DIR}/*.cpp")
+list(APPEND NX_RUNTIME_SOURCES ${NX_GAME_SOURCES})
 
 # Vulkan headers (the same registry version tools/gen_vk.py generated from). The loader comes with the GPU driver.
 if(DEFINED ENV{VULKAN_SDK})
@@ -58,24 +73,24 @@ else()
 endif()
 
 if(ANDROID)
-    # NativeActivity app: libhades.so, entry android_main (android_native_app_glue).
+    # NativeActivity app: lib<game>.so, entry android_main (android_native_app_glue).
     set(GLUE "${ANDROID_NDK}/sources/android/native_app_glue")
-    add_library(hades SHARED ${NX_RUNTIME_SOURCES} runtime/src/platform_android.cpp "${GLUE}/android_native_app_glue.c")
-    target_include_directories(hades PRIVATE runtime/include runtime/src "${NX_VULKAN_SDK}/Include" "${GLUE}")
+    add_library(${NX_GAME} SHARED ${NX_RUNTIME_SOURCES} runtime/src/platform_android.cpp "${GLUE}/android_native_app_glue.c")
+    target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}" "${NX_VULKAN_SDK}/Include" "${GLUE}")
     # Our ANativeActivity_onCreate (platform_android.cpp) runs first, on the UI thread, then calls the glue's.
     set_source_files_properties("${GLUE}/android_native_app_glue.c" PROPERTIES
         COMPILE_DEFINITIONS "ANativeActivity_onCreate=glue_ANativeActivity_onCreate")
-    target_link_libraries(hades PRIVATE game_main game_sdk android log aaudio)
-    target_compile_options(hades PRIVATE -fvisibility=hidden -fno-semantic-interposition)
+    target_link_libraries(${NX_GAME} PRIVATE game_main game_sdk android log aaudio)
+    target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden -fno-semantic-interposition)
     # The glue's ANativeActivity_onCreate must be exported.
-    target_link_options(hades PRIVATE -u ANativeActivity_onCreate)
+    target_link_options(${NX_GAME} PRIVATE -u ANativeActivity_onCreate)
 else()
-    add_executable(hades ${NX_RUNTIME_SOURCES} runtime/src/platform_win.cpp)
-    target_include_directories(hades PRIVATE runtime/include runtime/src "${NX_VULKAN_SDK}/Include")
-    target_link_libraries(hades PRIVATE game_main game_sdk xinput xaudio2 ole32)
+    add_executable(${NX_GAME} ${NX_RUNTIME_SOURCES} runtime/src/platform_win.cpp)
+    target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}" "${NX_VULKAN_SDK}/Include")
+    target_link_libraries(${NX_GAME} PRIVATE game_main game_sdk xinput xaudio2 ole32)
     if(MSVC)
         # Keep host allocations low so the guest ranges (0x40_0000_0000..0x70_0000_0000) are always free; a big
         # main-thread stack (recompiled calls nest deeply); a link map for tools/symbolize.py.
-        target_link_options(hades PRIVATE /STACK:67108864 /HIGHENTROPYVA:NO /MAP)
+        target_link_options(${NX_GAME} PRIVATE /STACK:67108864 /HIGHENTROPYVA:NO /MAP)
     endif()
 endif()

@@ -3,6 +3,15 @@
 The runtime turns the recompiled modules into a Windows program. Nothing is emulated at the CPU level: it plays
 the part of rtld (loading and linking) and of a small Horizon kernel, and replaces system services.
 
+## Games
+
+The runtime is shared; what only one game needs lives in `games/<game>/` and reaches the runtime through
+`runtime/include/nx/game.h`: the game's names and program id, and hooks (after the static constructors, when the
+renderer starts, on the first frame). `-DNX_GAME=<game>` picks the game (default `hades`); CMake builds one target
+of that name. Generated code and data live in `private/<game>/`, except Hades, which keeps `private/` as it was.
+`android/build_apk.sh --game <game>` / `android\build_apk.ps1 -Game <game>` build that game's APK
+(`games/<game>/AndroidManifest.xml`). `tools/probe.py` shows what a game's ExeFS is made of.
+
 ## Modules
 
 Two modules are recompiled and linked into one executable:

@@ -9,12 +9,12 @@
 #include <unordered_set>
 #include <vector>
 
+#include <nx/game.h>
+
 #include "vk_gen.h"
 #include "vk_present.h"
 
 namespace nx {
-void log_game_settings();  // game_settings.cpp
-void apply_game_settings();
 }
 
 namespace nx::vk {
@@ -126,9 +126,7 @@ void w_vkEnumerateInstanceLayerProperties(CPU& c) {
 
 void w_vkCreateInstance(CPU& c) {  // (const VkInstanceCreateInfo*, alloc, VkInstance*)
     load_loader();
-    // The engine resets its settings to their registered defaults when it loads its configuration (early in
-    // nnMain); the renderer, starting here, is what reads the display ones. Apply the player's settings again.
-    apply_game_settings();
+    game::renderer_start();
     VkInstanceCreateInfo ci = *reinterpret_cast<const VkInstanceCreateInfo*>(c.x[0]);
     uint32_t nhave = 0;
     host_enum_inst_ext(nullptr, &nhave, nullptr);
@@ -965,7 +963,7 @@ void w_vkQueuePresentKHR(CPU& c) {
     uint64_t now_ns = plat::monotonic_ns();
     if (prev_present) worst = std::max(worst, now_ns - prev_present);
     prev_present = now_ns;
-    if (frames == 0) log_game_settings();
+    if (frames == 0) game::first_frame();
     if (++frames == 1 || frames % 300 == 0) {
         static auto last = t0;
         auto now = std::chrono::steady_clock::now();

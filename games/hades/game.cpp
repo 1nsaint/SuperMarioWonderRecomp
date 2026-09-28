@@ -1,14 +1,18 @@
-// Hades' engine settings: console variables the engine registers in static constructors (main+24f5c0, with their
+// Hades (0100535012974000): what the shared runtime needs to know about the game, and what only Hades needs.
+//
+// Engine settings: console variables the engine registers in static constructors (main+24f5c0, with their
 // defaults) and then overrides from the command line. The runtime sets them right after the constructors, before
 // nnMain, from the player's settings (config.txt on Android, NX_<NAME> on PC).
 //
 //   fullscreen=1 (default)  fill a screen wider than 16:9 (Letterbox=0, UseSideBarArt=0) instead of pillarboxing
 //                           the 16:9 view with the side art
 //   <Variable>=<value>      any variable of the table, e.g. SwapInterval=1
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 
+#include <nx/game.h>
 #include <nx/runtime.h>
 
 #include "mods_data.h"
@@ -17,6 +21,9 @@
 extern const nx::ModuleInfo nx_module_main;
 
 namespace nx {
+
+// The data stays where it was before there were other games (private/analysis, private/extract).
+const game::Info game::kInfo = {"hades", "Hades", 0x0100535012974000ull, "io.github.belmantegu.hadesrecomp", "private"};
 
 namespace {
 
@@ -44,7 +51,7 @@ constexpr EngineVar kVars[] = {
 // 234 in all. After the initializers, rewrite every one of them in main's data and bss.
 uint32_t g_virtual_width = 1920;
 
-void apply_widescreen() {
+static void apply_widescreen() {
     uint32_t w = 0, h = 0;
     plat::screen_size(w, h);
     if (!w || !h || plat::setting("widescreen") == "0" || plat::setting("fullscreen") == "0") return;
@@ -71,7 +78,7 @@ void apply_widescreen() {
     log("widescreen: virtual screen %ux1080 for %ux%u (%d full-screen, %d centre, %d resolution globals)", vw, w, h,
         n_full, n_centre, n_ires);
 
-    // The Lua side: the Hephaistos mod (runtime/mods/hephaistos, MIT) re-anchors the HUD and screens and fixes the
+    // The Lua side: the Hephaistos mod (games/hades/mods/hephaistos, MIT) re-anchors the HUD and screens and fixes the
     // camera clamp for the new ScreenWidth; the game loads it through an Import appended to RoomManager.lua.
     for (const ModFile& m : kModFiles) add_virtual_file(std::string("Content/") + m.path, m.data);
     add_virtual_file("Content/Mods/Hephaistos/HephaistosConfig.lua",
@@ -87,7 +94,7 @@ void apply_widescreen() {
     log("widescreen: Hephaistos Lua mod loaded (%zu files)", sizeof kModFiles / sizeof kModFiles[0]);
 }
 
-void apply_game_settings() {
+static void apply_game_settings() {
     const uint64_t base = nx_module_main.base;
     bool fullscreen = plat::setting("fullscreen") != "0";
     for (const EngineVar& v : kVars) {
@@ -110,10 +117,57 @@ void apply_game_settings() {
 }
 
 // The engine variables as they are now (logged on the first frame: shows what the engine did with them).
-void log_game_settings() {
+static void log_game_settings() {
     const uint64_t base = nx_module_main.base;
     for (const EngineVar& v : kVars)
         log("settings: now %s = %u", v.name, v.is_bool ? ld<uint8_t>(base + v.value_at) : ld<uint32_t>(base + v.value_at));
 }
+
+// ---- render resolution ----------------------------------------------------------------------------------------
+// nnMain sets the game's output size to 1280x720 in two globals (main+0x8ccd98 and main+0x8ccec0: {u32 width,
+// u32 height}) and then calls nn::time::Initialize before creating the renderer; that import is our hook to put
+// the configured resolution there. The game renders natively at any size and aspect (wider than 16:9 it adds its
+// own side art).
+static bool render_resolution(uint32_t& w, uint32_t& h) {
+    if (const char* r = std::getenv("NX_RESOLUTION")) return std::sscanf(r, "%ux%u", &w, &h) == 2 && w && h;
+#if defined(__ANDROID__)
+    plat::window_size(w, h);  // the phone's own screen, in its own aspect
+    return w && h;
+#else
+    return false;
+#endif
+}
+
+static void time_initialize(CPU& c) {
+    uint32_t w = 0, h = 0;
+    if (render_resolution(w, h)) {
+        for (uint64_t off : {0x8ccd98ull, 0x8ccec0ull}) {
+            uint64_t p = nx_module_main.base + off;
+            if (ld<uint32_t>(p) == 1280 && ld<uint32_t>(p + 4) == 720) {
+                st<uint32_t>(p, w);
+                st<uint32_t>(p + 4, h);
+            }
+        }
+        log("render resolution %ux%u", w, h);
+    }
+    call(c, find_symbol("_ZN2nn4time10InitializeEv"));
+}
+
+NX_HLE("_ZN2nn4time10InitializeEv", time_initialize);
+
+// ---- the runtime's hooks --------------------------------------------------------------------------------------
+
+void game::after_init() {
+    apply_game_settings();
+    apply_widescreen();
+}
+
+void game::renderer_start() {
+    // The engine resets its settings to their registered defaults when it loads its configuration (early in
+    // nnMain); the renderer, starting here, is what reads the display ones. Apply the player's settings again.
+    apply_game_settings();
+}
+
+void game::first_frame() { log_game_settings(); }
 
 }  // namespace nx

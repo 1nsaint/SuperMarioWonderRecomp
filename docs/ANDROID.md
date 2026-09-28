@@ -15,7 +15,7 @@ the OS through `runtime/src/platform.h` (`platform_win.cpp` / `platform_android.
 The game fills the whole screen in native widescreen (Hor+, like Hades II and the Hephaistos mod on PC): the
 engine's virtual screen stays 1080 high and becomes 1080 x aspect wide, so a 19.5:9 phone shows more of each room
 instead of a stretched 16:9 picture. The runtime rewrites the engine's 16:9 globals after its static initializers
-(`game_settings.cpp`) and serves the Hephaistos Lua mod (`runtime/mods/hephaistos`, MIT) to the game from memory.
+(`games/hades/game.cpp`) and serves the Hephaistos Lua mod (`games/hades/mods/hephaistos`, MIT) to the game from memory.
 FMVs (main menu) stay stretched for now, dialogue portraits stay 16:9.
 
 The picture is drawn into the swapchain already rotated to the display's own orientation (present pass,

@@ -12,6 +12,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <nx/game.h>
+
 #include "kernel.h"
 #include "platform.h"
 
@@ -557,7 +559,7 @@ static uint64_t get_info(uint32_t type, uint32_t handle, uint64_t sub, uint32_t&
         case 15: return kStackSize;
         case 16: return 0;  // SystemResourceSizeTotal
         case 17: return 0;
-        case 18: return 0x0100535012974000ull;  // ProgramId
+        case 18: return game::kInfo.program_id;  // ProgramId
         case 20: return 0;  // UserExceptionContextAddress
         case 21: return 0xCD500000;
         case 22: return g_heap_size + 0x4000000;

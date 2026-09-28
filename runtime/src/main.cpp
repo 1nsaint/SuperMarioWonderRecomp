@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <string>
 
+#include <nx/game.h>
 #include <nx/runtime.h>
 
 #include "kernel.h"
@@ -14,9 +15,6 @@ extern const nx::ModuleInfo nx_module_main;
 extern const nx::ModuleInfo nx_module_sdk;
 
 namespace nx {
-
-void apply_game_settings();  // game_settings.cpp
-void apply_widescreen();
 
 uint64_t mrs(CPU& c, uint32_t sysreg) {
     switch (sysreg) {
@@ -79,44 +77,13 @@ static void rtld_fini(CPU&) {}
 static void nn_main(CPU& c) {
     init_module(c, nx_module_sdk);
     init_module(c, nx_module_main);
-    apply_game_settings();
-    apply_widescreen();
+    game::after_init();
     log("entering nnMain");
     uint64_t real = 0;
     for (size_t k = 0; k < nx_module_main.symbol_count; k++)
         if (!nx_module_main.symbols[k].imported && std::string(nx_module_main.symbols[k].name) == "nnMain")
             real = nx_module_main.base + nx_module_main.symbols[k].value;
     call(c, real);
-}
-
-// ---- render resolution ----------------------------------------------------------------------------------------
-// nnMain sets the game's output size to 1280x720 in two globals (main+0x8ccd98 and main+0x8ccec0: {u32 width,
-// u32 height}) and then calls nn::time::Initialize before creating the renderer; that import is our hook to put
-// the configured resolution there. The game renders natively at any size and aspect (wider than 16:9 it adds its
-// own side art).
-static bool render_resolution(uint32_t& w, uint32_t& h) {
-    if (const char* r = std::getenv("NX_RESOLUTION")) return std::sscanf(r, "%ux%u", &w, &h) == 2 && w && h;
-#if defined(__ANDROID__)
-    plat::window_size(w, h);  // the phone's own screen, in its own aspect
-    return w && h;
-#else
-    return false;
-#endif
-}
-
-static void time_initialize(CPU& c) {
-    uint32_t w = 0, h = 0;
-    if (render_resolution(w, h)) {
-        for (uint64_t off : {0x8ccd98ull, 0x8ccec0ull}) {
-            uint64_t p = nx_module_main.base + off;
-            if (ld<uint32_t>(p) == 1280 && ld<uint32_t>(p + 4) == 720) {
-                st<uint32_t>(p, w);
-                st<uint32_t>(p + 4, h);
-            }
-        }
-        log("render resolution %ux%u", w, h);
-    }
-    call(c, find_symbol("_ZN2nn4time10InitializeEv"));
 }
 
 // longjmp(buf, val): unwinds the host stack to the recompiled function that called setjmp on buf.
@@ -128,7 +95,6 @@ static void process_return(CPU&) {
 }
 
 NX_HLE("nnMain", nn_main);
-NX_HLE("_ZN2nn4time10InitializeEv", time_initialize);
 NX_HLE("longjmp", long_jmp);
 NX_HLE("_longjmp", long_jmp);
 NX_HLE("__rtld_init", rtld_init);

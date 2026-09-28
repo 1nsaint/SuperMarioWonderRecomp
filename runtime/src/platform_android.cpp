@@ -36,6 +36,7 @@
 #define VK_USE_PLATFORM_ANDROID_KHR
 #include <vulkan/vulkan.h>
 
+#include <nx/game.h>
 #include <nx/runtime.h>
 
 #include "kernel.h"
@@ -240,7 +241,7 @@ bool make_dirs(const std::string& path) {
     return !ec;
 }
 
-void log_line(const char* line) { __android_log_write(ANDROID_LOG_INFO, "hades", line); }
+void log_line(const char* line) { __android_log_write(ANDROID_LOG_INFO, nx::game::kInfo.id, line); }
 
 std::string data_root() { return g_root; }
 
@@ -701,7 +702,7 @@ extern "C" JNIEXPORT void ANativeActivity_onCreate(ANativeActivity* activity, vo
     glue_ANativeActivity_onCreate(activity, saved, size);
 }
 
-// All-files access (Android 11+): needed to read Internal storage/Hades. Asks for it by opening the system page.
+// All-files access (Android 11+): needed to read Internal storage/<game title>. Asks for it by opening the system page.
 static bool has_all_files_access(android_app* app) {
     JNIEnv* env = nullptr;
     app->activity->vm->AttachCurrentThread(&env, nullptr);
@@ -717,7 +718,7 @@ static void request_all_files_access(android_app* app) {
     app->activity->vm->AttachCurrentThread(&env, nullptr);
     jclass uric = env->FindClass("android/net/Uri");
     jobject uri = env->CallStaticObjectMethod(uric, env->GetStaticMethodID(uric, "parse", "(Ljava/lang/String;)Landroid/net/Uri;"),
-                                              env->NewStringUTF("package:io.github.belmantegu.hadesrecomp"));
+                                              env->NewStringUTF((std::string("package:") + nx::game::kInfo.android_package).c_str()));
     jclass intentc = env->FindClass("android/content/Intent");
     jobject intent = env->NewObject(intentc, env->GetMethodID(intentc, "<init>", "(Ljava/lang/String;Landroid/net/Uri;)V"),
                                     env->NewStringUTF("android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION"), uri);
@@ -731,9 +732,9 @@ static bool has_data(const std::string& root) { return access((root + "/analysis
 extern "C" void android_main(android_app* app) {
     using namespace nx::plat;
     g_app = app;
-    // Game data: Internal storage/Hades (put there by the player, needs all-files access) or the app's own
+    // Game data: Internal storage/<game title> (put there by the player, needs all-files access) or the app's own
     // external files folder (adb push).
-    const std::string shared = "/storage/emulated/0/Hades";
+    const std::string shared = std::string("/storage/emulated/0/") + nx::game::kInfo.title;
     const std::string own = app->activity->externalDataPath ? app->activity->externalDataPath : shared;
     if (!has_data(own) && !has_all_files_access(app)) {
         request_all_files_access(app);
@@ -756,7 +757,7 @@ extern "C" void android_main(android_app* app) {
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(s, &sa, &g_previous[s]);
 
-    nx::log("Hades (Switch recomp) on Android, data at %s", g_root.c_str());
+    nx::log("%s (Switch recomp) on Android, data at %s", nx::game::kInfo.title, g_root.c_str());
     static bool started = false;
     for (;;) {
         int events;
