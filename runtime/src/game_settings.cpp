@@ -11,6 +11,7 @@
 
 #include <nx/runtime.h>
 
+#include "mods_data.h"
 #include "platform.h"
 
 extern const nx::ModuleInfo nx_module_main;
@@ -35,6 +36,56 @@ constexpr EngineVar kVars[] = {
 };
 
 }  // namespace
+
+// Hor+ widescreen (what Hades II does, and the Hephaistos mod for Hades on PC): the engine's virtual screen stays
+// 1080 high and becomes 1080 * aspect wide, so a wider screen shows more of the scene instead of a stretched 16:9.
+// The engine keeps that virtual size in globals its static initializers fill (FULL_SCREEN (1920f, 1080f), the
+// screen centres (960f, 540f), the virtual resolution (1920, 1080)): each translation unit has its own copies,
+// 234 in all. After the initializers, rewrite every one of them in main's data and bss.
+uint32_t g_virtual_width = 1920;
+
+void apply_widescreen() {
+    uint32_t w = 0, h = 0;
+    plat::screen_size(w, h);
+    if (!w || !h || plat::setting("widescreen") == "0" || plat::setting("fullscreen") == "0") return;
+    uint32_t vw = uint32_t(1080.0 * w / h + 0.5) & ~1u;  // even, so the centre is whole
+    if (vw <= 1920) return;  // 16:9 or taller: the engine's own layout
+    g_virtual_width = vw;
+    const uint64_t base = nx_module_main.base;
+    const uint64_t from = base + nx_module_main.data, to = base + nx_module_main.bss + nx_module_main.bss_size;
+    auto f32 = [](float f) {
+        uint32_t u;
+        std::memcpy(&u, &f, 4);
+        return uint64_t(u);
+    };
+    const uint64_t full = f32(1920) | f32(1080) << 32, centre = f32(960) | f32(540) << 32, ires = 1920ull | 1080ull << 32;
+    const uint64_t new_full = f32(float(vw)) | f32(1080) << 32, new_centre = f32(float(vw / 2)) | f32(540) << 32,
+                   new_ires = uint64_t(vw) | 1080ull << 32;
+    int n_full = 0, n_centre = 0, n_ires = 0;
+    for (uint64_t a = from; a + 8 <= to; a += 4) {
+        uint64_t v = ld<uint64_t>(a);
+        if (v == full) st<uint64_t>(a, new_full), n_full++;
+        else if (v == centre) st<uint64_t>(a, new_centre), n_centre++;
+        else if (v == ires) st<uint64_t>(a, new_ires), n_ires++;
+    }
+    log("widescreen: virtual screen %ux1080 for %ux%u (%d full-screen, %d centre, %d resolution globals)", vw, w, h,
+        n_full, n_centre, n_ires);
+
+    // The Lua side: the Hephaistos mod (runtime/mods/hephaistos, MIT) re-anchors the HUD and screens and fixes the
+    // camera clamp for the new ScreenWidth; the game loads it through an Import appended to RoomManager.lua.
+    for (const ModFile& m : kModFiles) add_virtual_file(std::string("Content/") + m.path, m.data);
+    add_virtual_file("Content/Mods/Hephaistos/HephaistosConfig.lua",
+                     "Hephaistos.ScreenWidth = " + std::to_string(vw) +
+                         "\nHephaistos.ScreenHeight = 1080\nHephaistos.CenterHUD = " +
+                         (plat::setting("center_hud") == "1" ? "true" : "false") + "\n");
+    std::string rm = read_game_file("Content/Scripts/RoomManager.lua");
+    if (rm.empty()) {
+        log("widescreen: Scripts/RoomManager.lua not found, Lua layout left 16:9");
+        return;
+    }
+    add_virtual_file("Content/Scripts/RoomManager.lua", rm + "\nImport \"../Mods/Hephaistos/Hephaistos.lua\"\n");
+    log("widescreen: Hephaistos Lua mod loaded (%zu files)", sizeof kModFiles / sizeof kModFiles[0]);
+}
 
 void apply_game_settings() {
     const uint64_t base = nx_module_main.base;

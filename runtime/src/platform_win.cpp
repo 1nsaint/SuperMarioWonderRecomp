@@ -65,6 +65,7 @@ void exit_process(int code) { ExitProcess(UINT(code)); }
 void sleep_ns(int64_t ns) { std::this_thread::sleep_for(std::chrono::nanoseconds(ns)); }
 void yield() { SwitchToThread(); }
 void set_thread_name(const char*) {}
+float default_render_scale() { return 1.0f; }
 void release_window(void*) {}
 uint64_t window_generation() { return 1; }
 void audio_pause(bool) {}
@@ -98,6 +99,13 @@ FILE* fopen_utf8(const std::string& path, const char* mode) {
 }
 int64_t ftell64(FILE* f) { return _ftelli64(f); }
 int fseek64(FILE* f, int64_t off, int origin) { return _fseeki64(f, off, origin); }
+uint64_t read_at(FILE* f, int64_t off, void* buf, uint64_t size) {
+    _lock_file(f);  // seek + read as one step for this FILE
+    _fseeki64_nolock(f, off, SEEK_SET);
+    uint64_t n = _fread_nolock(buf, 1, size, f);
+    _unlock_file(f);
+    return n;
+}
 bool make_dirs(const std::string& path) {
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::u8path(path), ec);
@@ -202,6 +210,8 @@ void window_size(uint32_t& w, uint32_t& h) {
     w = uint32_t(r.right - r.left);
     h = uint32_t(r.bottom - r.top);
 }
+
+void screen_size(uint32_t& w, uint32_t& h) { window_size(w, h); }
 
 // ---- input: XInput pad 0 + keyboard ---------------------------------------------------------------------------
 

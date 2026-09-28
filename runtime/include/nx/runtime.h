@@ -95,5 +95,10 @@ void kernel_init();
 uint32_t create_main_thread(uint64_t stack_size);  // the calling host thread becomes it
 CPU& current_cpu();
 uint64_t system_tick();
+// A file the game can open under a mount (e.g. "Content/Mods/X/a.lua" for Content:/Mods/X/a.lua), served from
+// memory; it takes precedence over a real file of the same path (hle_fs.cpp).
+void add_virtual_file(const std::string& path, std::string data);
+// The contents of a real game file under the data folder ("" if missing).
+std::string read_game_file(const std::string& relative_to_romfs);
 
 }  // namespace nx

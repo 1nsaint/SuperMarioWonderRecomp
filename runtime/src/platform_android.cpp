@@ -11,6 +11,7 @@
 #include <android/window.h>
 #include <android_native_app_glue.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <jni.h>
 #include <pthread.h>
 #include <sched.h>
@@ -21,6 +22,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -219,6 +221,19 @@ uint64_t monotonic_ns() {
 FILE* fopen_utf8(const std::string& path, const char* mode) { return std::fopen(path.c_str(), mode); }
 int64_t ftell64(FILE* f) { return ftello(f); }
 int fseek64(FILE* f, int64_t off, int origin) { return fseeko(f, off, origin); }
+uint64_t read_at(FILE* f, int64_t off, void* buf, uint64_t size) {
+    // A size that does not fit ssize_t (the game passes -1) reads nothing, as fread did (and the game expects).
+    if (size > uint64_t(SSIZE_MAX)) return 0;
+    int fd = fileno(f);
+    uint64_t done = 0;
+    while (done < size) {
+        ssize_t n = pread(fd, static_cast<uint8_t*>(buf) + done, size_t(size - done), off + int64_t(done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        done += uint64_t(n);
+    }
+    return done;
+}
 bool make_dirs(const std::string& path) {
     std::error_code ec;
     std::filesystem::create_directories(path, ec);
@@ -257,6 +272,16 @@ uint64_t window_generation() { return g_window_gen; }
 
 bool window_minimized() { return !g_visible || !g_window; }
 
+void screen_size(uint32_t& w, uint32_t& h) {
+    ANativeWindow* win = static_cast<ANativeWindow*>(create_window());
+    int32_t a = ANativeWindow_getWidth(win), b = ANativeWindow_getHeight(win);
+    ANativeWindow_release(win);
+    w = uint32_t(std::max(a, b));  // landscape
+    h = uint32_t(std::min(a, b));
+}
+
+// The render size: resolution=WxH if set, else the screen's size times the render scale (render_scale=0.5..1, or
+// the GPU's default), never taller than 1080 (the game's art is made for 720p/1080p; more only costs GPU time).
 void window_size(uint32_t& w, uint32_t& h) {
     std::string r = setting("resolution");
     unsigned cw = 0, ch = 0;
@@ -265,12 +290,55 @@ void window_size(uint32_t& w, uint32_t& h) {
         h = ch;
         return;
     }
-    ANativeWindow* win = static_cast<ANativeWindow*>(create_window());
-    // The phone's own screen, landscape.
-    int32_t a = ANativeWindow_getWidth(win), b = ANativeWindow_getHeight(win);
-    ANativeWindow_release(win);
-    w = uint32_t(std::max(a, b));
-    h = uint32_t(std::min(a, b));
+    uint32_t sw = 0, sh = 0;
+    screen_size(sw, sh);
+    std::string rs = setting("render_scale");
+    float scale = rs.empty() ? default_render_scale() : std::strtof(rs.c_str(), nullptr);
+    scale = std::clamp(scale, 0.25f, 1.0f);
+    scale = std::min(scale, 1080.0f / float(sh));
+    w = uint32_t(float(sw) * scale + 0.5f) & ~1u;
+    h = uint32_t(float(sh) * scale + 0.5f) & ~1u;
+}
+
+// A GPU tier from the Vulkan device name (queried once, before the game starts its renderer): current Adreno 7xx
+// and 8xx, Mali-G7xx and newer, Immortalis, Xclipse render at 1; Adreno 6xx at 0.85; anything older at 2/3
+// (about 720p, the Switch's handheld resolution).
+float default_render_scale() {
+    static float scale = [] {
+        auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(vulkan_get_instance_proc_addr());
+        if (!gipa) return 2.0f / 3;
+        auto create = reinterpret_cast<PFN_vkCreateInstance>(gipa(nullptr, "vkCreateInstance"));
+        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+        app.apiVersion = VK_API_VERSION_1_1;
+        VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+        ci.pApplicationInfo = &app;
+        VkInstance inst = VK_NULL_HANDLE;
+        if (!create || create(&ci, nullptr, &inst) != VK_SUCCESS) return 2.0f / 3;
+        auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(gipa(inst, "vkEnumeratePhysicalDevices"));
+        auto props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(gipa(inst, "vkGetPhysicalDeviceProperties"));
+        auto destroy = reinterpret_cast<PFN_vkDestroyInstance>(gipa(inst, "vkDestroyInstance"));
+        uint32_t n = 1;
+        VkPhysicalDevice pd = VK_NULL_HANDLE;
+        float s = 2.0f / 3;
+        if (enumerate(inst, &n, &pd) >= 0 && n && pd) {
+            VkPhysicalDeviceProperties p{};
+            props(pd, &p);
+            std::string name = p.deviceName;
+            int adreno = 0, mali = 0;
+            std::sscanf(name.c_str() + (name.find("Adreno") != std::string::npos ? name.find("Adreno") : name.size()),
+                        "Adreno (TM) %d", &adreno);
+            if (auto m = name.find("Mali-G"); m != std::string::npos) std::sscanf(name.c_str() + m, "Mali-G%d", &mali);
+            if (adreno >= 700 || mali >= 710 || name.find("Immortalis") != std::string::npos ||
+                name.find("Xclipse") != std::string::npos)
+                s = 1.0f;
+            else if (adreno >= 610 || mali >= 76)
+                s = 0.85f;
+            nx::log("gpu: %s -> default render scale %.2f", p.deviceName, s);
+        }
+        destroy(inst, nullptr);
+        return s;
+    }();
+    return scale;
 }
 
 // ---- input: game controllers + touch --------------------------------------------------------------------------
@@ -542,6 +610,8 @@ void game_thread(void*) {
     }
 }
 
+void request_immersive();  // below: runs on the UI thread
+
 void on_cmd(android_app* app, int32_t cmd) {
     using namespace nx::plat;
     switch (cmd) {
@@ -549,6 +619,7 @@ void on_cmd(android_app* app, int32_t cmd) {
             g_window = app->window;
             g_window_gen++;
             g_visible = true;
+            request_immersive();
             break;
         case APP_CMD_TERM_WINDOW:  // the window goes away once this returns
             g_window = nullptr;
@@ -556,6 +627,7 @@ void on_cmd(android_app* app, int32_t cmd) {
             break;
         case APP_CMD_GAINED_FOCUS:
             g_visible = g_window != nullptr;
+            request_immersive();  // bars shown by a swipe hide again
             break;
         case APP_CMD_LOST_FOCUS:
             break;
@@ -569,6 +641,65 @@ void on_cmd(android_app* app, int32_t cmd) {
 }
 
 }  // namespace
+
+// ---- immersive mode: the status and navigation bars hidden (a swipe from an edge shows them for a moment) --------
+// Only the UI thread may touch the window's views; android_main runs on another. Our ANativeActivity_onCreate (on
+// the UI thread) registers a pipe with the UI thread's looper: writing a byte to it runs the request there.
+
+extern "C" void glue_ANativeActivity_onCreate(ANativeActivity* activity, void* saved, size_t size);
+
+namespace {
+
+ANativeActivity* g_activity = nullptr;
+int g_ui_pipe[2] = {-1, -1};
+
+void hide_system_bars(JNIEnv* env, jobject activity) {
+    jclass act = env->GetObjectClass(activity);
+    jobject window = env->CallObjectMethod(activity, env->GetMethodID(act, "getWindow", "()Landroid/view/Window;"));
+    if (env->ExceptionCheck() || !window) {
+        env->ExceptionClear();
+        return;
+    }
+    jclass winc = env->GetObjectClass(window);
+    jmethodID get_ctl = env->GetMethodID(winc, "getInsetsController", "()Landroid/view/WindowInsetsController;");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    jobject ctl = get_ctl ? env->CallObjectMethod(window, get_ctl) : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear(), ctl = nullptr;
+    if (ctl) {  // Android 11+
+        jclass cc = env->GetObjectClass(ctl);
+        jclass types = env->FindClass("android/view/WindowInsets$Type");
+        jint bars = env->CallStaticIntMethod(types, env->GetStaticMethodID(types, "systemBars", "()I"));
+        env->CallVoidMethod(ctl, env->GetMethodID(cc, "setSystemBarsBehavior", "(I)V"), 2);  // show transient by swipe
+        env->CallVoidMethod(ctl, env->GetMethodID(cc, "hide", "(I)V"), bars);
+    } else {  // Android 10: immersive sticky | hide navigation | fullscreen | layout stable/hide navigation/fullscreen
+        jobject decor = env->CallObjectMethod(window, env->GetMethodID(winc, "getDecorView", "()Landroid/view/View;"));
+        if (decor)
+            env->CallVoidMethod(decor, env->GetMethodID(env->GetObjectClass(decor), "setSystemUiVisibility", "(I)V"), 0x1706);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+}
+
+int on_ui_request(int fd, int, void*) {
+    char buf[16];
+    while (read(fd, buf, sizeof buf) > 0) {
+    }
+    if (g_activity) hide_system_bars(g_activity->env, g_activity->clazz);
+    return 1;
+}
+
+void request_immersive() {
+    char c = 1;
+    if (g_ui_pipe[1] >= 0) (void)write(g_ui_pipe[1], &c, 1);
+}
+
+}  // namespace
+
+extern "C" JNIEXPORT void ANativeActivity_onCreate(ANativeActivity* activity, void* saved, size_t size) {
+    g_activity = activity;
+    if (g_ui_pipe[0] < 0 && pipe2(g_ui_pipe, O_NONBLOCK | O_CLOEXEC) == 0)
+        ALooper_addFd(ALooper_forThread(), g_ui_pipe[0], ALOOPER_POLL_CALLBACK, ALOOPER_EVENT_INPUT, on_ui_request, nullptr);
+    glue_ANativeActivity_onCreate(activity, saved, size);
+}
 
 // All-files access (Android 11+): needed to read Internal storage/Hades. Asks for it by opening the system page.
 static bool has_all_files_access(android_app* app) {

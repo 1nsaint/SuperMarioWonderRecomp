@@ -16,6 +16,7 @@ extern const nx::ModuleInfo nx_module_sdk;
 namespace nx {
 
 void apply_game_settings();  // game_settings.cpp
+void apply_widescreen();
 
 uint64_t mrs(CPU& c, uint32_t sysreg) {
     switch (sysreg) {
@@ -79,6 +80,7 @@ static void nn_main(CPU& c) {
     init_module(c, nx_module_sdk);
     init_module(c, nx_module_main);
     apply_game_settings();
+    apply_widescreen();
     log("entering nnMain");
     uint64_t real = 0;
     for (size_t k = 0; k < nx_module_main.symbol_count; k++)
@@ -137,6 +139,7 @@ NX_HLE("__process_return", process_return);
 
 void boot() {
     if (const char* t = std::getenv("NX_TRACE")) g_trace = *t == '1';
+    if (plat::setting("trace") == "1") g_trace = true;
     memory_init();
     kernel_init();
     const ModuleInfo* mods[] = {&nx_module_main, &nx_module_sdk};

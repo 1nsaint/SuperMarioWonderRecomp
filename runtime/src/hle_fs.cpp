@@ -2,9 +2,11 @@
 //   rom:   -> private/extract/romfs (the RomFS with the update applied)
 //   save:  -> private/user/save/<mount>
 //   cache: -> private/user/cache<index>
+#include <cctype>
 #include <cstdio>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 
@@ -25,7 +27,39 @@ constexpr uint32_t kTargetNotFound = 0x2EE202;  // fs 6001-ish: generic "not mou
 
 std::mutex g_fs;
 std::map<std::string, fs::path> g_mounts;
-std::map<uint64_t, FILE*> g_files;
+// Open files: shared so a read in progress survives a close from another thread. Reads run outside g_fs (which
+// only guards the tables): one global lock made every streaming thread (Bink animations, FMOD banks) wait behind
+// any big read, felt as hitches.
+struct File {
+    FILE* f;
+    std::string path;
+    File(FILE* file, std::string p) : f(file), path(std::move(p)) {}
+    File(const File&) = delete;  // owns the FILE: one instance only
+    File& operator=(const File&) = delete;
+    ~File() { std::fclose(f); }
+};
+std::map<uint64_t, std::shared_ptr<File>> g_files;
+
+// Files the runtime adds or replaces (mods): key = path under the mount point, '/' separated, lower case.
+std::map<std::string, std::string> g_virtual;
+
+std::string virtual_key(const fs::path& p) {
+    auto g = p.lexically_normal().generic_u8string();
+    std::string s(g.begin(), g.end());
+    for (char& ch : s) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    return s;
+}
+
+// The virtual file whose key the resolved path ends with, or nullptr.
+const std::string* find_virtual(const fs::path& resolved) {
+    if (g_virtual.empty() || resolved.empty()) return nullptr;
+    std::string k = virtual_key(resolved);
+    for (auto& [key, data] : g_virtual)
+        if (k.size() >= key.size() + 1 && k.compare(k.size() - key.size(), key.size(), key) == 0 &&
+            k[k.size() - key.size() - 1] == '/')
+            return &data;
+    return nullptr;
+}
 struct Dir {
     std::vector<fs::directory_entry> entries;
     size_t pos = 0;
@@ -141,6 +175,11 @@ void CreateDirectory(CPU& c) {
 void GetEntryType(CPU& c) {  // (DirectoryEntryType* out, path)
     std::lock_guard lk(g_fs);
     fs::path p = resolve(cstr(c.x[1]));
+    if (find_virtual(p)) {
+        st<uint32_t>(c.x[0], 1);
+        c.x[0] = kOk;
+        return;
+    }
     std::error_code ec;
     if (p.empty() || !fs::exists(p, ec)) {
         c.x[0] = kPathNotFound;
@@ -155,6 +194,21 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
     std::string guest = cstr(c.x[1]);
     fs::path p = resolve(guest);
     int mode = int(c.x[2]);
+    if (const std::string* v = find_virtual(p)) {  // served from memory, through a temporary file
+        FILE* f = std::tmpfile();
+        if (!f) {
+            c.x[0] = kPathNotFound;
+            return;
+        }
+        std::fwrite(v->data(), 1, v->size(), f);
+        std::fflush(f);
+        uint64_t h = g_next++;
+        g_files[h] = std::make_shared<File>(f, guest);
+        st<uint64_t>(c.x[0], h);
+        if (g_trace) log("fs: OpenFile(%s) -> virtual, %zu bytes", guest.c_str(), v->size());
+        c.x[0] = kOk;
+        return;
+    }
     std::error_code ec;
     if (p.empty() || !fs::is_regular_file(p, ec)) {
         if (g_trace) log("fs: OpenFile(%s) not found", guest.c_str());
@@ -167,80 +221,89 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
         return;
     }
     uint64_t h = g_next++;
-    g_files[h] = f;
+    g_files[h] = std::make_shared<File>(f, guest);
     st<uint64_t>(c.x[0], h);
     if (g_trace) log("fs: OpenFile(%s, %d) -> %llu", guest.c_str(), mode, (unsigned long long)h);
     c.x[0] = kOk;
 }
 
-FILE* file(uint64_t h) {
+std::shared_ptr<File> open_file(uint64_t h) {
+    std::lock_guard lk(g_fs);
     auto it = g_files.find(h);
     return it == g_files.end() ? nullptr : it->second;
 }
 
 void CloseFile(CPU& c) {
     std::lock_guard lk(g_fs);
-    if (FILE* f = file(c.x[0])) fclose(f);
     g_files.erase(c.x[0]);
 }
 
 void GetFileSize(CPU& c) {  // (s64* out, FileHandle)
-    std::lock_guard lk(g_fs);
-    FILE* f = file(c.x[1]);
-    if (!f) {
+    auto file = open_file(c.x[1]);
+    if (!file) {
         c.x[0] = kTargetNotFound;
         return;
     }
+    std::lock_guard lk(g_fs);  // the FILE position is shared with writers
+    FILE* f = file->f;
     int64_t cur = plat::ftell64(f);
     plat::fseek64(f, 0, SEEK_END);
     st<int64_t>(c.x[0], plat::ftell64(f));
+    if (g_trace) log("fs: size %s = %lld", file->path.c_str(), (long long)ld<int64_t>(c.x[0]));
     plat::fseek64(f, cur, SEEK_SET);
     c.x[0] = kOk;
 }
 
-uint64_t read_at(FILE* f, int64_t off, uint64_t buf, uint64_t size) {
-    plat::fseek64(f, off, SEEK_SET);
-    return fread(reinterpret_cast<void*>(buf), 1, size, f);
+uint64_t read_at(const File& file, int64_t off, uint64_t buf, uint64_t size) {
+    uint64_t t0 = plat::monotonic_ns();
+    uint64_t n = plat::read_at(file.f, off, reinterpret_cast<void*>(buf), size);
+    uint64_t ms = (plat::monotonic_ns() - t0) / 1'000'000;
+    if (g_trace) log("fs: read %s at %lld size %llu -> %llu", file.path.c_str(), (long long)off, (unsigned long long)size,
+                     (unsigned long long)n);
+    if (ms >= 30)
+        log("fs: slow read %s: %llu bytes at %lld took %llu ms", file.path.c_str(), (unsigned long long)size,
+            (long long)off, (unsigned long long)ms);
+    return n;
 }
 
 void ReadFileOut(CPU& c) {  // (size_t* out, FileHandle, s64 off, void* buf, size_t size)
-    std::lock_guard lk(g_fs);
-    FILE* f = file(c.x[1]);
-    if (!f) {
+    auto file = open_file(c.x[1]);
+    if (!file) {
         c.x[0] = kTargetNotFound;
         return;
     }
-    st<uint64_t>(c.x[0], read_at(f, int64_t(c.x[2]), c.x[3], c.x[4]));
+    st<uint64_t>(c.x[0], read_at(*file, int64_t(c.x[2]), c.x[3], c.x[4]));
     c.x[0] = kOk;
 }
 
 void ReadFile(CPU& c) {  // (FileHandle, s64 off, void* buf, size_t size)
-    std::lock_guard lk(g_fs);
-    FILE* f = file(c.x[0]);
-    if (!f) {
+    auto file = open_file(c.x[0]);
+    if (!file) {
         c.x[0] = kTargetNotFound;
         return;
     }
-    read_at(f, int64_t(c.x[1]), c.x[2], c.x[3]);
+    read_at(*file, int64_t(c.x[1]), c.x[2], c.x[3]);
     c.x[0] = kOk;
 }
 
 void WriteFile(CPU& c) {  // (FileHandle, s64 off, const void* buf, size_t size, const WriteOption&)
-    std::lock_guard lk(g_fs);
-    FILE* f = file(c.x[0]);
-    if (!f) {
+    auto file = open_file(c.x[0]);
+    if (!file) {
         c.x[0] = kTargetNotFound;
         return;
     }
-    plat::fseek64(f, int64_t(c.x[1]), SEEK_SET);
-    fwrite(reinterpret_cast<const void*>(c.x[2]), 1, c.x[3], f);
-    if (c.x[4] && (ld<uint32_t>(c.x[4]) & 1)) fflush(f);
+    std::lock_guard lk(g_fs);
+    plat::fseek64(file->f, int64_t(c.x[1]), SEEK_SET);
+    fwrite(reinterpret_cast<const void*>(c.x[2]), 1, c.x[3], file->f);
+    fflush(file->f);  // positional reads bypass the FILE buffer (saves only: rare and small)
     c.x[0] = kOk;
 }
 
 void FlushFile(CPU& c) {
-    std::lock_guard lk(g_fs);
-    if (FILE* f = file(c.x[0])) fflush(f);
+    if (auto file = open_file(c.x[0])) {
+        std::lock_guard lk(g_fs);
+        fflush(file->f);
+    }
     c.x[0] = kOk;
 }
 
@@ -352,5 +415,21 @@ NX_HLE("_ZN2nn2fs21CloseCacheStorageListENS0_22CacheStorageListHandleE", CloseCa
 NX_HLE("_ZN2nn2fs18CreateCacheStorageEill", CreateCacheStorage);
 NX_HLE("_ZN2nn2fs18DeleteCacheStorageEi", DeleteCacheStorage);
 NX_HLE("_ZN2nn2fs17MountCacheStorageEPKci", MountCacheStorage);
+
+void add_virtual_file(const std::string& path, std::string data) {
+    std::lock_guard lk(g_fs);
+    g_virtual[virtual_key(fs::u8path(path))] = std::move(data);
+}
+
+std::string read_game_file(const std::string& relative_to_romfs) {
+    FILE* f = plat::fopen_utf8(utf8(data_root() / "extract" / "romfs" / fs::u8path(relative_to_romfs)), "rb");
+    if (!f) return {};
+    std::string s;
+    char buf[65536];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, n);
+    std::fclose(f);
+    return s;
+}
 
 }  // namespace nx

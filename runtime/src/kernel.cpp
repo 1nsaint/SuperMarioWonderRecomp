@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -456,7 +457,45 @@ uint32_t create_main_thread(uint64_t stack_size) {
     return t->handle;
 }
 
-void kernel_init() { plat::start_thread(watchdog, nullptr, 1ull << 20); }
+// Stalls: while no frame comes for more than 60 ms, sample where every guest thread is (its lr, every 5 ms); a
+// stall over 100 ms is logged with each thread's most frequent place, to tell what the frame waited for.
+static void stall_sampler(void*) {
+    uint64_t last_frame = 0, since = plat::monotonic_ns();
+    std::map<std::pair<uint64_t, uint64_t>, uint32_t> hits;  // (thread id, guest lr) -> samples
+    for (;;) {
+        plat::sleep_ns(5'000'000);
+        uint64_t f = g_frame, now = plat::monotonic_ns();
+        if (f != last_frame || plat::window_minimized()) {
+            uint64_t ms = (now - since) / 1'000'000;
+            if (last_frame && ms > 100 && !hits.empty()) {
+                log("stall: %llu ms without a frame after frame %llu; where the threads were:", (unsigned long long)ms,
+                    (unsigned long long)last_frame);
+                std::map<uint64_t, std::pair<uint64_t, uint32_t>> top;  // thread -> (lr, samples)
+                std::map<uint64_t, uint32_t> total;
+                for (auto& [k, n] : hits) {
+                    total[k.first] += n;
+                    if (n > top[k.first].second) top[k.first] = {k.second, n};
+                }
+                for (auto& [id, t] : top)
+                    log("  thread %llx: %s (%u of %u samples)", (unsigned long long)id, describe(t.first).c_str(),
+                        t.second, total[id]);
+            }
+            hits.clear();
+            last_frame = f;
+            since = now;
+            continue;
+        }
+        if (!f || now - since < 60'000'000) continue;
+        std::lock_guard al(g_all_lock);
+        for (auto& w : g_all)
+            if (auto t = w.lock(); t && t->started && !t->exited) hits[{t->id, t->ctx.x[30]}]++;
+    }
+}
+
+void kernel_init() {
+    plat::start_thread(watchdog, nullptr, 1ull << 20);
+    plat::start_thread(stall_sampler, nullptr, 1ull << 20);
+}
 
 // ---- dispatch -------------------------------------------------------------------------------------------------
 

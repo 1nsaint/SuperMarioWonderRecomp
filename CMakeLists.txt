@@ -45,6 +45,7 @@ set(NX_RUNTIME_SOURCES
     runtime/src/hle_audio.cpp
     runtime/src/vk_bridge.cpp
     runtime/src/vk_gen.cpp
+    runtime/src/vk_present.cpp
     runtime/src/game_settings.cpp
 )
 
@@ -60,6 +61,9 @@ if(ANDROID)
     set(GLUE "${ANDROID_NDK}/sources/android/native_app_glue")
     add_library(hades SHARED ${NX_RUNTIME_SOURCES} runtime/src/platform_android.cpp "${GLUE}/android_native_app_glue.c")
     target_include_directories(hades PRIVATE runtime/include runtime/src "${NX_VULKAN_SDK}/Include" "${GLUE}")
+    # Our ANativeActivity_onCreate (platform_android.cpp) runs first, on the UI thread, then calls the glue's.
+    set_source_files_properties("${GLUE}/android_native_app_glue.c" PROPERTIES
+        COMPILE_DEFINITIONS "ANativeActivity_onCreate=glue_ANativeActivity_onCreate")
     target_link_libraries(hades PRIVATE game_main game_sdk android log aaudio)
     # The glue's ANativeActivity_onCreate must be exported.
     target_link_options(hades PRIVATE -u ANativeActivity_onCreate)

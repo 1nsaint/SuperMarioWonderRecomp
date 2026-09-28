@@ -12,9 +12,32 @@ the OS through `runtime/src/platform.h` (`platform_win.cpp` / `platform_android.
 | Audio | XAudio2 | AAudio (low latency, callback) |
 | Vulkan | vulkan-1.dll, VK_KHR_win32_surface | libvulkan.so, VK_KHR_android_surface |
 
-The game renders at the phone's own resolution and aspect by default (Hades handles wide screens itself: at
-19.5:9 it draws its own side art). `config.txt` in the data folder can set another one, e.g. `resolution=1560x720`
-for more speed.
+The game fills the whole screen in native widescreen (Hor+, like Hades II and the Hephaistos mod on PC): the
+engine's virtual screen stays 1080 high and becomes 1080 x aspect wide, so a 19.5:9 phone shows more of each room
+instead of a stretched 16:9 picture. The runtime rewrites the engine's 16:9 globals after its static initializers
+(`game_settings.cpp`) and serves the Hephaistos Lua mod (`runtime/mods/hephaistos`, MIT) to the game from memory.
+FMVs (main menu) stay stretched for now, dialogue portraits stay 16:9.
+
+The picture is drawn into the swapchain already rotated to the display's own orientation (present pass,
+`vk_present.cpp`), so the display controller scans it out directly even with system UI on top; the system bars
+are hidden (swipe from an edge shows them for a moment). Leaving the app and coming back re-makes the surface and
+swapchain under the game.
+
+`config.txt` in the data folder (`key=value` lines):
+
+| Key | Default | What |
+|---|---|---|
+| `render_scale` | by GPU: 1 (Adreno 7xx+, Mali-G710+, Immortalis, Xclipse), 0.85 (Adreno 6xx), 0.67 | render at a fraction of the screen, scaled up by the present pass; never above 1080 lines |
+| `resolution` | | exact render size, e.g. `1560x720` (overrides `render_scale`) |
+| `fullscreen` | 1 | 0: the engine's own 16:9 with its side art |
+| `widescreen` | 1 | 0: fullscreen stretched instead of Hor+ |
+| `center_hud` | 0 | 1: HUD kept in the central 16:9 area |
+| `Letterbox`, `UseSideBarArt`, `NoBorder`, `SwapInterval`, `NoFixedStep` | | engine settings, set as is |
+| `trace` | 0 | 1: log file system calls and SVCs (slow) |
+
+Diagnostics while it runs: `touch Hades/dump_threads` logs every guest thread; `echo 20 > Hades/profile` samples
+every thread's host pc for 20 s into `Hades/profile.txt`. The log (`Hades/nx.log`, previous run in `nx.log.prev`)
+reports fps per 5 s with the worst frame, and stalls over 100 ms with where each thread was.
 
 ## Install from your phone alone
 
@@ -57,6 +80,5 @@ A Bluetooth controller is the better way to play for now.
 
 ## Known limits
 
-- Leaving the app (home button) loses the surface; come back only by restarting for now.
 - The address space: the guest ranges sit at 0x40_0000_0000-0x6F_0000_0000, below the 39-bit top where
   Android maps libraries; a failed reservation is reported in the log.

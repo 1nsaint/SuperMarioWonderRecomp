@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "vk_gen.h"
+#include "vk_present.h"
 
 namespace nx {
 void log_game_settings();  // game_settings.cpp
@@ -280,6 +281,10 @@ struct SurfaceInfo {
 };
 std::unordered_map<uint64_t, SurfaceInfo> g_surfaces;  // game handle -> current
 
+// The game's surface and swapchain handles are ours (a host handle value could come back for another object once
+// the host one behind it was re-made).
+uint64_t g_next_handle = 0x0000FA4E00000001ull;
+
 // The host surface behind a game handle, re-made on the current window if the OS replaced it. False: no window.
 bool refresh_surface(SurfaceInfo& s) {
     uint64_t gen = plat::window_generation();
@@ -312,9 +317,10 @@ void w_vkCreateViSurfaceNN(CPU& c) {  // (instance, const VkViSurfaceCreateInfoN
                                                   reinterpret_cast<void*>(host_gipa)));
     log("vkCreateViSurfaceNN -> %s surface on %p: %d", plat::vulkan_surface_extension(), vi->window, r);
     if (r == VK_SUCCESS) {
-        st<uint64_t>(c.x[3], s);
+        uint64_t game = g_next_handle++;
+        st<uint64_t>(c.x[3], game);
         // The window came from nn::vi::GetNativeWindow (a reference the game never gives back): ours now.
-        g_surfaces[s] = {arg<VkInstance>(c.x[0]), vi->window, plat::window_generation(), reinterpret_cast<VkSurfaceKHR>(s)};
+        g_surfaces[game] = {arg<VkInstance>(c.x[0]), vi->window, plat::window_generation(), reinterpret_cast<VkSurfaceKHR>(s)};
     }
     c.x[0] = ret_u64(r);
 }
@@ -379,6 +385,8 @@ struct SwapchainInfo {
     uint64_t generation = 0;  // window generation it was made for
     bool lost = false;        // the host said out of date / surface lost: re-make before the next acquire
     VkQueue queue = VK_NULL_HANDLE;  // where the game presents
+    PresentPass pass;        // draws the game's image into the host one (rotated); else a plain copy
+    bool prerotate = false;  // host swapchain in the display's own orientation
     std::vector<VkImage> images;  // what the game sees (the virtual images when `virt`)
     // Virtual swapchain.
     bool virt = false;
@@ -406,6 +414,7 @@ uint32_t find_memory_type(VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFl
 void destroy_virtual(SwapchainInfo& s) {
     if (!s.virt) return;
     p_vkDeviceWaitIdle(s.device);
+    s.pass.destroy();
     for (VkImage i : s.images) p_vkDestroyImage(s.device, i, nullptr);
     for (VkDeviceMemory m : s.memory) p_vkFreeMemory(s.device, m, nullptr);
     for (VkSemaphore x : s.copied) p_vkDestroySemaphore(s.device, x, nullptr);
@@ -430,7 +439,7 @@ bool make_virtual(SwapchainInfo& s, const VkSwapchainCreateInfoKHR& ci) {
         ii.arrayLayers = ci.imageArrayLayers;
         ii.samples = VK_SAMPLE_COUNT_1_BIT;
         ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ii.usage = ci.imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ii.usage = ci.imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         if (p_vkCreateImage(s.device, &ii, nullptr, &s.images[k]) != VK_SUCCESS) return false;
@@ -505,6 +514,18 @@ bool remake(SwapchainInfo& s) {
     s.ci.surface = it->second.host;
     s.ci.pQueueFamilyIndices = s.families.empty() ? nullptr : s.families.data();
     adapt_to_surface(s.ci);
+    if (s.prerotate) {
+        VkSurfaceCapabilitiesKHR caps{};
+        p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_physical, s.ci.surface, &caps);
+        bool sideways = caps.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR);
+        s.ci.preTransform = caps.currentTransform;
+        // The screen's own size (the game may render smaller: the present pass scales).
+        uint32_t sw = 0, sh = 0;
+        plat::screen_size(sw, sh);
+        VkExtent2D screen = sw && sh ? VkExtent2D{sw, sh} : s.extent;
+        s.ci.imageExtent = sideways ? VkExtent2D{screen.height, screen.width} : screen;
+        s.ci.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    }
     VkResult r = p_vkCreateSwapchainKHR(s.device, &s.ci, nullptr, &s.host_sc);
     s.generation = it->second.generation;
     s.lost = r != VK_SUCCESS;
@@ -516,8 +537,18 @@ bool remake(SwapchainInfo& s) {
     get_host_images(s);
     make_copied_semaphores(s);
     s.next = 0;
-    log("vk: swapchain re-made on the new window (%zu host images)", s.host.size());
+    if (s.pass.ready() && !s.pass.set_targets(s.host, s.ci.imageExtent, s.ci.preTransform)) s.pass.destroy();
+    log("vk: host swapchain %ux%u, transform %u, %zu images%s", s.ci.imageExtent.width, s.ci.imageExtent.height,
+        unsigned(s.ci.preTransform), s.host.size(), s.pass.ready() ? ", drawn by the present pass" : ", copied");
     return true;
+}
+
+// Suboptimal from a pre-rotated swapchain: re-make it if the display's orientation changed (phone turned over).
+void check_orientation(SwapchainInfo& s) {
+    if (!s.prerotate || !s.ci.surface) return;
+    VkSurfaceCapabilitiesKHR caps{};
+    p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_physical, s.ci.surface, &caps);
+    if (caps.currentTransform != s.ci.preTransform) s.lost = true;
 }
 
 void w_vkCreateSwapchainKHR(CPU& c) {  // (device, const VkSwapchainCreateInfoKHR*, alloc, VkSwapchainKHR*)
@@ -536,8 +567,9 @@ void w_vkCreateSwapchainKHR(CPU& c) {  // (device, const VkSwapchainCreateInfoKH
     log("vkCreateSwapchainKHR %ux%u format %d, %u images, present mode %d -> %d", ci.imageExtent.width,
         ci.imageExtent.height, ci.imageFormat, ci.minImageCount, ci.presentMode, r);
     if (r == VK_SUCCESS) {
-        st<uint64_t>(c.x[3], reinterpret_cast<uint64_t>(sc));
-        SwapchainInfo& s = g_swapchains[reinterpret_cast<uint64_t>(sc)];
+        uint64_t game = g_next_handle++;
+        st<uint64_t>(c.x[3], game);
+        SwapchainInfo& s = g_swapchains[game];
         s.device = arg<VkDevice>(c.x[0]);
         s.format = ci.imageFormat;
         s.extent = ci.imageExtent;
@@ -558,6 +590,17 @@ void w_vkCreateSwapchainKHR(CPU& c) {  // (device, const VkSwapchainCreateInfoKH
                 fatal("swapchain has %u images, the game handles %u, and no virtual swapchain could be made", n,
                       kMaxGuestImages);
             log("vk: %u host swapchain images, the game sees %u (copied on present)", n, kMaxGuestImages);
+            if (std::strcmp(plat::vulkan_surface_extension(), "VK_KHR_android_surface") == 0) {
+                uint32_t sw = 0, sh = 0;
+                plat::screen_size(sw, sh);
+                if (s.pass.init(s.device, s.format, s.images, sw != s.extent.width || sh != s.extent.height)) {
+                    s.prerotate = true;
+                    remake(s);  // again, in the display's orientation
+                } else {
+                    s.pass.destroy();
+                    log("vk: present pass not available, copying");
+                }
+            }
         }
     }
     c.x[0] = ret_u64(r);
@@ -728,8 +771,9 @@ void w_vkAcquireNextImageKHR(CPU& c) {  // (device, swapchain, timeout, semaphor
     uint32_t host = 0;
     VkResult r = VK_ERROR_OUT_OF_DATE_KHR;
     if (!s) {
-        r = p_vkAcquireNextImageKHR(arg<VkDevice>(c.x[0]), arg<VkSwapchainKHR>(c.x[1]), c.x[2], arg<VkSemaphore>(c.x[3]),
-                                    arg<VkFence>(c.x[4]), arg<uint32_t*>(c.x[5]));
+        VkSwapchainKHR sc = it != g_swapchains.end() ? it->second.host_sc : arg<VkSwapchainKHR>(c.x[1]);
+        r = p_vkAcquireNextImageKHR(arg<VkDevice>(c.x[0]), sc, c.x[2], arg<VkSemaphore>(c.x[3]), arg<VkFence>(c.x[4]),
+                                    arg<uint32_t*>(c.x[5]));
     } else {
         // Window replaced or swapchain lost: re-make it under the game (waiting for a window as long as it takes).
         for (int attempt = 0; attempt < 50; attempt++) {
@@ -741,6 +785,7 @@ void w_vkAcquireNextImageKHR(CPU& c) {  // (device, swapchain, timeout, semaphor
                 }
             }
             r = p_vkAcquireNextImageKHR(s->device, s->host_sc, c.x[2], arg<VkSemaphore>(c.x[3]), arg<VkFence>(c.x[4]), &host);
+            if (r == VK_SUBOPTIMAL_KHR) check_orientation(*s);
             if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR || r == VK_TIMEOUT || r == VK_NOT_READY) break;
             log("vkAcquireNextImageKHR -> %d: re-making the swapchain", r);
             s->lost = true;
@@ -806,6 +851,12 @@ void copy_virtual(VkQueue queue, VkPresentInfoKHR& pi, std::vector<uint32_t>& in
         if (it == g_swapchains.end() || !it->second.virt) continue;
         SwapchainInfo& s = it->second;
         uint32_t v = indices[k], h = s.host_of[v];
+        if (s.pass.ready()) {
+            s.pass.record(cb, v, h);
+            indices[k] = h;
+            signals.push_back(s.copied[h]);
+            continue;
+        }
         VkImage src = s.images[v], dst = s.host[h];
         VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, s.layers};
         auto barrier = [&](VkImage img, VkAccessFlags sa, VkAccessFlags da, VkImageLayout from, VkImageLayout to) {
@@ -899,6 +950,9 @@ void w_vkQueuePresentKHR(CPU& c) {
         log("vkQueuePresentKHR -> %d: swapchain will be re-made", r);
         r = VK_SUCCESS;
     } else if (r == VK_SUBOPTIMAL_KHR) {
+        for (uint32_t k = 0; k < pi.swapchainCount; k++)
+            if (auto it = g_swapchains.find(reinterpret_cast<uint64_t>(game_swapchains[k])); it != g_swapchains.end())
+                check_orientation(it->second);
         r = VK_SUCCESS;
     }
     nx::g_frame = frames + 1;

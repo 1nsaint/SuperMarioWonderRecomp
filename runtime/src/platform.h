@@ -33,6 +33,8 @@ uint64_t monotonic_ns();
 FILE* fopen_utf8(const std::string& path, const char* mode);
 int64_t ftell64(FILE* f);
 int fseek64(FILE* f, int64_t off, int origin);
+// Positional read, safe with other threads reading the same FILE (no shared file position). Bytes read.
+uint64_t read_at(FILE* f, int64_t off, void* buf, uint64_t size);
 bool make_dirs(const std::string& path);
 
 // ---- output ----
@@ -46,6 +48,9 @@ void release_window(void* w);  // done with a handle from create_window
 uint64_t window_generation();  // changes when the OS replaced the window (Android: app back from the background)
 bool window_minimized();     // no surface to draw to (minimized / app in background)
 void window_size(uint32_t& w, uint32_t& h);  // client size in pixels
+void screen_size(uint32_t& w, uint32_t& h);  // the display's own size, landscape (Android; the window on PC)
+// The render scale to use when the player sets none: 1 on fast GPUs, less on slower ones (Android).
+float default_render_scale();
 
 // NpadButton bits (Nintendo layout: A is the right face button, B the bottom one).
 enum : uint64_t {
