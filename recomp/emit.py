@@ -116,6 +116,9 @@ class Emitter:
         self.cs.detail = True
         self.entries = {f.start for f in an.functions}
         self.prefix = prefix
+        # Debug: NX_TRACE_SP=0xADDR,... logs SP after every instruction that changes it in those functions.
+        import os
+        self.trace_sp = {int(x, 16) for x in os.environ.get("NX_TRACE_SP", "").split(",") if x}
         self.unhandled = collections.Counter()
         self.handled = 0
 
@@ -232,6 +235,8 @@ class Emitter:
                 self.unhandled[i.mnemonic] += 1
                 txt = f"{i.mnemonic} {i.op_str}".replace('"', "'")
                 stmt = f"nx::unimpl(c, {B} + {a:#x}ull, \"{txt}\"); // {e}"
+            if f.start in self.trace_sp and ("sp" in i.op_str.split(",")[0] or "[sp" in i.op_str and i.writeback):
+                stmt += f" nx::trace_sp(c, {B} + {a:#x}ull);"
             body.append((a, f"{stmt} // {i.mnemonic} {i.op_str}"))
             last_term = i.mnemonic in ("b", "br", "ret", "udf", "brk") or stmt.endswith("return; }")
         out = [f"void {self.fn(f.start)}(nx::CPU& c) {{"]

@@ -51,6 +51,7 @@ void call(CPU& c, uint64_t target);  // indirect call / tail call through the fu
 void svc(CPU& c, uint32_t imm, uint64_t pc);
 uint64_t mrs(CPU& c, uint32_t sysreg);
 void msr(CPU& c, uint32_t sysreg, uint64_t value);
+void trace_sp(CPU& c, uint64_t pc);  // debug (NX_TRACE_SP at recompile time)
 
 // ---- memory -------------------------------------------------------------------------------------------------
 

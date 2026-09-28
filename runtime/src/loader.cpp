@@ -152,7 +152,17 @@ void call(CPU& c, uint64_t t) {
     fatal("call to %llx (%s), lr %s", (unsigned long long)t, describe(t).c_str(), describe(c.x[30]).c_str());
 }
 
+void backtrace(CPU& c);
+
+void trace_sp(CPU& c, uint64_t pc) {
+    log("sp %llx x19 %llx at %s", (unsigned long long)c.x[31], (unsigned long long)c.x[19], describe(pc).c_str());
+}
+
 [[noreturn]] void unimpl(CPU& c, uint64_t pc, const char* what) {
+    for (int k = 0; k < 31; k += 4)
+        log("  x%-2d %016llx %016llx %016llx %016llx", k, (unsigned long long)c.x[k], (unsigned long long)c.x[k + 1],
+            (unsigned long long)c.x[k + 2], (unsigned long long)(k + 3 < 32 ? c.x[k + 3] : 0));
+    backtrace(c);
     fatal("unimplemented instruction at %s: %s (lr %s)", describe(pc).c_str(), what, describe(c.x[30]).c_str());
 }
 

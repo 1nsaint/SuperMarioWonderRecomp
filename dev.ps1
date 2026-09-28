@@ -7,5 +7,8 @@ Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments "-ar
 $cm = "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake"
 $env:PATH = "$vs\VC\Tools\Llvm\x64\bin;$cm\CMake\bin;$cm\Ninja;$env:PATH"
 $env:PATH = "$PSScriptRoot\private\tools\nstool;$env:PATH"
+# Vulkan SDK: headers, vk.xml (tools/gen_vk.py), validation layer (NX_VK_VALIDATION=1)
+if (-not $env:VULKAN_SDK) { $env:VULKAN_SDK = (Get-ChildItem C:\VulkanSDK -Directory | Sort-Object Name | Select-Object -Last 1).FullName }
+$env:PATH = "$env:VULKAN_SDK\Bin;$env:PATH"
 Set-Location $PSScriptRoot
 Write-Host "SwitchGamesRecomp dev env: clang $((clang-cl --version)[0] -replace '.*version ','') | $(Get-Location)"

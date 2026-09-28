@@ -267,8 +267,11 @@ def _jump_table(an, f, br):
         return None
     idx = _regno(mem.group(2))
     count = _bound(an, f, a_ld, idx)
-    limit = count if count is not None else 1024
+    # Without a bound, take every entry that lands on an instruction of this function (up to 256): a superset only
+    # adds labels, while a missing target would be a call into the middle of the function at run time.
+    limit = count if count is not None else 256
     out = []
+    misses = 0
     for k in range(limit):
         p = table + k * size
         if p + size > len(m.image):
@@ -276,7 +279,8 @@ def _jump_table(an, f, br):
         v = int.from_bytes(m.image[p:p + size], "little", signed=signed)
         t = anchor + (v << shift)
         if not (f.start <= t < f.end) or t not in an.insns:
-            if count is None:
+            misses += 1
+            if count is None and misses > 4:
                 break
             continue
         out.append(t)
@@ -284,12 +288,19 @@ def _jump_table(an, f, br):
 
 
 def _bound(an, f, before, idx):
-    """Number of table entries from `cmp idx, #N` + b.hi/b.hs before the load."""
+    """Number of table entries from `cmp idx, #N` + b.hi/b.hs before the load. The index may be a zero/sign
+    extended copy of the compared register (and x8, x22, #0xffffffff / mov / uxtw / sxtw)."""
+    regs = {idx}
     a = before - 4
     while a >= max(f.start, before - 4 * 40):
         mn, op = an.insns.get(a, ("", ""))
         ops = _ops(op)
-        if mn == "cmp" and len(ops) == 2 and _regno(ops[0]) == idx and ops[1].startswith("#"):
+        if len(ops) >= 2 and _regno(ops[0]) in regs and ops[1][0] in "xw":
+            copy = (mn in ("mov", "uxtw", "sxtw") or
+                    (mn == "and" and len(ops) == 3 and ops[2] in ("#0xffffffff", "#4294967295")))
+            if copy:
+                regs.add(_regno(ops[1]))
+        if mn == "cmp" and len(ops) == 2 and _regno(ops[0]) in regs and ops[1].startswith("#"):
             n = _imm(ops[1][1:])
             # Find the branch that uses these flags.
             for k in range(1, 6):

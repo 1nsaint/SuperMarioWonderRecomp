@@ -37,11 +37,20 @@ add_executable(hades
     runtime/src/hle_vi.cpp
     runtime/src/hle_hid.cpp
     runtime/src/hle_net.cpp
+    runtime/src/hle_audio.cpp
+    runtime/src/vk_bridge.cpp
+    runtime/src/vk_gen.cpp
 )
-target_include_directories(hades PRIVATE runtime/include runtime/src)
+# Vulkan headers (the loader, vulkan-1.dll, comes with the GPU driver).
+if(DEFINED ENV{VULKAN_SDK})
+    set(NX_VULKAN_SDK "$ENV{VULKAN_SDK}" CACHE PATH "Vulkan SDK")
+else()
+    set(NX_VULKAN_SDK "C:/VulkanSDK/1.4.357.0" CACHE PATH "Vulkan SDK")
+endif()
+target_include_directories(hades PRIVATE runtime/include runtime/src "${NX_VULKAN_SDK}/Include")
 target_link_libraries(hades PRIVATE game_main game_sdk xinput)
 # Static tables (and HLE registrars) must not be dropped by the linker.
 if(MSVC)
     # Keep host allocations low so the guest ranges (0x40_0000_0000..0x80_0000_0000) are always free.
-    target_link_options(hades PRIVATE /STACK:67108864 /HIGHENTROPYVA:NO)
+    target_link_options(hades PRIVATE /STACK:67108864 /HIGHENTROPYVA:NO /MAP)
 endif()

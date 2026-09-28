@@ -333,6 +333,11 @@ static std::shared_ptr<KThread> new_thread(uint64_t entry, uint64_t arg, uint64_
     t->prio = prio;
     t->core = core;
     t->tls = kernel_alloc(0x1000);  // one TLS page per thread (0x200 used)
+    // Static TLS block for the thread (what rtld and the libc provide on Horizon): the thread pointer, stored at
+    // TLS region +0x1F0 where nn::os loads TPIDR_EL0 from. main's TLS is 0x440 bytes of .tbss at tp+0x10.
+    uint64_t block = kernel_alloc(0x4000);
+    st<uint64_t>(t->tls + 0x1F0, block);
+    t->ctx.tpidr = block;
     t->ctx.x[0] = arg;
     t->ctx.x[31] = sp;
     t->ctx.tpidrro = t->tls;
@@ -373,7 +378,7 @@ void backtrace(CPU& c) {
         if (v.state == kMemFree) break;
         uint64_t lr = ld<uint64_t>(fp + 8);
         if (!lr) break;
-        log("  #%-2d %s", k, describe(lr).c_str());
+        log("  #%-2d %s  (fp %llx)", k, describe(lr).c_str(), (unsigned long long)fp);
         fp = ld<uint64_t>(fp);
     }
 }
