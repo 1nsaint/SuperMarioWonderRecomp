@@ -1,13 +1,14 @@
 // Boot: map and link the recompiled modules (what rtld does), create the main thread and enter
 // nn::init::Start(main thread handle, main module base, init, fini) like rtld's _start.
+// The platform's entry point (platform_win.cpp / platform_android.cpp) calls nx::boot().
+#include <cstdio>
 #include <cstdlib>
 #include <string>
-
-#include <windows.h>
 
 #include <nx/runtime.h>
 
 #include "kernel.h"
+#include "platform.h"
 
 extern const nx::ModuleInfo nx_module_main;
 extern const nx::ModuleInfo nx_module_sdk;
@@ -35,8 +36,13 @@ void msr(CPU& c, uint32_t sysreg, uint64_t value) {
     log("msr %#x = %llx at lr %s", sysreg, (unsigned long long)value, describe(c.x[30]).c_str());
 }
 
-// Module initializers. Each module's DT_INIT (at +0x30 in both main and sdk, see .dynamic) registers the module's
-// TLS and unwind info with __nnmusl_init_dso and runs its init_array.
+// ---- module initializers --------------------------------------------------------------------------------------
+// Each module's DT_INIT (at +0x30 in both main and sdk, see .dynamic) registers the module with the libc
+// (__nnmusl_init_dso: TLS, unwind info) and runs its init_array, unless the registration reports 1: then the
+// constructors are left to the loader and we run them. Registration only works once the program has given nn::os
+// a TLS allocator (SetMemoryAllocatorForThreadLocal, in nninitStartup), so rtld's initializer callback does nothing
+// and the modules are initialized right before nnMain, SDK first. Static TLS itself comes from the kernel
+// (kernel.cpp: a block per thread at TLS region +0x1F0, where nn::os loads TPIDR_EL0 from).
 constexpr uint64_t kDtInit = 0x30;
 
 static void call_preserving(CPU& c, uint64_t target) {
@@ -54,42 +60,6 @@ static uint64_t init_status_addr(const ModuleInfo& m) {
     return (pc & ~0xFFFull) + uint64_t(imm) + ((ldr >> 10) & 0xFFF) * 4;
 }
 
-// Run a module's initializers the way rtld does: DT_INIT registers the module with the libc (TLS, unwind info);
-// when that registration reports 1 the constructors are left to the loader, so we run the init_array.
-// The main thread's static TLS. New threads get theirs from nn::os's thread entry, which calls the libc's
-// thread-start hook (it allocates the TLS block and stores it at TLS region +0x1F0) and then loads TPIDR_EL0 from
-// there; on Horizon rtld does the same for the main thread. Hook variable: sdk GOT slot 0x11e8628.
-constexpr uint64_t kThreadStartHookGot = 0x11e8628;
-
-static void setup_main_thread_tls(CPU& c) {
-    uint64_t var = ld<uint64_t>(nx_module_sdk.base + kThreadStartHookGot);
-    uint64_t hook = var ? ld<uint64_t>(var) : 0;
-    if (hook) {
-        uint64_t saved0 = c.x[0];
-        c.x[0] = ld<uint64_t>(c.tpidrro + 0x1F8);  // ThreadType*
-        call_preserving(c, hook);
-        c.x[0] = saved0;
-    }
-    c.tpidr = ld<uint64_t>(c.tpidrro + 0x1F0);
-    log("main thread TLS: hook %s, TPIDR_EL0 = %llx", hook ? describe(hook).c_str() : "none",
-        (unsigned long long)c.tpidr);
-}
-
-// rtld's initializer callback. Like rtld, register the modules with the libc in load order: main first (it
-// becomes the head of the libc's module list; its constructors stay pending, init_dso reports 1), the SDK last
-// (the libc itself: it then lays out static TLS for every module, sets TPIDR_EL0 for the main thread and installs
-// the thread-pointer hooks nn::os uses for new threads).
-// libc internals (sdk): the head of the libc's module list, and the function that starts a module (for the head:
-// allocates static TLS for all modules, copies .tdata, sets TPIDR_EL0 and installs the thread-pointer hooks).
-constexpr uint64_t kMuslDsoHead = 0x1294ed0;
-constexpr uint64_t kMuslStartDso = 0x51dd38;
-
-// Module initializers can only run once the program has given nn::os a TLS allocator
-// (SetMemoryAllocatorForThreadLocal, done in nninitStartup): __nnmusl_init_dso bails out before that. So rtld's
-// callback does nothing and the modules are initialized right before nnMain, SDK first.
-static void rtld_init(CPU&) {}
-
-// The program's pending constructors, once nninitStartup has set up its allocator.
 static void init_module(CPU& c, const ModuleInfo& m) {
     call_preserving(c, m.base + kDtInit);
     uint32_t status = ld<uint32_t>(init_status_addr(m));
@@ -98,25 +68,14 @@ static void init_module(CPU& c, const ModuleInfo& m) {
     log("%s constructors: %zu", m.name, status == 1 ? m.init_count : 0);
 }
 
-// nnMain, as called by nn::init::Start: the program's constructors need its allocator, which nninitStartup has
+static void rtld_init(CPU&) {}
+static void rtld_fini(CPU&) {}
+
+// nnMain, as called by nn::init::Start: the constructors need the program's allocator, which nninitStartup has
 // set up by now, so they run here, right before the real nnMain.
 static void nn_main(CPU& c) {
-    log("TLS allocator set: %llx", (unsigned long long)ld<uint64_t>(nx_module_sdk.base + 0x11f5008));
     init_module(c, nx_module_sdk);
     init_module(c, nx_module_main);
-    log("TPIDR_EL0 = %llx, musl head %llx", (unsigned long long)c.tpidr,
-        (unsigned long long)ld<uint64_t>(nx_module_sdk.base + kMuslDsoHead));
-    uint64_t list = ld<uint64_t>(nx_module_sdk.base + 0x1294ec8), count = ld<uint64_t>(nx_module_sdk.base + 0x1294ed8);
-    log("musl modules: list %llx count %llu", (unsigned long long)list, (unsigned long long)count);
-    for (uint64_t k = 0; list && k < 8; k++) {
-        uint64_t d = ld<uint64_t>(list + 8 * k);
-        if (!d) continue;
-        log("  [%llu] dso %llx: %llx %llx %llx %llx %llx %llx flags %x", (unsigned long long)k, (unsigned long long)d,
-            (unsigned long long)ld<uint64_t>(d), (unsigned long long)ld<uint64_t>(d + 8),
-            (unsigned long long)ld<uint64_t>(d + 0x10), (unsigned long long)ld<uint64_t>(d + 0x18),
-            (unsigned long long)ld<uint64_t>(d + 0x20), (unsigned long long)ld<uint64_t>(d + 0x30),
-            ld<uint8_t>(d + 0x38));
-    }
     log("entering nnMain");
     uint64_t real = 0;
     for (size_t k = 0; k < nx_module_main.symbol_count; k++)
@@ -124,116 +83,61 @@ static void nn_main(CPU& c) {
             real = nx_module_main.base + nx_module_main.symbols[k].value;
     call(c, real);
 }
-NX_HLE("nnMain", nn_main);
 
-// Render resolution. nnMain sets the game's output size to 1280x720 in two globals (main+0x8ccd98 and
-// main+0x8ccec0: {u32 width, u32 height}) and then calls nn::time::Initialize before creating the renderer; that
-// import is our hook to put NX_RESOLUTION=WxH there instead.
+// ---- render resolution ----------------------------------------------------------------------------------------
+// nnMain sets the game's output size to 1280x720 in two globals (main+0x8ccd98 and main+0x8ccec0: {u32 width,
+// u32 height}) and then calls nn::time::Initialize before creating the renderer; that import is our hook to put
+// the configured resolution there. The game renders natively at any size and aspect (wider than 16:9 it adds its
+// own side art).
+static bool render_resolution(uint32_t& w, uint32_t& h) {
+    if (const char* r = std::getenv("NX_RESOLUTION")) return std::sscanf(r, "%ux%u", &w, &h) == 2 && w && h;
+#if defined(__ANDROID__)
+    plat::window_size(w, h);  // the phone's own screen, in its own aspect
+    return w && h;
+#else
+    return false;
+#endif
+}
+
 static void time_initialize(CPU& c) {
-    if (const char* r = std::getenv("NX_RESOLUTION")) {
-        unsigned w = 0, h = 0;
-        if (std::sscanf(r, "%ux%u", &w, &h) == 2 && w && h) {
-            for (uint64_t off : {0x8ccd98ull, 0x8ccec0ull}) {
-                uint64_t p = nx_module_main.base + off;
-                if (ld<uint32_t>(p) == 1280 && ld<uint32_t>(p + 4) == 720) {
-                    st<uint32_t>(p, w);
-                    st<uint32_t>(p + 4, h);
-                }
+    uint32_t w = 0, h = 0;
+    if (render_resolution(w, h)) {
+        for (uint64_t off : {0x8ccd98ull, 0x8ccec0ull}) {
+            uint64_t p = nx_module_main.base + off;
+            if (ld<uint32_t>(p) == 1280 && ld<uint32_t>(p + 4) == 720) {
+                st<uint32_t>(p, w);
+                st<uint32_t>(p + 4, h);
             }
-            log("render resolution %ux%u", w, h);
         }
+        log("render resolution %ux%u", w, h);
     }
     call(c, find_symbol("_ZN2nn4time10InitializeEv"));
 }
-NX_HLE("_ZN2nn4time10InitializeEv", time_initialize);
 
 // longjmp(buf, val): unwinds the host stack to the recompiled function that called setjmp on buf.
 static void long_jmp(CPU& c) { throw LongJmp{c.x[0], uint32_t(c.x[1])}; }
-NX_HLE("longjmp", long_jmp);
-NX_HLE("_longjmp", long_jmp);
-static void rtld_fini(CPU&) {}
+
 static void process_return(CPU&) {
     log("nn::init::Start returned");
-    ExitProcess(0);
+    plat::exit_process(0);
 }
+
+NX_HLE("nnMain", nn_main);
+NX_HLE("_ZN2nn4time10InitializeEv", time_initialize);
+NX_HLE("longjmp", long_jmp);
+NX_HLE("_longjmp", long_jmp);
 NX_HLE("__rtld_init", rtld_init);
 NX_HLE("__rtld_fini", rtld_fini);
 NX_HLE("__process_return", process_return);
 
-}  // namespace nx
+// ---- boot -----------------------------------------------------------------------------------------------------
 
-// Debugging aid: NX_WATCH=<hex address> puts a hardware write watchpoint (DR0, 8 bytes) on every thread the
-// kernel starts and on the main thread; the first write logs the host RIP (module) and the guest context.
-static uint64_t g_watch = 0;
-
-static void arm_watch(HANDLE thread) {
-    if (!g_watch) return;
-    CONTEXT ctx{};
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    GetThreadContext(thread, &ctx);
-    ctx.Dr0 = g_watch;
-    ctx.Dr7 = (1ull << 0) | (1ull << 16) | (3ull << 18);  // L0, R/W0 = write, LEN0 = 8 bytes
-    SetThreadContext(thread, &ctx);
-}
-
-static LONG WINAPI watch_handler(EXCEPTION_POINTERS* e) {
-    using namespace nx;
-    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !g_watch) return EXCEPTION_CONTINUE_SEARCH;
-    HMODULE mod = nullptr;
-    char name[MAX_PATH] = "?";
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       reinterpret_cast<LPCSTR>(e->ExceptionRecord->ExceptionAddress), &mod);
-    if (mod) GetModuleFileNameA(mod, name, sizeof name);
-    log("WATCH: %llx written (now %llx) by host %p in %s (+%llx)", (unsigned long long)g_watch,
-        (unsigned long long)ld<uint64_t>(g_watch), e->ExceptionRecord->ExceptionAddress, name,
-        (unsigned long long)(uint64_t(e->ExceptionRecord->ExceptionAddress) - uint64_t(mod)));
-    CPU& c = current_cpu();
-    log("  guest lr %s", describe(c.x[30]).c_str());
-    for (int k = 0; k < 32; k += 4)
-        log("  x%-2d %016llx %016llx %016llx %016llx", k, (unsigned long long)c.x[k], (unsigned long long)c.x[k + 1],
-            (unsigned long long)c.x[k + 2], (unsigned long long)c.x[k + 3]);
-    backtrace(c);
-    static int hits = 0;
-    if (++hits >= 30) e->ContextRecord->Dr7 = 0;
-    return EXCEPTION_CONTINUE_EXECUTION;
-}
-
-void nx_arm_watch_current() { arm_watch(GetCurrentThread()); }
-
-static LONG WINAPI crash_handler(EXCEPTION_POINTERS* e) {
-    using namespace nx;
-    auto* r = e->ExceptionRecord;
-    uint64_t info = r->NumberParameters > 1 ? r->ExceptionInformation[1] : 0;
-    log("CRASH: exception %08lx at host %p (hades.exe+%llx, see hades.map), data address %llx", r->ExceptionCode,
-        r->ExceptionAddress,
-        (unsigned long long)(uint64_t(r->ExceptionAddress) - uint64_t(GetModuleHandleW(nullptr)) + 0x140000000ull),
-        (unsigned long long)info);
-    CPU& c = current_cpu();
-    log("  guest lr %s  sp %llx  tpidr %llx  tpidrro %llx", describe(c.x[30]).c_str(), (unsigned long long)c.x[31],
-        (unsigned long long)c.tpidr, (unsigned long long)c.tpidrro);
-    backtrace(c);
-    for (int k = 0; k < 31; k += 4)
-        log("  x%-2d %016llx %016llx %016llx %016llx", k, (unsigned long long)c.x[k], (unsigned long long)c.x[k + 1],
-            (unsigned long long)c.x[k + 2], (unsigned long long)(k + 3 < 32 ? c.x[k + 3] : 0));
-    return EXCEPTION_EXECUTE_HANDLER;
-}
-
-int main(int argc, char** argv) {
-    using namespace nx;
-    SetUnhandledExceptionFilter(crash_handler);
-    if (const char* w = std::getenv("NX_WATCH")) {
-        g_watch = std::strtoull(w, nullptr, 16);
-        AddVectoredExceptionHandler(1, watch_handler);
-        arm_watch(GetCurrentThread());
-        log("watching writes to %llx", (unsigned long long)g_watch);
-    }
+void boot() {
     if (const char* t = std::getenv("NX_TRACE")) g_trace = *t == '1';
-    std::string data = argc > 1 ? argv[1] : "private/analysis";
-
     memory_init();
     kernel_init();
     const ModuleInfo* mods[] = {&nx_module_main, &nx_module_sdk};
-    load_modules(mods, 2, data);
+    load_modules(mods, 2, plat::data_root() + "/analysis");
 
     uint32_t main_thread = create_main_thread(16ull << 20);
     CPU& c = current_cpu();
@@ -247,5 +151,6 @@ int main(int argc, char** argv) {
     log("entering nn::init::Start at %s", describe(start).c_str());
     call(c, start);
     log("returned from nn::init::Start");
-    return 0;
 }
+
+}  // namespace nx

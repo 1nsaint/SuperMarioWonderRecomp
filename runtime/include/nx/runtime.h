@@ -28,9 +28,10 @@ constexpr uint64_t kAliasBase = 0x5800000000ull;
 constexpr uint64_t kAliasSize = 0x1000000000ull;
 constexpr uint64_t kStackBase = 0x6800000000ull;
 constexpr uint64_t kStackSize = 0x100000000ull;
-constexpr uint64_t kKernelBase = 0x7000000000ull;  // TLS pages, main thread stack: memory we hand out
+// Kept below 0x70_0000_0000: Android (39-bit address space) maps the process's own libraries and heap up there.
+constexpr uint64_t kKernelBase = 0x6A00000000ull;  // TLS pages, main thread stack: memory we hand out
 constexpr uint64_t kKernelSize = 0x100000000ull;
-constexpr uint64_t kThunkBase = 0x7F00000000ull;  // HLE function addresses (never mapped)
+constexpr uint64_t kThunkBase = 0x6F00000000ull;  // HLE function addresses (never mapped)
 constexpr uint64_t kThunkSize = 0x100000ull;
 
 void memory_init();

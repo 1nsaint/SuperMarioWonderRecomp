@@ -3,9 +3,9 @@
 #include <map>
 #include <mutex>
 
-#include <windows.h>
-
 #include <nx/runtime.h>
+
+#include "platform.h"
 
 namespace nx {
 
@@ -16,9 +16,9 @@ std::map<uint64_t, VmInfo> g_vm;  // start -> block (non-overlapping; gaps are f
 uint64_t g_kernel_next = kKernelBase;
 
 void reserve(uint64_t addr, uint64_t size, const char* what) {
-    if (!VirtualAlloc(reinterpret_cast<void*>(addr), size, MEM_RESERVE, PAGE_NOACCESS))
-        fatal("cannot reserve %s at %llx (+%llx): error %lu", what, (unsigned long long)addr,
-              (unsigned long long)size, GetLastError());
+    if (!plat::reserve(addr, size))
+        fatal("cannot reserve %s at %llx (+%llx): the range is in use", what, (unsigned long long)addr,
+              (unsigned long long)size);
 }
 
 }  // namespace
@@ -38,12 +38,11 @@ void memory_init() {
 }
 
 bool commit(uint64_t addr, uint64_t size) {
-    uint64_t a = addr & ~0xFFFull, e = (addr + size + 0xFFF) & ~0xFFFull;
-    return VirtualAlloc(reinterpret_cast<void*>(a), e - a, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+    return plat::commit(addr, size);
 }
 
 void decommit(uint64_t addr, uint64_t size) {
-    VirtualFree(reinterpret_cast<void*>(addr), size, MEM_DECOMMIT);
+    plat::decommit(addr, size);
 }
 
 uint64_t kernel_alloc(uint64_t size, uint64_t align) {

@@ -11,9 +11,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include <windows.h>
-
 #include "kernel.h"
+#include "platform.h"
 
 namespace nx {
 
@@ -36,11 +35,6 @@ std::vector<KThread*> g_addr_waiters;
 
 thread_local KThread* t_self = nullptr;
 
-LARGE_INTEGER qpc_freq() {
-    LARGE_INTEGER f;
-    QueryPerformanceFrequency(&f);
-    return f;
-}
 
 }  // namespace
 
@@ -69,12 +63,7 @@ KThread* self_thread() { return t_self; }
 
 CPU& current_cpu() { return t_self->ctx; }
 
-uint64_t system_tick() {
-    static const LARGE_INTEGER f = qpc_freq();
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    return uint64_t(double(t.QuadPart) * 19200000.0 / double(f.QuadPart));
-}
+uint64_t system_tick() { return plat::monotonic_ns() * 192 / 10000; }  // 19.2 MHz
 
 // ---- waiting --------------------------------------------------------------------------------------------------
 
@@ -314,7 +303,7 @@ static uint32_t svc_wait_synchronization(CPU& c, uint64_t handles, int32_t count
 
 // ---- threads --------------------------------------------------------------------------------------------------
 
-static DWORD WINAPI thread_main(void* p) {
+static void thread_main(void* p) {
     KThread* t = static_cast<KThread*>(p);
     t_self = t;
     call(t->ctx, t->entry);
@@ -322,7 +311,6 @@ static DWORD WINAPI thread_main(void* p) {
     std::lock_guard lk(g_k);
     t->exited = true;
     notify_all();
-    return 0;
 }
 
 static std::shared_ptr<KThread> new_thread(uint64_t entry, uint64_t arg, uint64_t sp, int prio, int core) {
@@ -458,7 +446,7 @@ void svc(CPU& c, uint32_t imm, uint64_t pc) {
         }
         case 0x07:
             log("svcExitProcess");
-            ExitProcess(0);
+            plat::exit_process(0);
         case 0x08: {  // CreateThread(entry x1, arg x2, stack_top x3, prio w4, core w5) -> handle
             auto t = new_thread(c.x[1], c.x[2], c.x[3], int(c.x[4]), int32_t(c.x[5]));
             c.x[1] = t->handle;
@@ -472,19 +460,19 @@ void svc(CPU& c, uint32_t imm, uint64_t pc) {
                 break;
             }
             t->started = true;
-            t->host = CreateThread(nullptr, 8 << 20, thread_main, t.get(), 0, nullptr);
+            plat::start_thread(thread_main, t.get(), 64ull << 20);  // host stack: recompiled calls nest deeply
             break;
         }
         case 0x0A: {  // ExitThread
             std::lock_guard lk(g_k);
             t_self->exited = true;
             notify_all();
-            ExitThread(0);
+            plat::exit_thread();
         }
         case 0x0B: {  // SleepThread(ns)
             int64_t ns = int64_t(c.x[0]);
             if (ns <= 0)
-                SwitchToThread();
+                plat::yield();
             else
                 std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
             return;

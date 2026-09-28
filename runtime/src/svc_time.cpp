@@ -17,6 +17,37 @@ int64_t unix_now() {
 
 int64_t steady_seconds() { return int64_t(system_tick() / 19200000); }
 
+// Portable UTC <-> calendar helpers (MSVC and bionic spell these differently).
+void utc_tm(time_t t, std::tm& out) {
+#if defined(_WIN32)
+    gmtime_s(&out, &t);
+#else
+    gmtime_r(&t, &out);
+#endif
+}
+
+int64_t utc_from_tm(std::tm& tm) {
+#if defined(_WIN32)
+    return int64_t(_mkgmtime(&tm));
+#else
+    return int64_t(timegm(&tm));
+#endif
+}
+
+// Seconds west of UTC, like _get_timezone (so local = utc - offset).
+long utc_offset_west() {
+    time_t now = std::time(nullptr);
+    std::tm lt{}, gt{};
+#if defined(_WIN32)
+    localtime_s(&lt, &now);
+#else
+    localtime_r(&now, &lt);
+#endif
+    utc_tm(now, gt);
+    lt.tm_isdst = 0;
+    return long(utc_from_tm(gt) - utc_from_tm(lt));
+}
+
 std::shared_ptr<KSharedMemory> time_shared_memory() {
     static std::shared_ptr<KSharedMemory> shm = [] {
         auto s = make_shared_memory("time", 0x1000);
@@ -68,11 +99,10 @@ std::shared_ptr<Service> steady_clock() {
 
 // Calendar conversion in UTC (the host's local offset is applied as the "rule").
 void push_calendar(IpcCtx& c, int64_t t) {
-    long offset = 0;
-    _get_timezone(&offset);
+    long offset = utc_offset_west();
     time_t lt = time_t(t - offset);
     std::tm tm{};
-    gmtime_s(&tm, &lt);
+    utc_tm(lt, tm);
     // CalendarTime {s16 year; s8 month, day, hour, minute, second; pad}
     c.push<int16_t>(int16_t(tm.tm_year + 1900));
     c.push<int8_t>(int8_t(tm.tm_mon + 1));
@@ -107,9 +137,8 @@ std::shared_ptr<Service> time_zone() {
         tm.tm_hour = c.arg<int8_t>(4);
         tm.tm_min = c.arg<int8_t>(5);
         tm.tm_sec = c.arg<int8_t>(6);
-        long offset = 0;
-        _get_timezone(&offset);
-        int64_t t = int64_t(_mkgmtime(&tm)) + offset;
+        long offset = utc_offset_west();
+        int64_t t = utc_from_tm(tm) + offset;
         Buffer out = c.out_buf(0);
         if (out.addr && out.size >= 8) st<int64_t>(out.addr, t);
         c.push<uint32_t>(1);

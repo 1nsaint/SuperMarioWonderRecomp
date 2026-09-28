@@ -10,6 +10,8 @@
 
 #include <nx/runtime.h>
 
+#include "platform.h"
+
 namespace fs = std::filesystem;
 
 namespace nx {
@@ -31,9 +33,11 @@ struct Dir {
 std::map<uint64_t, Dir> g_dirs;
 uint64_t g_next = 1;
 
-fs::path data_root() {
-    const char* r = std::getenv("NX_DATA_ROOT");
-    return r ? fs::path(r) : fs::path("private");
+fs::path data_root() { return fs::u8path(plat::data_root()); }
+
+std::string utf8(const fs::path& p) {
+    auto s = p.u8string();
+    return std::string(s.begin(), s.end());
 }
 
 std::string cstr(uint64_t p) { return p ? std::string(reinterpret_cast<const char*>(p)) : std::string(); }
@@ -101,10 +105,10 @@ void CreateFile(CPU& c) {
         c.x[0] = kPathAlreadyExists;
         return;
     }
-    FILE* f = _wfopen(p.c_str(), L"wb");
+    FILE* f = plat::fopen_utf8(utf8(p), "wb");
     if (f) {
         if (size > 0) {
-            _fseeki64(f, size - 1, SEEK_SET);
+            plat::fseek64(f, size - 1, SEEK_SET);
             fputc(0, f);
         }
         fclose(f);
@@ -157,7 +161,7 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
         c.x[0] = kPathNotFound;
         return;
     }
-    FILE* f = _wfopen(p.c_str(), (mode & 2) ? L"r+b" : L"rb");
+    FILE* f = plat::fopen_utf8(utf8(p), (mode & 2) ? "r+b" : "rb");
     if (!f) {
         c.x[0] = kPathNotFound;
         return;
@@ -187,15 +191,15 @@ void GetFileSize(CPU& c) {  // (s64* out, FileHandle)
         c.x[0] = kTargetNotFound;
         return;
     }
-    int64_t cur = _ftelli64(f);
-    _fseeki64(f, 0, SEEK_END);
-    st<int64_t>(c.x[0], _ftelli64(f));
-    _fseeki64(f, cur, SEEK_SET);
+    int64_t cur = plat::ftell64(f);
+    plat::fseek64(f, 0, SEEK_END);
+    st<int64_t>(c.x[0], plat::ftell64(f));
+    plat::fseek64(f, cur, SEEK_SET);
     c.x[0] = kOk;
 }
 
 uint64_t read_at(FILE* f, int64_t off, uint64_t buf, uint64_t size) {
-    _fseeki64(f, off, SEEK_SET);
+    plat::fseek64(f, off, SEEK_SET);
     return fread(reinterpret_cast<void*>(buf), 1, size, f);
 }
 
@@ -228,7 +232,7 @@ void WriteFile(CPU& c) {  // (FileHandle, s64 off, const void* buf, size_t size,
         c.x[0] = kTargetNotFound;
         return;
     }
-    _fseeki64(f, int64_t(c.x[1]), SEEK_SET);
+    plat::fseek64(f, int64_t(c.x[1]), SEEK_SET);
     fwrite(reinterpret_cast<const void*>(c.x[2]), 1, c.x[3], f);
     if (c.x[4] && (ld<uint32_t>(c.x[4]) & 1)) fflush(f);
     c.x[0] = kOk;

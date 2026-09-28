@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(SwitchGamesRecomp CXX)
+project(SwitchGamesRecomp C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -14,15 +14,20 @@ endif()
 if(MSVC)
     add_compile_options(/arch:AVX2)
 endif()
-add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+if(WIN32)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
 
 foreach(mod main sdk)
     file(GLOB src CONFIGURE_DEPENDS "${NX_GEN_DIR}/${mod}/*.cpp")
     add_library(game_${mod} STATIC ${src})
     target_include_directories(game_${mod} PRIVATE runtime/include "${NX_GEN_DIR}/${mod}")
+    if(ANDROID)
+        target_compile_options(game_${mod} PRIVATE -O2 -fPIC)
+    endif()
 endforeach()
 
-add_executable(hades
+set(NX_RUNTIME_SOURCES
     runtime/src/main.cpp
     runtime/src/loader.cpp
     runtime/src/memory.cpp
@@ -41,16 +46,29 @@ add_executable(hades
     runtime/src/vk_bridge.cpp
     runtime/src/vk_gen.cpp
 )
-# Vulkan headers (the loader, vulkan-1.dll, comes with the GPU driver).
+
+# Vulkan headers (the same registry version tools/gen_vk.py generated from). The loader comes with the GPU driver.
 if(DEFINED ENV{VULKAN_SDK})
     set(NX_VULKAN_SDK "$ENV{VULKAN_SDK}" CACHE PATH "Vulkan SDK")
 else()
     set(NX_VULKAN_SDK "C:/VulkanSDK/1.4.357.0" CACHE PATH "Vulkan SDK")
 endif()
-target_include_directories(hades PRIVATE runtime/include runtime/src "${NX_VULKAN_SDK}/Include")
-target_link_libraries(hades PRIVATE game_main game_sdk xinput xaudio2 ole32)
-# Static tables (and HLE registrars) must not be dropped by the linker.
-if(MSVC)
-    # Keep host allocations low so the guest ranges (0x40_0000_0000..0x80_0000_0000) are always free.
-    target_link_options(hades PRIVATE /STACK:67108864 /HIGHENTROPYVA:NO /MAP)
+
+if(ANDROID)
+    # NativeActivity app: libhades.so, entry android_main (android_native_app_glue).
+    set(GLUE "${ANDROID_NDK}/sources/android/native_app_glue")
+    add_library(hades SHARED ${NX_RUNTIME_SOURCES} runtime/src/platform_android.cpp "${GLUE}/android_native_app_glue.c")
+    target_include_directories(hades PRIVATE runtime/include runtime/src "${NX_VULKAN_SDK}/Include" "${GLUE}")
+    target_link_libraries(hades PRIVATE game_main game_sdk android log aaudio)
+    # The glue's ANativeActivity_onCreate must be exported.
+    target_link_options(hades PRIVATE -u ANativeActivity_onCreate)
+else()
+    add_executable(hades ${NX_RUNTIME_SOURCES} runtime/src/platform_win.cpp)
+    target_include_directories(hades PRIVATE runtime/include runtime/src "${NX_VULKAN_SDK}/Include")
+    target_link_libraries(hades PRIVATE game_main game_sdk xinput xaudio2 ole32)
+    if(MSVC)
+        # Keep host allocations low so the guest ranges (0x40_0000_0000..0x70_0000_0000) are always free; a big
+        # main-thread stack (recompiled calls nest deeply); a link map for tools/symbolize.py.
+        target_link_options(hades PRIVATE /STACK:67108864 /HIGHENTROPYVA:NO /MAP)
+    endif()
 endif()

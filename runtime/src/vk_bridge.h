@@ -3,18 +3,21 @@
 #pragma once
 
 #define VK_NO_PROTOTYPES
+#define VK_USE_PLATFORM_VI_NN  // the game's surface (only the struct is used)
+#if defined(_WIN32)
 #define VK_USE_PLATFORM_WIN32_KHR
-#define VK_USE_PLATFORM_VI_NN
 #include <windows.h>
+#elif defined(__ANDROID__)
+#define VK_USE_PLATFORM_ANDROID_KHR
+#endif
 #include <vulkan/vulkan.h>
 
 #include <cstring>
+#include <string>
 
 #include <nx/runtime.h>
 
-namespace nx {
-extern HWND g_window;
-}
+#include "platform.h"
 
 namespace nx::vk {
 

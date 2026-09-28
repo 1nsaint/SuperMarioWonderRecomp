@@ -36,9 +36,8 @@ const std::unordered_set<std::string> kSpecial = {
 
 void load_loader() {
     if (host_gipa) return;
-    HMODULE m = LoadLibraryW(L"vulkan-1.dll");
-    if (!m) fatal("vulkan-1.dll not found");
-    host_gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(m, "vkGetInstanceProcAddr"));
+    host_gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(plat::vulkan_get_instance_proc_addr());
+    if (!host_gipa) fatal("no Vulkan loader");
     host_create_instance = reinterpret_cast<PFN_vkCreateInstance>(host_gipa(nullptr, "vkCreateInstance"));
     host_enum_inst_ext = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
         host_gipa(nullptr, "vkEnumerateInstanceExtensionProperties"));
@@ -130,7 +129,7 @@ void w_vkCreateInstance(CPU& c) {  // (const VkInstanceCreateInfo*, alloc, VkIns
         if (std::none_of(exts.begin(), exts.end(), [&](const char* x) { return std::strcmp(x, e) == 0; })) exts.push_back(e);
     };
     add(VK_KHR_SURFACE_EXTENSION_NAME);
-    add(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+    add(plat::vulkan_surface_extension());
     std::vector<const char*> layers;
     if (const char* v = std::getenv("NX_VK_VALIDATION"); v && *v == '1') layers.push_back("VK_LAYER_KHRONOS_validation");
     ci.enabledExtensionCount = uint32_t(exts.size());
@@ -253,13 +252,11 @@ void w_vkCreateDevice(CPU& c) {  // (physical, const VkDeviceCreateInfo*, alloc,
 
 void w_vkCreateViSurfaceNN(CPU& c) {  // (instance, const VkViSurfaceCreateInfoNN*, alloc, VkSurfaceKHR*)
     auto* vi = reinterpret_cast<const VkViSurfaceCreateInfoNN*>(c.x[1]);
-    VkWin32SurfaceCreateInfoKHR ci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
-    ci.hinstance = GetModuleHandleW(nullptr);
-    ci.hwnd = reinterpret_cast<HWND>(vi->window);
-    VkSurfaceKHR s = VK_NULL_HANDLE;
-    VkResult r = p_vkCreateWin32SurfaceKHR(arg<VkInstance>(c.x[0]), &ci, nullptr, &s);
-    log("vkCreateViSurfaceNN -> win32 surface on %p: %d", vi->window, r);
-    if (r == VK_SUCCESS) st<uint64_t>(c.x[3], reinterpret_cast<uint64_t>(s));
+    uint64_t s = 0;
+    auto r = VkResult(plat::vulkan_create_surface(arg<VkInstance>(c.x[0]), vi->window, &s,
+                                                  reinterpret_cast<void*>(host_gipa)));
+    log("vkCreateViSurfaceNN -> %s surface on %p: %d", plat::vulkan_surface_extension(), vi->window, r);
+    if (r == VK_SUCCESS) st<uint64_t>(c.x[3], s);
     c.x[0] = ret_u64(r);
 }
 
@@ -398,23 +395,21 @@ void capture(VkQueue queue, VkPresentInfoKHR& pi, uint64_t frame, VkSemaphore& o
 
     void* data = nullptr;
     p_vkMapMemory(dev, mem, 0, size, 0, &data);
-    CreateDirectoryA("private", nullptr);
-    CreateDirectoryA("private\\captures", nullptr);
-    char path[128];
-    snprintf(path, sizeof path, "private\\captures\\frame_%llu.bmp", (unsigned long long)frame);
-    if (FILE* f = std::fopen(path, "wb")) {
-        BITMAPFILEHEADER fh{};
-        BITMAPINFOHEADER ih{};
-        fh.bfType = 0x4D42;
-        fh.bfOffBits = sizeof fh + sizeof ih;
-        fh.bfSize = fh.bfOffBits + DWORD(size);
-        ih.biSize = sizeof ih;
-        ih.biWidth = LONG(w);
-        ih.biHeight = -LONG(h);  // top-down
-        ih.biPlanes = 1;
-        ih.biBitCount = 32;
-        std::fwrite(&fh, sizeof fh, 1, f);
-        std::fwrite(&ih, sizeof ih, 1, f);
+    std::string dir = plat::data_root() + "/captures";
+    plat::make_dirs(dir);
+    std::string path = dir + "/frame_" + std::to_string(frame) + ".bmp";
+    if (FILE* f = plat::fopen_utf8(path, "wb")) {
+        // BITMAPFILEHEADER (14 bytes) + BITMAPINFOHEADER (40 bytes), little endian, top-down 32-bit.
+        uint8_t hdr[54] = {'B', 'M'};
+        auto put32 = [&](int at, uint32_t v) { std::memcpy(hdr + at, &v, 4); };
+        put32(2, uint32_t(54 + size));
+        put32(10, 54);
+        put32(14, 40);
+        put32(18, w);
+        put32(22, uint32_t(-int32_t(h)));
+        hdr[26] = 1;
+        hdr[28] = 32;
+        std::fwrite(hdr, 1, sizeof hdr, f);
         const uint8_t* px = static_cast<const uint8_t*>(data);
         bool rgba = s.format == VK_FORMAT_R8G8B8A8_UNORM || s.format == VK_FORMAT_R8G8B8A8_SRGB;
         std::vector<uint8_t> row(size_t(w) * 4);
@@ -425,7 +420,7 @@ void capture(VkQueue queue, VkPresentInfoKHR& pi, uint64_t frame, VkSemaphore& o
             std::fwrite(row.data(), 1, row.size(), f);
         }
         std::fclose(f);
-        log("screenshot: %s (%ux%u, format %d)", path, w, h, s.format);
+        log("screenshot: %s (%ux%u, format %d)", path.c_str(), w, h, s.format);
     }
     p_vkUnmapMemory(dev, mem);
     p_vkDestroyCommandPool(dev, pool, nullptr);
@@ -436,7 +431,7 @@ void capture(VkQueue queue, VkPresentInfoKHR& pi, uint64_t frame, VkSemaphore& o
 // A minimized window has no surface to draw to; the Switch never loses its screen, so the game does not handle
 // VK_ERROR_OUT_OF_DATE_KHR. Hold the render thread while minimized (the game pauses, like a console asleep).
 void wait_while_minimized() {
-    while (nx::g_window && IsIconic(nx::g_window)) Sleep(50);
+    while (plat::window_minimized()) plat::sleep_ns(50'000'000);
 }
 
 void w_vkAcquireNextImageKHR(CPU& c) {  // (device, swapchain, timeout, semaphore, fence, uint32_t* index)

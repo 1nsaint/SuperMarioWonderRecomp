@@ -1,37 +1,21 @@
-// nn::hid at the API level: Npad state from an XInput controller or the keyboard. Vibration is accepted and dropped.
+// nn::hid at the API level: player 1's Npad state comes from the platform (XInput + keyboard on Windows, game
+// controllers + touch on Android). Vibration is accepted and dropped.
+#include <cstring>
 #include <string>
 #include <vector>
 
-#include <windows.h>
-#include <xinput.h>
-
 #include <nx/runtime.h>
+
+#include "platform.h"
 
 namespace nx {
 
-extern HWND g_window;
-
 namespace {
 
-// NpadButton bits.
-enum : uint64_t {
-    kA = 1ull << 0, kB = 1ull << 1, kX = 1ull << 2, kY = 1ull << 3, kStickL = 1ull << 4, kStickR = 1ull << 5,
-    kL = 1ull << 6, kR = 1ull << 7, kZL = 1ull << 8, kZR = 1ull << 9, kPlus = 1ull << 10, kMinus = 1ull << 11,
-    kLeft = 1ull << 12, kUp = 1ull << 13, kRight = 1ull << 14, kDown = 1ull << 15,
-    kStickLLeft = 1ull << 16, kStickLUp = 1ull << 17, kStickLRight = 1ull << 18, kStickLDown = 1ull << 19,
-    kStickRLeft = 1ull << 20, kStickRUp = 1ull << 21, kStickRRight = 1ull << 22, kStickRDown = 1ull << 23,
-};
+using namespace plat;
+
 constexpr uint32_t kStyleFullKey = 1u << 0;
-constexpr int32_t kStickMax = 0x7FFF;
-
 uint64_t g_sampling = 0;
-
-bool key(int vk) { return g_window && GetForegroundWindow() == g_window && (GetAsyncKeyState(vk) & 0x8000); }
-
-struct Pad {
-    uint64_t buttons = 0;
-    int32_t lx = 0, ly = 0, rx = 0, ry = 0;
-};
 
 // Scripted input for automated runs: NX_INPUT="3300:A,3900:A,4200:Down" holds the button for 8 frames from the
 // given presented frame.
@@ -63,52 +47,12 @@ std::vector<Scripted> input_script() {
     return v;
 }
 
-Pad read_pad() {
-    Pad p;
+PadState read() {
+    PadState p;
     static const std::vector<Scripted> script = input_script();
     for (const auto& s : script)
         if (g_frame >= s.frame && g_frame < s.frame + 8) p.buttons |= s.buttons;
-    XINPUT_STATE xs{};
-    if (XInputGetState(0, &xs) == ERROR_SUCCESS) {
-        const auto& g = xs.Gamepad;
-        // Nintendo layout: A is the right face button, B the bottom one.
-        if (g.wButtons & XINPUT_GAMEPAD_B) p.buttons |= kA;
-        if (g.wButtons & XINPUT_GAMEPAD_A) p.buttons |= kB;
-        if (g.wButtons & XINPUT_GAMEPAD_Y) p.buttons |= kX;
-        if (g.wButtons & XINPUT_GAMEPAD_X) p.buttons |= kY;
-        if (g.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) p.buttons |= kL;
-        if (g.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) p.buttons |= kR;
-        if (g.bLeftTrigger > 100) p.buttons |= kZL;
-        if (g.bRightTrigger > 100) p.buttons |= kZR;
-        if (g.wButtons & XINPUT_GAMEPAD_START) p.buttons |= kPlus;
-        if (g.wButtons & XINPUT_GAMEPAD_BACK) p.buttons |= kMinus;
-        if (g.wButtons & XINPUT_GAMEPAD_LEFT_THUMB) p.buttons |= kStickL;
-        if (g.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB) p.buttons |= kStickR;
-        if (g.wButtons & XINPUT_GAMEPAD_DPAD_LEFT) p.buttons |= kLeft;
-        if (g.wButtons & XINPUT_GAMEPAD_DPAD_UP) p.buttons |= kUp;
-        if (g.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) p.buttons |= kRight;
-        if (g.wButtons & XINPUT_GAMEPAD_DPAD_DOWN) p.buttons |= kDown;
-        auto dz = [](int v) { return (v > -7849 && v < 7849) ? 0 : std::max(-kStickMax, std::min(kStickMax, v)); };
-        p.lx = dz(g.sThumbLX);
-        p.ly = dz(g.sThumbLY);
-        p.rx = dz(g.sThumbRX);
-        p.ry = dz(g.sThumbRY);
-    }
-    // Keyboard: WASD / arrows move, Space A, Shift B (dash), J X, K Y, Q/E L/R, Enter +, Esc -.
-    if (key('A') || key(VK_LEFT)) p.lx = -kStickMax;
-    if (key('D') || key(VK_RIGHT)) p.lx = kStickMax;
-    if (key('W') || key(VK_UP)) p.ly = kStickMax;
-    if (key('S') || key(VK_DOWN)) p.ly = -kStickMax;
-    if (key(VK_SPACE)) p.buttons |= kA;
-    if (key(VK_SHIFT)) p.buttons |= kB;
-    if (key('J')) p.buttons |= kX;
-    if (key('K')) p.buttons |= kY;
-    if (key('Q')) p.buttons |= kL;
-    if (key('E')) p.buttons |= kR;
-    if (key('Z')) p.buttons |= kZL;
-    if (key('C')) p.buttons |= kZR;
-    if (key(VK_RETURN)) p.buttons |= kPlus;
-    if (key(VK_ESCAPE)) p.buttons |= kMinus;
+    read_pad(p);
     // Stick directions as buttons, like the hid sysmodule reports them.
     constexpr int32_t t = kStickMax / 2;
     if (p.lx < -t) p.buttons |= kStickLLeft;
@@ -130,7 +74,7 @@ void GetNpadState(CPU& c) {
     std::memset(reinterpret_cast<void*>(out), 0, 0x28);
     st<int64_t>(out, int64_t(++g_sampling));
     if (id != 0) return;  // only player 1 is connected
-    Pad p = read_pad();
+    PadState p = read();
     st<uint64_t>(out + 8, p.buttons);
     st<int32_t>(out + 16, p.lx);
     st<int32_t>(out + 20, p.ly);

@@ -4,8 +4,6 @@
 #include <memory>
 #include <string>
 
-#include <windows.h>
-
 #include <nx/runtime.h>
 
 namespace nx {
@@ -24,7 +22,6 @@ struct KThread : KObject {
     uint64_t tls = 0;
     uint64_t entry = 0;
     int prio = 44, core = 0;
-    HANDLE host = nullptr;
     bool started = false, exited = false, cancel = false;
     // wait state (under the kernel lock)
     bool wake = false;

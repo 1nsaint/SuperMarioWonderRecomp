@@ -8,9 +8,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include <windows.h>
-
 #include <nx/runtime.h>
+
+#include "platform.h"
 
 namespace nx {
 
@@ -52,9 +52,9 @@ void log(const char* fmt, ...) {
     std::lock_guard lk(g_log_lock);
     if (!g_log_file) {
         const char* path = std::getenv("NX_LOG");
-        g_log_file = std::fopen(path ? path : "nx.log", "w");
+        g_log_file = std::fopen(path ? path : (plat::data_root() + "/../nx.log").c_str(), "w");
     }
-    std::fprintf(stderr, "%s\n", buf);
+    plat::log_line(buf);
     if (g_log_file) {
         std::fprintf(g_log_file, "%s\n", buf);
         std::fflush(g_log_file);
@@ -68,8 +68,7 @@ void fatal(const char* fmt, ...) {
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     log("FATAL: %s", buf);
-    std::fflush(stderr);
-    ExitProcess(1);
+    plat::exit_process(1);
 }
 
 // ---- HLE registry ---------------------------------------------------------------------------------------------
