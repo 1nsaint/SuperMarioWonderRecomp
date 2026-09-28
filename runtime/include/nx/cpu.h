@@ -80,33 +80,41 @@ struct JmpState {
     }
 };
 
+// Helpers the generated code calls millions of times: always inlined (the compiler then drops flag bits nobody
+// reads; left to itself it kept adds32/adds64 as calls in the huge generated functions).
+#if defined(_MSC_VER)
+#define NX_INLINE __forceinline
+#else
+#define NX_INLINE inline __attribute__((always_inline))
+#endif
+
 // ---- memory -------------------------------------------------------------------------------------------------
 
 template <typename T>
-inline T ld(uint64_t a) {
+NX_INLINE T ld(uint64_t a) {
     T v;
     std::memcpy(&v, reinterpret_cast<const void*>(a), sizeof(T));
     return v;
 }
 
 template <typename T>
-inline void st(uint64_t a, T v) {
+NX_INLINE void st(uint64_t a, T v) {
     std::memcpy(reinterpret_cast<void*>(a), &v, sizeof(T));
 }
 
 template <typename T>
-inline T ld_acq(uint64_t a) {
+NX_INLINE T ld_acq(uint64_t a) {
     return __atomic_load_n(reinterpret_cast<T*>(a), __ATOMIC_ACQUIRE);
 }
 
 template <typename T>
-inline void st_rel(uint64_t a, T v) {
+NX_INLINE void st_rel(uint64_t a, T v) {
     __atomic_store_n(reinterpret_cast<T*>(a), v, __ATOMIC_RELEASE);
 }
 
 // Exclusive monitor: LDXR remembers (address, value); STXR succeeds if memory still holds that value.
 template <typename T>
-inline T ldxr(CPU& c, uint64_t a) {
+NX_INLINE T ldxr(CPU& c, uint64_t a) {
     T v = __atomic_load_n(reinterpret_cast<T*>(a), __ATOMIC_ACQUIRE);
     c.excl_addr = a;
     c.excl_val = v;
@@ -114,7 +122,7 @@ inline T ldxr(CPU& c, uint64_t a) {
 }
 
 template <typename T>
-inline uint32_t stxr(CPU& c, uint64_t a, T v) {
+NX_INLINE uint32_t stxr(CPU& c, uint64_t a, T v) {
     if (c.excl_addr != a) return 1;
     c.excl_addr = ~0ull;
     T expected = static_cast<T>(c.excl_val);
@@ -124,13 +132,13 @@ inline uint32_t stxr(CPU& c, uint64_t a, T v) {
                : 1;
 }
 
-inline void clrex(CPU& c) { c.excl_addr = ~0ull; }
+NX_INLINE void clrex(CPU& c) { c.excl_addr = ~0ull; }
 
-inline void barrier() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+NX_INLINE void barrier() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 
 // ---- flags --------------------------------------------------------------------------------------------------
 
-inline uint64_t adds64(CPU& c, uint64_t a, uint64_t b, uint64_t carry) {
+NX_INLINE uint64_t adds64(CPU& c, uint64_t a, uint64_t b, uint64_t carry) {
     uint64_t r = a + b + carry;
     c.nf = r >> 63;
     c.zf = r == 0;
@@ -139,7 +147,7 @@ inline uint64_t adds64(CPU& c, uint64_t a, uint64_t b, uint64_t carry) {
     return r;
 }
 
-inline uint32_t adds32(CPU& c, uint32_t a, uint32_t b, uint32_t carry) {
+NX_INLINE uint32_t adds32(CPU& c, uint32_t a, uint32_t b, uint32_t carry) {
     uint64_t wide = uint64_t(a) + b + carry;
     uint32_t r = uint32_t(wide);
     c.nf = r >> 31;
@@ -149,36 +157,36 @@ inline uint32_t adds32(CPU& c, uint32_t a, uint32_t b, uint32_t carry) {
     return r;
 }
 
-inline uint64_t subs64(CPU& c, uint64_t a, uint64_t b) { return adds64(c, a, ~b, 1); }
-inline uint32_t subs32(CPU& c, uint32_t a, uint32_t b) { return adds32(c, a, ~b, 1); }
+NX_INLINE uint64_t subs64(CPU& c, uint64_t a, uint64_t b) { return adds64(c, a, ~b, 1); }
+NX_INLINE uint32_t subs32(CPU& c, uint32_t a, uint32_t b) { return adds32(c, a, ~b, 1); }
 
-inline void logic64(CPU& c, uint64_t r) {
+NX_INLINE void logic64(CPU& c, uint64_t r) {
     c.nf = r >> 63;
     c.zf = r == 0;
     c.cf = 0;
     c.vf = 0;
 }
 
-inline void logic32(CPU& c, uint32_t r) {
+NX_INLINE void logic32(CPU& c, uint32_t r) {
     c.nf = r >> 31;
     c.zf = r == 0;
     c.cf = 0;
     c.vf = 0;
 }
 
-inline void set_nzcv(CPU& c, uint32_t nzcv) {
+NX_INLINE void set_nzcv(CPU& c, uint32_t nzcv) {
     c.nf = (nzcv >> 3) & 1;
     c.zf = (nzcv >> 2) & 1;
     c.cf = (nzcv >> 1) & 1;
     c.vf = nzcv & 1;
 }
 
-inline uint64_t get_nzcv(const CPU& c) {
+NX_INLINE uint64_t get_nzcv(const CPU& c) {
     return (uint64_t(c.nf) << 31) | (uint64_t(c.zf) << 30) | (uint64_t(c.cf) << 29) | (uint64_t(c.vf) << 28);
 }
 
 template <typename F>
-inline void fcmp(CPU& c, F a, F b) {
+NX_INLINE void fcmp(CPU& c, F a, F b) {
     if (std::isnan(a) || std::isnan(b))
         set_nzcv(c, 0b0011);
     else if (a == b)

@@ -23,7 +23,8 @@ foreach(mod main sdk)
     add_library(game_${mod} STATIC ${src})
     target_include_directories(game_${mod} PRIVATE runtime/include "${NX_GEN_DIR}/${mod}")
     if(ANDROID)
-        target_compile_options(game_${mod} PRIVATE -O2 -fPIC)
+        # Hidden visibility: calls between recompiled functions are direct, not through the PLT.
+        target_compile_options(game_${mod} PRIVATE -O2 -fPIC -fvisibility=hidden -fno-semantic-interposition)
     endif()
 endforeach()
 
@@ -65,6 +66,7 @@ if(ANDROID)
     set_source_files_properties("${GLUE}/android_native_app_glue.c" PROPERTIES
         COMPILE_DEFINITIONS "ANativeActivity_onCreate=glue_ANativeActivity_onCreate")
     target_link_libraries(hades PRIVATE game_main game_sdk android log aaudio)
+    target_compile_options(hades PRIVATE -fvisibility=hidden -fno-semantic-interposition)
     # The glue's ANativeActivity_onCreate must be exported.
     target_link_options(hades PRIVATE -u ANativeActivity_onCreate)
 else()

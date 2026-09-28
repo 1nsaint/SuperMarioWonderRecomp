@@ -141,12 +141,22 @@ std::string describe(uint64_t addr) {
     return buf;
 }
 
+// Indirect calls (every blr of the game) look the target up here: the modules' text ranges in a small flat array.
+struct FastModule {
+    uint64_t base, text_size;
+    const Fn* table;
+};
+FastModule g_fast[4];
+size_t g_fast_count = 0;
+
 void call(CPU& c, uint64_t t) {
-    for (auto& m : g_modules) {
+    for (size_t k = 0; k < g_fast_count; k++) {
+        const FastModule& m = g_fast[k];
         uint64_t off = t - m.base;
-        if (off < m.info->text_size) {
+        if (off < m.text_size) [[likely]] {
             Fn fn = m.table[off >> 2];
-            if (!fn) fatal("call into the middle of a function: %s (lr %s)", describe(t).c_str(), describe(c.x[30]).c_str());
+            if (!fn) [[unlikely]]
+                fatal("call into the middle of a function: %s (lr %s)", describe(t).c_str(), describe(c.x[30]).c_str());
             fn(c);
             return;
         }
@@ -204,6 +214,7 @@ void load_modules(const ModuleInfo* const* mods, size_t count, const std::string
         LoadedModule lm{mi, mi->base, size, new Fn[mi->text_size / 4]()};
         for (size_t k = 0; k < mi->func_count; k++) lm.table[mi->funcs[k].offset / 4] = mi->funcs[k].fn;
         g_modules.push_back(lm);
+        if (g_fast_count < 4) g_fast[g_fast_count++] = {lm.base, mi->text_size, lm.table};
 
         for (size_t k = 0; k < mi->symbol_count; k++) {
             const Symbol& s = mi->symbols[k];
