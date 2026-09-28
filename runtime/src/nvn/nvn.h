@@ -27,6 +27,9 @@ uint64_t real_proc(CPU& c, const char* name);
 // Calls guest function `fn` with integer arguments, returns x0. Registers are restored afterwards.
 uint64_t guest_call(CPU& c, uint64_t fn, std::initializer_list<uint64_t> args);
 
+// Guest memory for out-parameters of driver calls: up to 0x1000 bytes private to the calling thread.
+uint64_t scratch(CPU& c, size_t size);
+
 // Calls the SDK driver's `name` (a getter of a builder or state object).
 inline uint64_t driver(CPU& c, const char* name, std::initializer_list<uint64_t> args) {
     return guest_call(c, real_proc(c, name), args);
@@ -98,22 +101,63 @@ VkFormat vk_format(uint32_t format);
 uint32_t format_aspect(uint32_t format);
 
 // ---- recorded commands ----------------------------------------------------------------------------------------
-// A command buffer records into a list of these; nvnQueueSubmitCommands replays the lists into Vulkan.
+// A command buffer records into a list of these; nvnQueueSubmitCommands replays the lists into Vulkan. State
+// objects (blend, depth/stencil, vertex layouts, ...) are decoded when recorded, through the SDK driver's getters,
+// and kept in the list's blobs: the game may reuse its structs right after the call.
 
 struct Cmd {
-    enum Op : uint8_t { SetRenderTargets, ClearColor, ClearDepthStencil, SetViewport, SetScissor, CallList } op;
+    enum Op : uint8_t {
+        SetRenderTargets, ClearColor, ClearDepthStencil, SetViewport, SetScissor, CallList,
+        SetDepthRange, BindProgram, BindUniformBuffer, BindStorageBuffer, BindTexture, BindVertexBuffer,
+        BindVertexAttribs, BindVertexStreams, BindBlendState, BindColorState, BindChannelMaskState,
+        BindDepthStencilState, BindPolygonState, SetBlendColor, UpdateUniformBuffer, SetTexturePool, SetSamplerPool,
+        DrawArrays, DrawElements,
+    } op;
     uint32_t n = 0, mask = 0;
-    uint64_t a[9] = {};  // textures (render targets: colors then depth), command handles, ...
+    uint64_t a[9] = {};  // textures (render targets: colors then depth), handles, GPU addresses, sizes, ...
     float f[4] = {};
     int32_t i[4] = {};
+    uint32_t blob = 0;  // index into CmdList::blobs (decoded state, inline data)
 };
-using CmdList = std::vector<Cmd>;
+
+struct CmdList {
+    std::vector<Cmd> cmds;
+    std::vector<std::vector<uint8_t>> blobs;
+};
+
+// Decoded state objects (values are NVN enums, see nvn_state.cpp).
+struct VertexAttrib {
+    uint32_t format = 0, offset = 0, stream = 0;
+};
+struct VertexStream {
+    uint32_t stride = 0, divisor = 0;
+};
+struct BlendTarget {
+    uint32_t target = 0, src_rgb = 0, dst_rgb = 0, src_a = 0, dst_a = 0, eq_rgb = 0, eq_a = 0;
+};
+struct ColorStateInfo {
+    uint8_t blend_enable[8] = {};
+    uint32_t alpha_test = 0, logic_op = 0;
+};
+struct ChannelMaskInfo {
+    uint8_t mask[8] = {};  // bit 0 r, 1 g, 2 b, 3 a
+};
+struct DepthStencilInfo {
+    uint8_t depth_test = 0, depth_write = 0, stencil_test = 0;
+    uint32_t depth_func = 0;
+    uint32_t stencil_func[2] = {}, stencil_fail[2] = {}, depth_fail[2] = {}, depth_pass[2] = {};
+};
+struct PolygonInfo {
+    uint32_t cull = 0, front = 0, mode = 0, offset_enables = 0;
+};
 
 std::shared_ptr<CmdList> command_list(uint64_t handle);  // a recorded handle's commands (nvn_cmd.cpp)
+// Appends to the command buffer (guest NVNcommandBuffer*) being recorded; `blob` is copied into the list.
+void record(uint64_t cmdbuf, Cmd cmd, const void* blob = nullptr, size_t size = 0);
 
 // ---- the GPU (nvn_vk.cpp) -------------------------------------------------------------------------------------
 
-void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists);
+void gpu_submit(CPU& c, const std::vector<std::shared_ptr<CmdList>>& lists);
 void gpu_present(uint64_t texture);  // guest NVNtexture* of a window texture
 
 // Bytes a texture built from `builder` occupies in its pool (nvn_texture_layout.cpp).

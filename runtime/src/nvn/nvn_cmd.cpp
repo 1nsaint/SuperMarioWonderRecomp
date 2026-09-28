@@ -28,12 +28,6 @@ std::deque<uint64_t> g_handle_order;  // oldest first: handles are dropped after
 constexpr size_t kKeepHandles = 1 << 16;
 std::atomic<uint64_t> g_next_handle{1};
 
-void record(uint64_t guest, const Cmd& cmd) {
-    auto* cb = get<CommandBuffer>(guest);
-    if (!cb) return;
-    std::lock_guard lk(cb->lock);
-    cb->recording->push_back(cmd);
-}
 
 void CommandBufferInitialize(CPU& c) {  // NVNboolean (NVNcommandBuffer*, NVNdevice*)
     make<CommandBuffer>(c.x[0]);
@@ -115,6 +109,18 @@ void CallCommands(CPU& c) {
 }
 
 }  // namespace
+
+void record(uint64_t guest, Cmd cmd, const void* blob, size_t size) {
+    auto* cb = get<CommandBuffer>(guest);
+    if (!cb) return;
+    std::lock_guard lk(cb->lock);
+    if (blob) {
+        cmd.blob = uint32_t(cb->recording->blobs.size());
+        auto* p = static_cast<const uint8_t*>(blob);
+        cb->recording->blobs.emplace_back(p, p + size);
+    }
+    cb->recording->cmds.push_back(cmd);
+}
 
 std::shared_ptr<CmdList> command_list(uint64_t handle) {
     std::lock_guard lk(g_handles_lock);

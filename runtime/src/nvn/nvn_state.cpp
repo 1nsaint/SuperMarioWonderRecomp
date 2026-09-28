@@ -1,0 +1,245 @@
+// NVN command buffers (docs/NVN.md, N6): binds, state objects and draws, recorded for nvn_draw.cpp to replay.
+//
+// State objects are plain structs of the SDK driver; they are decoded here, while recording, through its getters
+// (the game reuses its structs right after binding them). Signatures from the game's call sites (nvn_trace.txt):
+//   BindProgram(cmd, program, stageBits)            BindUniformBuffer(cmd, stage, index, address, size)
+//   BindStorageBuffer(cmd, stage, index, address, size)   BindTexture(cmd, stage, index, handle)
+//   BindVertexBuffer(cmd, index, address, size)     BindVertexAttribState(cmd, count, const state*)  (4 bytes each)
+//   BindVertexStreamState(cmd, count, const state*) (8 bytes each)   Bind{Blend,Color,...}State(cmd, const state*)
+//   UpdateUniformBuffer(cmd, address, size, offset, dataSize, const void* data)
+//   DrawArrays(cmd, mode, first, count)             DrawElements(cmd, mode, indexType, count, indexAddress)
+//   DrawElementsBaseVertex(..., baseVertex)         DrawElementsInstanced(..., baseVertex, baseInstance, instances)
+//   DrawArraysInstanced(cmd, mode, first, count, baseInstance, instances)
+// Shader stages are numbered 0 vertex, 1 fragment (the pairs the game binds), 5 compute.
+#include <cstring>
+#include <vector>
+
+#include "nvn.h"
+
+namespace nx::nvn {
+
+namespace {
+
+// ---- shaders and resources --------------------------------------------------------------------------------------
+
+void BindProgram(CPU& c) {
+    Cmd cmd{Cmd::BindProgram};
+    cmd.a[0] = c.x[1];
+    cmd.mask = uint32_t(c.x[2]);
+    record(c.x[0], cmd);
+}
+
+void BindUniformBuffer(CPU& c) {
+    Cmd cmd{Cmd::BindUniformBuffer};
+    cmd.i[0] = int32_t(c.x[1]), cmd.i[1] = int32_t(c.x[2]);
+    cmd.a[0] = c.x[3], cmd.a[1] = c.x[4];
+    record(c.x[0], cmd);
+}
+
+void BindStorageBuffer(CPU& c) {
+    Cmd cmd{Cmd::BindStorageBuffer};
+    cmd.i[0] = int32_t(c.x[1]), cmd.i[1] = int32_t(c.x[2]);
+    cmd.a[0] = c.x[3], cmd.a[1] = c.x[4];
+    record(c.x[0], cmd);
+}
+
+void BindTexture(CPU& c) {
+    Cmd cmd{Cmd::BindTexture};
+    cmd.i[0] = int32_t(c.x[1]), cmd.i[1] = int32_t(c.x[2]);
+    cmd.a[0] = c.x[3];
+    record(c.x[0], cmd);
+}
+
+void BindVertexBuffer(CPU& c) {
+    Cmd cmd{Cmd::BindVertexBuffer};
+    cmd.i[0] = int32_t(c.x[1]);
+    cmd.a[0] = c.x[2], cmd.a[1] = c.x[3];
+    record(c.x[0], cmd);
+}
+
+void SetTexturePool(CPU& c) {
+    Cmd cmd{Cmd::SetTexturePool};
+    cmd.a[0] = c.x[1];
+    record(c.x[0], cmd);
+}
+
+void SetSamplerPool(CPU& c) {
+    Cmd cmd{Cmd::SetSamplerPool};
+    cmd.a[0] = c.x[1];
+    record(c.x[0], cmd);
+}
+
+void UpdateUniformBuffer(CPU& c) {  // the data is copied now: the game's buffer is on its stack
+    Cmd cmd{Cmd::UpdateUniformBuffer};
+    cmd.a[0] = c.x[1], cmd.a[1] = c.x[2], cmd.a[2] = c.x[3];
+    size_t n = size_t(c.x[4]);
+    record(c.x[0], cmd, reinterpret_cast<const void*>(c.x[5]), n);
+}
+
+// ---- state objects ------------------------------------------------------------------------------------------------
+
+void BindVertexAttribState(CPU& c) {
+    uint32_t n = std::min<uint32_t>(uint32_t(c.x[1]), 32);
+    std::vector<VertexAttrib> v(n);
+    uint64_t tmp = scratch(c, 16);
+    for (uint32_t k = 0; k < n; k++) {
+        uint64_t state = c.x[2] + 4 * k;
+        driver(c, "nvnVertexAttribStateGetFormat", {state, tmp, tmp + 8});
+        v[k].format = ld<uint32_t>(tmp);
+        v[k].offset = uint32_t(ld<uint64_t>(tmp + 8));
+        v[k].stream = uint32_t(driver(c, "nvnVertexAttribStateGetStreamIndex", {state}));
+    }
+    Cmd cmd{Cmd::BindVertexAttribs};
+    cmd.n = n;
+    record(c.x[0], cmd, v.data(), v.size() * sizeof(VertexAttrib));
+}
+
+void BindVertexStreamState(CPU& c) {
+    uint32_t n = std::min<uint32_t>(uint32_t(c.x[1]), 32);
+    std::vector<VertexStream> v(n);
+    for (uint32_t k = 0; k < n; k++) {
+        uint64_t state = c.x[2] + 8 * k;
+        v[k].stride = uint32_t(driver(c, "nvnVertexStreamStateGetStride", {state}));
+        v[k].divisor = uint32_t(driver(c, "nvnVertexStreamStateGetDivisor", {state}));
+    }
+    Cmd cmd{Cmd::BindVertexStreams};
+    cmd.n = n;
+    record(c.x[0], cmd, v.data(), v.size() * sizeof(VertexStream));
+}
+
+void BindBlendState(CPU& c) {
+    uint64_t state = c.x[1], tmp = scratch(c, 16);
+    BlendTarget b;
+    b.target = uint32_t(driver(c, "nvnBlendStateGetBlendTarget", {state}));
+    driver(c, "nvnBlendStateGetBlendFunc", {state, tmp, tmp + 4, tmp + 8, tmp + 12});
+    b.src_rgb = ld<uint32_t>(tmp), b.dst_rgb = ld<uint32_t>(tmp + 4);
+    b.src_a = ld<uint32_t>(tmp + 8), b.dst_a = ld<uint32_t>(tmp + 12);
+    driver(c, "nvnBlendStateGetBlendEquation", {state, tmp, tmp + 4});
+    b.eq_rgb = ld<uint32_t>(tmp), b.eq_a = ld<uint32_t>(tmp + 4);
+    Cmd cmd{Cmd::BindBlendState};
+    record(c.x[0], cmd, &b, sizeof b);
+}
+
+void BindColorState(CPU& c) {
+    uint64_t state = c.x[1];
+    ColorStateInfo s;
+    for (uint32_t k = 0; k < 8; k++) s.blend_enable[k] = uint8_t(driver(c, "nvnColorStateGetBlendEnable", {state, k}) & 1);
+    s.alpha_test = uint32_t(driver(c, "nvnColorStateGetAlphaTest", {state}));
+    s.logic_op = uint32_t(driver(c, "nvnColorStateGetLogicOp", {state}));
+    Cmd cmd{Cmd::BindColorState};
+    record(c.x[0], cmd, &s, sizeof s);
+}
+
+void BindChannelMaskState(CPU& c) {
+    uint64_t state = c.x[1], tmp = scratch(c, 16);
+    ChannelMaskInfo s;
+    for (uint32_t k = 0; k < 8; k++) {
+        driver(c, "nvnChannelMaskStateGetChannelMask", {state, k, tmp, tmp + 1, tmp + 2, tmp + 3});
+        s.mask[k] = uint8_t((ld<uint8_t>(tmp) & 1) | (ld<uint8_t>(tmp + 1) & 1) << 1 | (ld<uint8_t>(tmp + 2) & 1) << 2 |
+                            (ld<uint8_t>(tmp + 3) & 1) << 3);
+    }
+    Cmd cmd{Cmd::BindChannelMaskState};
+    record(c.x[0], cmd, &s, sizeof s);
+}
+
+void BindDepthStencilState(CPU& c) {
+    uint64_t state = c.x[1], tmp = scratch(c, 16);
+    DepthStencilInfo s;
+    s.depth_test = uint8_t(driver(c, "nvnDepthStencilStateGetDepthTestEnable", {state}) & 1);
+    s.depth_write = uint8_t(driver(c, "nvnDepthStencilStateGetDepthWriteEnable", {state}) & 1);
+    s.depth_func = uint32_t(driver(c, "nvnDepthStencilStateGetDepthFunc", {state}));
+    s.stencil_test = uint8_t(driver(c, "nvnDepthStencilStateGetStencilTestEnable", {state}) & 1);
+    for (uint32_t face = 0; face < 2; face++) {  // NVNface: 1 front, 2 back
+        s.stencil_func[face] = uint32_t(driver(c, "nvnDepthStencilStateGetStencilFunc", {state, face + 1}));
+        driver(c, "nvnDepthStencilStateGetStencilOp", {state, face + 1, tmp, tmp + 4, tmp + 8});
+        s.stencil_fail[face] = ld<uint32_t>(tmp), s.depth_fail[face] = ld<uint32_t>(tmp + 4);
+        s.depth_pass[face] = ld<uint32_t>(tmp + 8);
+    }
+    Cmd cmd{Cmd::BindDepthStencilState};
+    record(c.x[0], cmd, &s, sizeof s);
+}
+
+void BindPolygonState(CPU& c) {
+    uint64_t state = c.x[1];
+    PolygonInfo s;
+    s.cull = uint32_t(driver(c, "nvnPolygonStateGetCullFace", {state}));
+    s.front = uint32_t(driver(c, "nvnPolygonStateGetFrontFace", {state}));
+    s.mode = uint32_t(driver(c, "nvnPolygonStateGetPolygonMode", {state}));
+    s.offset_enables = uint32_t(driver(c, "nvnPolygonStateGetPolygonOffsetEnables", {state}));
+    Cmd cmd{Cmd::BindPolygonState};
+    record(c.x[0], cmd, &s, sizeof s);
+}
+
+void SetBlendColor(CPU& c) {
+    Cmd cmd{Cmd::SetBlendColor};
+    if (c.x[1]) std::memcpy(cmd.f, reinterpret_cast<const void*>(c.x[1]), 16);
+    record(c.x[0], cmd);
+}
+
+void SetDepthRange(CPU& c) {  // (cmd, float near [s0], float far [s1])
+    Cmd cmd{Cmd::SetDepthRange};
+    cmd.f[0] = c.v[0].f32[0], cmd.f[1] = c.v[1].f32[0];
+    record(c.x[0], cmd);
+}
+
+// ---- draws --------------------------------------------------------------------------------------------------------
+
+void DrawArrays(CPU& c) {
+    Cmd cmd{Cmd::DrawArrays};
+    cmd.n = uint32_t(c.x[1]);                                    // mode
+    cmd.i[0] = int32_t(c.x[2]), cmd.i[1] = int32_t(c.x[3]);      // first, count
+    cmd.i[2] = 0, cmd.i[3] = 1;                                  // base instance, instances
+    record(c.x[0], cmd);
+}
+
+void DrawArraysInstanced(CPU& c) {
+    Cmd cmd{Cmd::DrawArrays};
+    cmd.n = uint32_t(c.x[1]);
+    cmd.i[0] = int32_t(c.x[2]), cmd.i[1] = int32_t(c.x[3]);
+    cmd.i[2] = int32_t(c.x[4]), cmd.i[3] = int32_t(c.x[5]);
+    record(c.x[0], cmd);
+}
+
+void draw_elements(CPU& c, int32_t base_vertex, int32_t base_instance, int32_t instances) {
+    Cmd cmd{Cmd::DrawElements};
+    cmd.n = uint32_t(c.x[1]);        // mode
+    cmd.mask = uint32_t(c.x[2]);     // index type: 0 u8, 1 u16, 2 u32
+    cmd.i[0] = int32_t(c.x[3]);      // count
+    cmd.a[0] = c.x[4];               // index buffer address
+    cmd.i[1] = base_vertex, cmd.i[2] = base_instance, cmd.i[3] = instances;
+    record(c.x[0], cmd);
+}
+
+void DrawElements(CPU& c) { draw_elements(c, 0, 0, 1); }
+void DrawElementsBaseVertex(CPU& c) { draw_elements(c, int32_t(c.x[5]), 0, 1); }
+void DrawElementsInstanced(CPU& c) { draw_elements(c, int32_t(c.x[5]), int32_t(c.x[6]), int32_t(c.x[7])); }
+
+void ignore(CPU&) {}
+
+}  // namespace
+
+NX_HLE("nvnCommandBufferBindProgram", BindProgram);
+NX_HLE("nvnCommandBufferBindUniformBuffer", BindUniformBuffer);
+NX_HLE("nvnCommandBufferBindStorageBuffer", BindStorageBuffer);
+NX_HLE("nvnCommandBufferBindTexture", BindTexture);
+NX_HLE("nvnCommandBufferBindVertexBuffer", BindVertexBuffer);
+NX_HLE("nvnCommandBufferSetTexturePool", SetTexturePool);
+NX_HLE("nvnCommandBufferSetSamplerPool", SetSamplerPool);
+NX_HLE("nvnCommandBufferUpdateUniformBuffer", UpdateUniformBuffer);
+NX_HLE("nvnCommandBufferBindVertexAttribState", BindVertexAttribState);
+NX_HLE("nvnCommandBufferBindVertexStreamState", BindVertexStreamState);
+NX_HLE("nvnCommandBufferBindBlendState", BindBlendState);
+NX_HLE("nvnCommandBufferBindColorState", BindColorState);
+NX_HLE("nvnCommandBufferBindChannelMaskState", BindChannelMaskState);
+NX_HLE("nvnCommandBufferBindDepthStencilState", BindDepthStencilState);
+NX_HLE("nvnCommandBufferBindPolygonState", BindPolygonState);
+NX_HLE("nvnCommandBufferSetBlendColor", SetBlendColor);
+NX_HLE("nvnCommandBufferSetDepthRange", SetDepthRange);
+NX_HLE("nvnCommandBufferDrawArrays", DrawArrays);
+NX_HLE("nvnCommandBufferDrawArraysInstanced", DrawArraysInstanced);
+NX_HLE("nvnCommandBufferDrawElements", DrawElements);
+NX_HLE("nvnCommandBufferDrawElementsBaseVertex", DrawElementsBaseVertex);
+NX_HLE("nvnCommandBufferDrawElementsInstanced", DrawElementsInstanced);
+NX_HLE("nvnCommandBufferBarrier", ignore);  // every replayed command is serialized for now
+
+}  // namespace nx::nvn

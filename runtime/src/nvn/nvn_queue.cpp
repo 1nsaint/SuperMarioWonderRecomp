@@ -41,7 +41,7 @@ void QueueSubmitCommands(CPU& c) {  // (NVNqueue*, int count, const NVNcommandHa
     std::vector<std::shared_ptr<CmdList>> lists;
     for (uint32_t k = 0; k < uint32_t(c.x[1]); k++)
         if (auto l = command_list(ld<uint64_t>(c.x[2] + 8 * k))) lists.push_back(std::move(l));
-    gpu_submit(lists);
+    gpu_submit(c, lists);
 }
 void QueueFlush(CPU&) {}
 void QueueFinish(CPU&) {}

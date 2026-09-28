@@ -289,7 +289,7 @@ struct Exec {
 };
 
 void replay(VkCommandBuffer cb, Exec& st, const CmdList& list, int depth) {
-    for (const Cmd& c : list) {
+    for (const Cmd& c : list.cmds) {
         switch (c.op) {
             case Cmd::SetRenderTargets:
                 st.color_count = c.n;
@@ -429,7 +429,7 @@ void readback_write(const GpuImage& img, uint64_t frame) {
 
 }  // namespace
 
-void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists) {
+void gpu_submit(CPU&, const std::vector<std::shared_ptr<CmdList>>& lists) {
     std::lock_guard lk(g_gpu);
     if (!init() || !begin()) return;
     Exec st;

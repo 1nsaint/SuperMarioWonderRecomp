@@ -130,6 +130,13 @@ uint64_t guest_call(CPU& c, uint64_t fn, std::initializer_list<uint64_t> args) {
     return r;
 }
 
+uint64_t scratch(CPU&, size_t size) {
+    thread_local uint64_t page = 0;
+    if (!page) page = kernel_alloc(0x1000);
+    if (size > 0x1000) fatal("nvn scratch: %zu bytes asked", size);
+    return page;
+}
+
 uint64_t real_proc(CPU& c, const char* name) {
     static std::mutex lock;
     static std::map<std::string, uint64_t> cache;
