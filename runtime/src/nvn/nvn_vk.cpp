@@ -10,9 +10,8 @@
 #include <string>
 #include <vector>
 
-#include "nvn.h"
+#include "nvn_vk.h"
 #include "platform.h"
-#include "vk_gen.h"
 
 #include <nx/game.h>
 
@@ -20,14 +19,6 @@ namespace nx::nvn {
 
 using namespace nx::vk;
 
-struct GpuImage {
-    VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    VkFormat format = VK_FORMAT_UNDEFINED;
-    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-    uint32_t width = 0, height = 0;
-    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
-};
 
 namespace {
 
@@ -49,6 +40,15 @@ std::vector<VkImage> g_sc_images;
 VkExtent2D g_sc_extent{};
 VkFormat g_sc_format = VK_FORMAT_B8G8R8A8_UNORM;
 VkSemaphore g_acquired = VK_NULL_HANDLE, g_rendered = VK_NULL_HANDLE;
+VkBool32 g_depth_clip_control = VK_FALSE;
+VkDescriptorPool g_descriptors = VK_NULL_HANDLE;
+
+// The per-submit upload buffer (nvn_vk.h): one host-visible buffer, bump-allocated, reset at every submit.
+VkBuffer g_upload = VK_NULL_HANDLE;
+VkDeviceMemory g_upload_memory = VK_NULL_HANDLE;
+uint8_t* g_upload_ptr = nullptr;
+uint64_t g_upload_size = 0, g_upload_used = 0;
+void make_upload_buffer(uint64_t size);
 
 // Commands the Hades bridge intercepts are not in the generated table: ours are loaded here.
 PFN_vkEnumerateInstanceExtensionProperties p_enum_instance_ext = nullptr;
@@ -141,7 +141,34 @@ bool init() {
     std::vector<VkExtensionProperties> dext(n);
     p_vkEnumerateDeviceExtensionProperties(g_physical, nullptr, &n, dext.data());
     std::vector<const char*> dexts = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
-    if (has_extension(dext, "VK_KHR_portability_subset")) dexts.push_back("VK_KHR_portability_subset");
+    // Features: everything core the GPU has, dynamic rendering (1.3), 8-bit indices (NVN has them), clip-space
+    // depth -1..1 (NVN's default depth mode, what Wonder uses), and on MoltenVK the portability subset's own
+    // features, which must be enabled to be used.
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceIndexTypeUint8FeaturesEXT fu8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT};
+    VkPhysicalDeviceDepthClipControlFeaturesEXT fclip{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
+    struct {  // VkPhysicalDevicePortabilitySubsetFeaturesKHR, without its header (beta extensions)
+        VkStructureType sType = VkStructureType(1000163000);
+        void* pNext = nullptr;
+        VkBool32 fields[15] = {};
+    } fport;
+    features.pNext = &f13;
+    void** tail = &f13.pNext;
+    if (has_extension(dext, "VK_EXT_index_type_uint8")) {
+        dexts.push_back("VK_EXT_index_type_uint8");
+        *tail = &fu8, tail = &fu8.pNext;
+    }
+    if (has_extension(dext, "VK_EXT_depth_clip_control")) {
+        dexts.push_back("VK_EXT_depth_clip_control");
+        *tail = &fclip, tail = &fclip.pNext;
+    }
+    if (has_extension(dext, "VK_KHR_portability_subset")) {
+        dexts.push_back("VK_KHR_portability_subset");
+        *tail = &fport, tail = &fport.pNext;
+    }
+    p_vkGetPhysicalDeviceFeatures2(g_physical, &features);
+    g_depth_clip_control = fclip.depthClipControl;
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = g_family;
@@ -152,6 +179,7 @@ bool init() {
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = uint32_t(dexts.size());
     dci.ppEnabledExtensionNames = dexts.data();
+    dci.pNext = &features;
     if (!check(p_create_device(g_physical, &dci, nullptr, &g_device), "vkCreateDevice")) return false;
     p_vkGetDeviceQueue(g_device, g_family, 0, &g_queue);
 
@@ -170,6 +198,15 @@ bool init() {
     p_vkCreateSemaphore(g_device, &sci, nullptr, &g_acquired);
     p_vkCreateSemaphore(g_device, &sci, nullptr, &g_rendered);
 
+    make_upload_buffer(64ull << 20);
+    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 65536}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16384},
+                                    {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 65536}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4096},
+                                    {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024}};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = 32768;
+    dpi.poolSizeCount = uint32_t(sizeof sizes / sizeof sizes[0]);
+    dpi.pPoolSizes = sizes;
+    p_vkCreateDescriptorPool(g_device, &dpi, nullptr, &g_descriptors);
     log("nvn/vk: %s, Vulkan %u.%u, queue family %u", props.deviceName, VK_API_VERSION_MAJOR(props.apiVersion),
         VK_API_VERSION_MINOR(props.apiVersion), g_family);
     g_failed = false;
@@ -216,13 +253,21 @@ bool make_swapchain() {
     return true;
 }
 
+}  // namespace
+
+VkDevice vk_device() { return g_device; }
+VkPhysicalDevice vk_physical() { return g_physical; }
+bool vk_depth_clip_control() { return g_depth_clip_control; }
+
 uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
     for (uint32_t k = 0; k < g_memory.memoryTypeCount; k++)
         if ((bits >> k) & 1 && (g_memory.memoryTypes[k].propertyFlags & want) == want) return k;
     return 0;
 }
 
-// The VkImage behind an NVN texture, made on first use (render target, clear, present).
+// The VkImage behind an NVN texture, made on first use. NVN texture targets (GL order): 0 1D, 1 2D, 2 3D, 3 1D array,
+// 4 2D array, 5 2D multisample, 6 2D multisample array, 7 rectangle, 8 cube map, 9 cube map array, 10 buffer.
+// Arrays and cube maps keep their layer count in the builder's depth.
 GpuImage* image_of(uint64_t guest) {
     Texture* t = get<Texture>(guest);
     if (!t) return nullptr;
@@ -236,21 +281,42 @@ GpuImage* image_of(uint64_t guest) {
                                 : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     img->width = std::max(1u, t->width);
     img->height = std::max(1u, t->height);
+    img->levels = std::max(1u, t->levels);
+    uint32_t depth = std::max(1u, t->depth);
+    bool is3d = t->target == 2, cube = t->target == 8 || t->target == 9;
+    bool array = t->target == 3 || t->target == 4 || t->target == 6 || t->target == 9;
+    img->layers = is3d ? 1 : (array || cube) ? depth : 1;
+    if (cube && img->layers < 6) img->layers = 6;
+    img->view_type = is3d                              ? VK_IMAGE_VIEW_TYPE_3D
+                     : t->target == 9                  ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
+                     : cube                            ? VK_IMAGE_VIEW_TYPE_CUBE
+                     : t->target == 0                  ? VK_IMAGE_VIEW_TYPE_1D
+                     : t->target == 3                  ? VK_IMAGE_VIEW_TYPE_1D_ARRAY
+                     : (t->target == 4 || t->target == 6) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                                                         : VK_IMAGE_VIEW_TYPE_2D;
     if (img->format == VK_FORMAT_UNDEFINED) {
         log("nvn/vk: texture %llx has format %#x with no Vulkan equivalent", (unsigned long long)guest, t->format);
         img->format = VK_FORMAT_R8G8B8A8_UNORM;
         img->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        aspect = 0;
+    }
+    bool compressed = false;
+    {
+        uint32_t bw = 1, bh = 1, bytes = 4;
+        format_block(t->format, bw, bh, bytes);
+        compressed = bw > 1 || bh > 1;
     }
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ci.imageType = VK_IMAGE_TYPE_2D;
+    ci.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+    ci.imageType = is3d ? VK_IMAGE_TYPE_3D : t->target == 0 || t->target == 3 ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
     ci.format = img->format;
-    ci.extent = {img->width, img->height, 1};
-    ci.mipLevels = 1;
-    ci.arrayLayers = 1;
+    ci.extent = {img->width, ci.imageType == VK_IMAGE_TYPE_1D ? 1 : img->height, is3d ? depth : 1};
+    ci.mipLevels = img->levels;
+    ci.arrayLayers = img->layers;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-               (aspect ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (!compressed) ci.usage |= aspect ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (!check(p_vkCreateImage(g_device, &ci, nullptr, &img->image), "vkCreateImage")) return nullptr;
     VkMemoryRequirements req{};
@@ -260,9 +326,18 @@ GpuImage* image_of(uint64_t guest) {
     ai.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (!check(p_vkAllocateMemory(g_device, &ai, nullptr, &img->memory), "vkAllocateMemory")) return nullptr;
     p_vkBindImageMemory(g_device, img->image, img->memory, 0);
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = img->image;
+    vi.viewType = img->view_type;
+    vi.format = img->format;
+    // A sampled depth/stencil view reads depth.
+    vi.subresourceRange = {aspect == 3 ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT) : img->aspect, 0, img->levels, 0,
+                           img->layers};
+    check(p_vkCreateImageView(g_device, &vi, nullptr, &img->view), "vkCreateImageView");
     if (g_trace)
-        log("nvn/vk: image for texture %llx: %ux%u format %#x -> %d", (unsigned long long)guest, img->width,
-            img->height, t->format, int(img->format));
+        log("nvn/vk: image for texture %llx: %ux%u x%u layers, %u levels, target %u format %#x -> %d",
+            (unsigned long long)guest, img->width, img->height, img->layers, img->levels, t->target, t->format,
+            int(img->format));
     t->image = img;
     return img.get();
 }
@@ -276,10 +351,58 @@ void transition(VkCommandBuffer cb, GpuImage& img, VkImageLayout to) {
     b.newLayout = to;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = img.image;
-    b.subresourceRange = {img.aspect, 0, 1, 0, 1};
+    b.subresourceRange = {img.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
     p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
                            nullptr, 1, &b);
     img.layout = to;
+}
+
+Upload upload_alloc(uint64_t size, uint64_t align) {
+    uint64_t at = (g_upload_used + align - 1) & ~(align - 1);
+    if (at + size > g_upload_size) {
+        log("nvn/vk: upload buffer full (%llu + %llu bytes)", (unsigned long long)at, (unsigned long long)size);
+        at = 0;  // wraps: this submit's earlier data may be overwritten (grow the buffer when this shows)
+    }
+    g_upload_used = at + size;
+    return {g_upload, at, g_upload_ptr + at};
+}
+
+Upload upload(const void* data, uint64_t size, uint64_t align) {
+    Upload u = upload_alloc(size, align);
+    if (data && size) std::memcpy(u.ptr, data, size);
+    return u;
+}
+
+VkDescriptorSet descriptor_set(VkDescriptorSetLayout layout) {
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = g_descriptors;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &layout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (p_vkAllocateDescriptorSets(g_device, &ai, &set) != VK_SUCCESS) log("nvn/vk: descriptor pool exhausted");
+    return set;
+}
+
+namespace {
+
+void make_upload_buffer(uint64_t size) {
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = size;
+    bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    p_vkCreateBuffer(g_device, &bi, nullptr, &g_upload);
+    VkMemoryRequirements req{};
+    p_vkGetBufferMemoryRequirements(g_device, g_upload, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex =
+        memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    p_vkAllocateMemory(g_device, &ai, nullptr, &g_upload_memory);
+    p_vkBindBufferMemory(g_device, g_upload, g_upload_memory, 0);
+    void* p = nullptr;
+    p_vkMapMemory(g_device, g_upload_memory, 0, VK_WHOLE_SIZE, 0, &p);
+    g_upload_ptr = static_cast<uint8_t*>(p);
+    g_upload_size = size;
 }
 
 struct Exec {
@@ -292,15 +415,18 @@ void replay(VkCommandBuffer cb, Exec& st, const CmdList& list, int depth) {
     for (const Cmd& c : list.cmds) {
         switch (c.op) {
             case Cmd::SetRenderTargets:
+                draw_end_rendering(cb);
                 st.color_count = c.n;
                 for (uint32_t k = 0; k < 8; k++) st.colors[k] = k < c.n ? c.a[k] : 0;
                 st.depth = c.a[8];
                 break;
             case Cmd::ClearColor: {
+                draw_end_rendering(cb);
                 if (c.n >= 8 || !st.colors[c.n]) break;
                 GpuImage* img = image_of(st.colors[c.n]);
                 if (!img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) break;
                 transition(cb, *img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                img->rendered = true;  // GPU-written from now on: never re-read from guest memory
                 VkClearColorValue v{};
                 std::memcpy(v.float32, c.f, 16);
                 VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -308,21 +434,34 @@ void replay(VkCommandBuffer cb, Exec& st, const CmdList& list, int depth) {
                 break;
             }
             case Cmd::ClearDepthStencil: {
+                draw_end_rendering(cb);
                 GpuImage* img = st.depth ? image_of(st.depth) : nullptr;
                 if (!img || img->aspect == VK_IMAGE_ASPECT_COLOR_BIT) break;
                 transition(cb, *img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                img->rendered = true;
                 VkClearDepthStencilValue v{c.f[0], uint32_t(c.i[0])};
                 VkImageSubresourceRange r{img->aspect, 0, 1, 0, 1};
                 p_vkCmdClearDepthStencilImage(cb, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
                 break;
             }
             case Cmd::CallList:
-                if (depth < 8)
-                    if (auto l = command_list(c.a[0])) replay(cb, st, *l, depth + 1);
+                if (depth < 8) {
+                    if (auto l = command_list(c.a[0]))
+                        replay(cb, st, *l, depth + 1);
+                    else {
+                        static int missing = 0;
+                        if (++missing <= 5) log("nvn: called handle %llx is unknown", (unsigned long long)c.a[0]);
+                    }
+                }
                 break;
-            case Cmd::SetViewport:
-            case Cmd::SetScissor:
+            default: {
+                Targets t;
+                std::memcpy(t.colors, st.colors, sizeof t.colors);
+                t.color_count = st.color_count;
+                t.depth = st.depth;
+                draw_command(cb, c, list, t);
                 break;
+            }
         }
     }
 }
@@ -431,9 +570,14 @@ void readback_write(const GpuImage& img, uint64_t frame) {
 
 void gpu_submit(CPU&, const std::vector<std::shared_ptr<CmdList>>& lists) {
     std::lock_guard lk(g_gpu);
-    if (!init() || !begin()) return;
+    if (!init()) return;
+    p_vkResetDescriptorPool(g_device, g_descriptors, 0);
+    g_upload_used = 0;
+    if (!begin()) return;
+    draw_begin_submit();
     Exec st;
     for (auto& l : lists) replay(g_cb, st, *l, 0);
+    draw_end_rendering(g_cb);
     end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);
 }
 
@@ -475,6 +619,7 @@ void gpu_present(uint64_t texture) {
     transition(g_cb, dst, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     static uint64_t presents = 0;
     presents++;
+    if (presents % (presents < 300 ? 60 : 300) == 0) draw_log_stats();
     bool dump = src && dump_every() && presents % dump_every() == 0 && readback_record(*src);
     end_and_wait(g_acquired, g_rendered);
     if (dump) readback_write(*src, presents);

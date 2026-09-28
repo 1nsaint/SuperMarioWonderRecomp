@@ -11,6 +11,7 @@
 //   DrawElementsBaseVertex(..., baseVertex)         DrawElementsInstanced(..., baseVertex, baseInstance, instances)
 //   DrawArraysInstanced(cmd, mode, first, count, baseInstance, instances)
 // Shader stages are numbered 0 vertex, 1 fragment (the pairs the game binds), 5 compute.
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include "nvn.h"
+#include "platform.h"
 
 namespace nx::nvn {
 
@@ -212,9 +214,12 @@ void SetDepthRange(CPU& c) {  // (cmd, float near [s0], float far [s1])
     record(c.x[0], cmd);
 }
 
+std::atomic<uint64_t> g_recorded_draws{0};
+
 // ---- draws --------------------------------------------------------------------------------------------------------
 
 void DrawArrays(CPU& c) {
+    g_recorded_draws++;
     Cmd cmd{Cmd::DrawArrays};
     cmd.n = uint32_t(c.x[1]);                                    // mode
     cmd.i[0] = int32_t(c.x[2]), cmd.i[1] = int32_t(c.x[3]);      // first, count
@@ -231,6 +236,7 @@ void DrawArraysInstanced(CPU& c) {
 }
 
 void draw_elements(CPU& c, int32_t base_vertex, int32_t base_instance, int32_t instances) {
+    g_recorded_draws++;
     Cmd cmd{Cmd::DrawElements};
     cmd.n = uint32_t(c.x[1]);        // mode
     cmd.mask = uint32_t(c.x[2]);     // index type: 0 u8, 1 u16, 2 u32
@@ -246,8 +252,24 @@ void DrawElementsInstanced(CPU& c) { draw_elements(c, int32_t(c.x[5]), int32_t(c
 
 void ignore(CPU&) {}
 
+// ReportCounter(cmd, NVNcounterType, NVNbufferAddress): the GPU writes {u64 value, u64 timestamp} there when it gets
+// to this point. Engines read these to know how far the GPU is (Wonder skips drawing the scene when they never
+// arrive), so the replay writes them.
+void ReportCounter(CPU& c) {
+    Cmd cmd{Cmd::ReportCounter};
+    cmd.n = uint32_t(c.x[1]);
+    cmd.a[0] = c.x[2];
+    record(c.x[0], cmd);
+}
+
+// Our GPU timestamps are host nanoseconds: the conversions are identities.
+void GetTimestampInNanoseconds(CPU& c) { c.x[0] = c.x[1] ? ld<uint64_t>(c.x[1] + 8) : 0; }  // (device, counterData*)
+void GetCurrentTimestampInNanoseconds(CPU& c) { c.x[0] = plat::monotonic_ns(); }
+
 
 }  // namespace
+
+uint64_t recorded_draws() { return g_recorded_draws; }
 
 NX_HLE("nvnCommandBufferBindProgram", BindProgram);
 NX_HLE("nvnCommandBufferBindUniformBuffer", BindUniformBuffer);
@@ -271,6 +293,9 @@ NX_HLE("nvnCommandBufferDrawArraysInstanced", DrawArraysInstanced);
 NX_HLE("nvnCommandBufferDrawElements", DrawElements);
 NX_HLE("nvnCommandBufferDrawElementsBaseVertex", DrawElementsBaseVertex);
 NX_HLE("nvnCommandBufferDrawElementsInstanced", DrawElementsInstanced);
-NX_HLE("nvnCommandBufferBarrier", ignore);  // every replayed command is serialized for now
+NX_HLE("nvnCommandBufferBarrier", ignore);
+NX_HLE("nvnCommandBufferReportCounter", ReportCounter);
+NX_HLE("nvnDeviceGetTimestampInNanoseconds", GetTimestampInNanoseconds);
+NX_HLE("nvnDeviceGetCurrentTimestampInNanoseconds", GetCurrentTimestampInNanoseconds);  // every replayed command is serialized for now
 
 }  // namespace nx::nvn

@@ -90,6 +90,11 @@ void GetStorageClass(CPU& c) { c.x[0] = 0; }  // NVNstorageClass: only matters f
 
 uint64_t texture_storage_size(CPU& c, uint64_t builder) { return compute(c, builder).size; }
 
+void format_block(uint32_t format, uint32_t& block_w, uint32_t& block_h, uint32_t& bytes) {
+    FormatInfo f = format_info(format);
+    block_w = f.block_w, block_h = f.block_h, bytes = f.bytes;
+}
+
 NX_HLE("nvnTextureBuilderGetStorageSize", GetStorageSize);
 NX_HLE("nvnTextureBuilderGetStorageAlignment", GetStorageAlignment);
 NX_HLE("nvnTextureBuilderGetStorageClass", GetStorageClass);

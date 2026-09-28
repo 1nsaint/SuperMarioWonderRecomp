@@ -2,6 +2,7 @@
 // sampler pools. Signatures come from the game's call sites (nvn_trace.txt); builder state is read back
 // through the SDK driver's getters (nvn.h). The Vulkan side hangs off these objects.
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 
 #include "nvn.h"
@@ -45,6 +46,17 @@ MemoryPool* pool_at_gpu(uint64_t gpu, uint64_t* offset) {
     if (gpu - p->gpu >= p->size) return nullptr;
     if (offset) *offset = gpu - p->gpu;
     return p;
+}
+
+uint64_t pool_host(const MemoryPool& pool, uint64_t offset) {
+    if (pool.memory) return pool.memory + offset;
+    std::lock_guard lk(objects_lock());
+    auto it = pool.mappings.upper_bound(offset);
+    if (it == pool.mappings.begin()) return 0;
+    --it;
+    if (offset - it->first >= it->second.size) return 0;
+    auto* phys = dynamic_cast<MemoryPool*>(objects().count(it->second.physical) ? objects()[it->second.physical].get() : nullptr);
+    return phys && phys->memory ? phys->memory + it->second.physical_offset + (offset - it->first) : 0;
 }
 
 namespace {
@@ -91,6 +103,33 @@ void MemoryPoolGetFlags(CPU& c) {
     c.x[0] = p ? p->flags : 0;
 }
 
+// NVNboolean nvnMemoryPoolMapVirtual(NVNmemoryPool* virtualPool, int count, const NVNmappingRequest* requests):
+// each request maps [virtualOffset, +size) of the virtual pool onto [physicalOffset, +size) of a physical pool.
+// Request layout (0x28 bytes, logged once to check): {NVNmemoryPool* physicalPool; s64 physicalOffset;
+// s64 virtualOffset; u64 size; NVNstorageClass storageClass}.
+void MemoryPoolMapVirtual(CPU& c) {
+    auto* v = get<MemoryPool>(c.x[0]);
+    uint32_t n = uint32_t(c.x[1]);
+    static int logged = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        uint64_t r = c.x[2] + 0x28ull * k;
+        uint64_t phys = ld<uint64_t>(r), poff = ld<uint64_t>(r + 8), voff = ld<uint64_t>(r + 16), size = ld<uint64_t>(r + 24);
+        if (logged < 4) {
+            logged++;
+            log("nvn: map virtual %llx: phys pool %llx +%llx -> virtual +%llx size %llx (class %x)", (unsigned long long)c.x[0],
+                (unsigned long long)phys, (unsigned long long)poff, (unsigned long long)voff, (unsigned long long)size,
+                ld<uint32_t>(r + 32));
+        }
+        if (!v) continue;
+        std::lock_guard lk(objects_lock());
+        if (phys)
+            v->mappings[voff] = {phys, poff, size};
+        else
+            v->mappings.erase(voff);  // unmap
+    }
+    c.x[0] = 1;
+}
+
 // Guest memory is host memory and the GPU side is coherent with it (imported host memory): nothing to flush.
 void MemoryPoolFlushMappedRange(CPU&) {}
 void MemoryPoolInvalidateMappedRange(CPU&) {}
@@ -110,7 +149,7 @@ void BufferInitialize(CPU& c) {  // NVNboolean (NVNbuffer*, const NVNbufferBuild
     b.offset = driver(c, "nvnBufferBuilderGetMemoryOffset", {builder});
     b.size = driver(c, "nvnBufferBuilderGetSize", {builder});
     if (auto* p = get<MemoryPool>(b.pool)) {
-        b.memory = p->memory + b.offset;
+        b.memory = pool_host(*p, b.offset);
         b.gpu = p->gpu + b.offset;
     }
     c.x[0] = 1;
@@ -164,8 +203,13 @@ void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBu
     t.pool = driver(c, "nvnTextureBuilderGetMemoryPool", {builder});
     t.offset = driver(c, "nvnTextureBuilderGetMemoryOffset", {builder});
     t.storage_size = texture_storage_size(c, builder);
+    // Packaged (BNTX) textures: their layout's first word holds log2 of the block height (BRTI +0x34,
+    // docs/nvn/TILING.md); the data must be untiled with it rather than the default.
+    uint64_t layout = driver(c, "nvnTextureBuilderGetPackagedTextureLayout", {builder});
+    if (layout >= kModuleBase && layout < kKernelBase + kKernelSize) layout = ld<uint64_t>(layout);
+    if (layout) t.block_height_gobs = 1u << (layout & 7);
     if (auto* p = get<MemoryPool>(t.pool)) {
-        t.memory = p->memory + t.offset;
+        t.memory = pool_host(*p, t.offset);
         t.gpu = p->gpu + t.offset;
     }
     if (g_trace)
@@ -243,6 +287,7 @@ void DeviceGetImageHandle(CPU& c) { c.x[0] = c.x[1] & 0xFFFFF; }
 NX_HLE("nvnMemoryPoolInitialize", MemoryPoolInitialize);
 NX_HLE("nvnMemoryPoolFinalize", MemoryPoolFinalize);
 NX_HLE("nvnMemoryPoolMap", MemoryPoolMap);
+NX_HLE("nvnMemoryPoolMapVirtual", MemoryPoolMapVirtual);
 NX_HLE("nvnMemoryPoolGetBufferAddress", MemoryPoolGetBufferAddress);
 NX_HLE("nvnMemoryPoolGetSize", MemoryPoolGetSize);
 NX_HLE("nvnMemoryPoolGetFlags", MemoryPoolGetFlags);

@@ -7,8 +7,10 @@
 // ClearColor(cmd, int index, const float* rgba, int channelMask); ClearDepthStencil(cmd, float depth [s0],
 // NVNboolean depthMask, int stencil, int stencilMask); SetViewport / SetScissor(cmd, int x, int y, int w, int h);
 // CallCommands(cmd, int count, const NVNcommandHandle*).
+#include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <cstdlib>
 #include <deque>
 
 #include "nvn.h"
@@ -20,7 +22,20 @@ namespace {
 struct CommandBuffer : Object {
     std::mutex lock;
     std::shared_ptr<CmdList> recording = std::make_shared<CmdList>();
+    // The memory the game hands over (AddCommandMemory / AddControlMemory) and what recording "uses" of it. Engines
+    // look at the used amounts right after EndRecording (a list that used nothing is dropped, never submitted) and
+    // at the free ones (to add memory in time), so usage grows with the commands recorded, survives EndRecording
+    // and BeginRecording like the real memory does, and is given back only when memory is added. It never reaches
+    // the total.
+    uint64_t command_size = 0, control_size = 0;
+    uint64_t command_base = 0, control_base = 0;  // usage before this recording
 };
+
+constexpr uint64_t kCommandBytes = 16, kControlBytes = 4;  // per recorded command
+
+uint64_t used(uint64_t size, uint64_t base, size_t cmds, uint64_t per) {
+    return std::min(base + cmds * per, size > 64 ? size - 64 : 0);
+}
 
 std::mutex g_handles_lock;
 std::map<uint64_t, std::shared_ptr<CmdList>> g_handles;
@@ -43,13 +58,64 @@ void CommandBufferBeginRecording(CPU& c) {
     }
 }
 
+void AddCommandMemory(CPU& c) {  // (cmd, const NVNmemoryPool*, ptrdiff_t offset, size_t size)
+    if (auto* cb = get<CommandBuffer>(c.x[0])) {
+        std::lock_guard lk(cb->lock);
+        cb->command_size = c.x[3];
+        cb->command_base = 0;
+    }
+}
+
+void AddControlMemory(CPU& c) {  // (cmd, void* memory, size_t size)
+    if (auto* cb = get<CommandBuffer>(c.x[0])) {
+        std::lock_guard lk(cb->lock);
+        cb->control_size = c.x[2];
+        cb->control_base = 0;
+    }
+}
+
+template <bool Command, int What>  // What: 0 used, 1 size, 2 free
+void memory_query(CPU& c) {
+    auto* cb = get<CommandBuffer>(c.x[0]);
+    if (!cb) {
+        c.x[0] = 0;
+        return;
+    }
+    std::lock_guard lk(cb->lock);
+    uint64_t size = Command ? cb->command_size : cb->control_size;
+    uint64_t u = used(size, Command ? cb->command_base : cb->control_base, cb->recording->cmds.size(),
+                      Command ? kCommandBytes : kControlBytes);
+    c.x[0] = What == 0 ? u : What == 1 ? size : size - u;
+}
+
+std::atomic<uint64_t> g_ends{0}, g_end_cmds{0}, g_calls{0}, g_no_cb{0};
+
 void CommandBufferEndRecording(CPU& c) {  // NVNcommandHandle
     std::shared_ptr<CmdList> list = std::make_shared<CmdList>();
     if (auto* cb = get<CommandBuffer>(c.x[0])) {
         std::lock_guard lk(cb->lock);
+        size_t n = cb->recording->cmds.size() + 1;  // + the end of the list, so even an empty one used something
+        cb->command_base = used(cb->command_size, cb->command_base, n, kCommandBytes);
+        cb->control_base = used(cb->control_size, cb->control_base, n, kControlBytes);
         list.swap(cb->recording);
     }
+    g_ends++;
+    g_end_cmds += list->cmds.size();
+    if ((g_ends & 4095) == 0)
+        log("nvn: %llu lists ended (%llu commands), %llu CallCommands, %llu records into unknown command buffers",
+            (unsigned long long)g_ends.load(), (unsigned long long)g_end_cmds.load(), (unsigned long long)g_calls.load(),
+            (unsigned long long)g_no_cb.load());
     uint64_t h = g_next_handle++;
+    static const bool trace_lists = std::getenv("NX_NVN_LISTS") != nullptr;
+    if (trace_lists && g_ends > 20000 && g_ends < 20200) {
+        size_t draws = 0, calls = 0;
+        for (auto& k : list->cmds) {
+            draws += k.op == Cmd::DrawArrays || k.op == Cmd::DrawElements;
+            calls += k.op == Cmd::CallList;
+        }
+        log("nvn list: end %llx -> handle %llu: %zu cmds, %zu draws, %zu calls, lr %s", (unsigned long long)c.x[0],
+            (unsigned long long)h, list->cmds.size(), draws, calls, describe(c.x[30]).c_str());
+    }
     {
         std::lock_guard lk(g_handles_lock);
         g_handles[h] = list;
@@ -101,6 +167,7 @@ void SetScissor(CPU& c) {
 
 void CallCommands(CPU& c) {
     uint32_t n = uint32_t(c.x[1]);
+    g_calls += n;
     for (uint32_t k = 0; k < n; k++) {
         Cmd cmd{Cmd::CallList};
         cmd.a[0] = ld<uint64_t>(c.x[2] + 8 * k);
@@ -112,7 +179,10 @@ void CallCommands(CPU& c) {
 
 void record(uint64_t guest, Cmd cmd, const void* blob, size_t size) {
     auto* cb = get<CommandBuffer>(guest);
-    if (!cb) return;
+    if (!cb) {
+        g_no_cb++;
+        return;
+    }
     std::lock_guard lk(cb->lock);
     if (blob) {
         cmd.blob = uint32_t(cb->recording->blobs.size());
@@ -138,5 +208,13 @@ NX_HLE("nvnCommandBufferClearDepthStencil", ClearDepthStencil);
 NX_HLE("nvnCommandBufferSetViewport", SetViewport);
 NX_HLE("nvnCommandBufferSetScissor", SetScissor);
 NX_HLE("nvnCommandBufferCallCommands", CallCommands);
+NX_HLE("nvnCommandBufferAddCommandMemory", AddCommandMemory);
+NX_HLE("nvnCommandBufferAddControlMemory", AddControlMemory);
+NX_HLE("nvnCommandBufferGetCommandMemoryUsed", (memory_query<true, 0>));
+NX_HLE("nvnCommandBufferGetCommandMemorySize", (memory_query<true, 1>));
+NX_HLE("nvnCommandBufferGetCommandMemoryFree", (memory_query<true, 2>));
+NX_HLE("nvnCommandBufferGetControlMemoryUsed", (memory_query<false, 0>));
+NX_HLE("nvnCommandBufferGetControlMemorySize", (memory_query<false, 1>));
+NX_HLE("nvnCommandBufferGetControlMemoryFree", (memory_query<false, 2>));
 
 }  // namespace nx::nvn

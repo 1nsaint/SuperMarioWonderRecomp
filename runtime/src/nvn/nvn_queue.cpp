@@ -1,3 +1,4 @@
+#include <cstdlib>
 // NVN queues, command buffers, windows and syncs (docs/NVN.md, N3). Without the Vulkan side every command
 // completes at submit: fences are signaled right away, the window hands out its textures in turn, and presents are
 // counted. Return values follow the SDK driver (nvnSyncWait sdk+45a960: 0 once the fence has passed;
@@ -39,8 +40,22 @@ void QueueInitialize(CPU& c) { c.x[0] = 1; }  // NVNboolean (NVNqueue*, const NV
 void QueueFinalize(CPU&) {}
 void QueueSubmitCommands(CPU& c) {  // (NVNqueue*, int count, const NVNcommandHandle*)
     std::vector<std::shared_ptr<CmdList>> lists;
-    for (uint32_t k = 0; k < uint32_t(c.x[1]); k++)
-        if (auto l = command_list(ld<uint64_t>(c.x[2] + 8 * k))) lists.push_back(std::move(l));
+    static uint64_t submitted = 0, missing = 0;
+    for (uint32_t k = 0; k < uint32_t(c.x[1]); k++) {
+        submitted++;
+        if (auto l = command_list(ld<uint64_t>(c.x[2] + 8 * k)))
+            lists.push_back(std::move(l));
+        else if (++missing <= 5)
+            log("nvn: submitted handle %llx is unknown", (unsigned long long)ld<uint64_t>(c.x[2] + 8 * k));
+    }
+    static const bool trace_lists = std::getenv("NX_NVN_LISTS") != nullptr;
+    if (trace_lists && g_presents > 900 && g_presents < 905)
+        for (uint32_t k = 0; k < uint32_t(c.x[1]); k++) {
+            auto l = command_list(ld<uint64_t>(c.x[2] + 8 * k));
+            log("nvn list: submit %llx handle %llu (%zu cmds)", (unsigned long long)c.x[0],
+                (unsigned long long)ld<uint64_t>(c.x[2] + 8 * k), l ? l->cmds.size() : 0);
+        }
+    if ((submitted & 1023) == 0) log("nvn: %llu handles submitted, %llu unknown", (unsigned long long)submitted, (unsigned long long)missing);
     gpu_submit(c, lists);
 }
 void QueueFlush(CPU&) {}

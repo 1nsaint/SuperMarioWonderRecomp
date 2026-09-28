@@ -778,6 +778,18 @@ const ShaderInfo* shader_for(uint64_t code_host, uint64_t control) {
     if (!read_whole(dir + hash + ".spv", bytes) || bytes.size() % 4 || bytes.empty()) {
         log("nvn: shader %s (code %#x bytes, control %llx): no %s%s.spv", hash.c_str(), c.code_size,
             (unsigned long long)control, dir.c_str(), hash.c_str());
+        if (std::getenv("NX_DUMP_SHADER_MISSES")) {  // for translating shaders the offline inventory missed
+            std::string out = plat::data_root() + "/shader_misses/";
+            plat::make_dirs(out);
+            if (FILE* f = plat::fopen_utf8(out + "code_" + hash + ".bin", "wb")) {
+                std::fwrite(code, 1, c.code_size, f);
+                std::fclose(f);
+            }
+            if (FILE* f = plat::fopen_utf8(out + "ctrl_" + hash + ".bin", "wb")) {
+                std::fwrite(ctrl, 1, 0x880, f);
+                std::fclose(f);
+            }
+        }
         return nullptr;
     }
     std::vector<uint32_t> words(bytes.size() / 4);

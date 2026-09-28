@@ -70,11 +70,19 @@ inline void destroy(uint64_t guest) {
 // ---- memory ---------------------------------------------------------------------------------------------------
 
 struct MemoryPool : Object {
-    uint64_t memory = 0;  // guest (= host) address of the storage the game gave
+    uint64_t memory = 0;  // guest (= host) address of the storage the game gave; 0 for a virtual pool
     uint64_t size = 0;
     uint32_t flags = 0;
     uint64_t gpu = 0;  // our GPU virtual address of byte 0
+    // Virtual pools (nvnMemoryPoolMapVirtual): virtual offset -> (physical pool, its offset, size).
+    struct Mapping {
+        uint64_t physical = 0, physical_offset = 0, size = 0;
+    };
+    std::map<uint64_t, Mapping> mappings;
 };
+
+// Host address of `offset` in a pool, through its virtual mappings if it has no storage of its own; 0 if unmapped.
+uint64_t pool_host(const MemoryPool& pool, uint64_t offset);
 
 // GPU virtual addresses: every pool gets a range; address -> (pool, offset) for command translation.
 uint64_t gpu_alloc(uint64_t size);
@@ -91,6 +99,7 @@ struct Texture : Object {
     uint32_t width = 0, height = 0, depth = 0, stride = 0;
     uint64_t pool = 0, offset = 0, storage_size = 0;
     uint64_t memory = 0, gpu = 0;
+    uint32_t block_height_gobs = 0;  // packaged (BNTX) textures carry their own; 0: the layout's default
     std::shared_ptr<GpuImage> image;  // made on first use by the GPU
 };
 
@@ -139,7 +148,7 @@ struct Cmd {
         SetDepthRange, BindProgram, BindUniformBuffer, BindStorageBuffer, BindTexture, BindVertexBuffer,
         BindVertexAttribs, BindVertexStreams, BindBlendState, BindColorState, BindChannelMaskState,
         BindDepthStencilState, BindPolygonState, SetBlendColor, UpdateUniformBuffer, SetTexturePool, SetSamplerPool,
-        DrawArrays, DrawElements,
+        DrawArrays, DrawElements, ReportCounter,
     } op;
     uint32_t n = 0, mask = 0;
     uint64_t a[9] = {};  // textures (render targets: colors then depth), handles, GPU addresses, sizes, ...
@@ -187,6 +196,13 @@ void record(uint64_t cmdbuf, Cmd cmd, const void* blob = nullptr, size_t size = 
 
 void gpu_submit(CPU& c, const std::vector<std::shared_ptr<CmdList>>& lists);
 void gpu_present(uint64_t texture);  // guest NVNtexture* of a window texture
+
+// Programs: the translated stages bound by nvnProgramSetShaders (nvn_program.cpp; ShaderInfo in nvn_shaders.h).
+struct ShaderInfo;
+const std::vector<const ShaderInfo*>* program_shaders(uint64_t program);
+
+// A format's block (width, height in texels; bytes), from the SDK driver's format table (nvn_texture_layout.cpp).
+void format_block(uint32_t format, uint32_t& block_w, uint32_t& block_h, uint32_t& bytes);
 
 // Bytes a texture built from `builder` occupies in its pool (nvn_texture_layout.cpp).
 uint64_t texture_storage_size(CPU& c, uint64_t builder);

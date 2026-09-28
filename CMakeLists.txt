@@ -73,7 +73,11 @@ set(NX_RUNTIME_SOURCES
     runtime/src/nvn/nvn_format.cpp
     runtime/src/nvn/nvn_enums.cpp
     runtime/src/nvn/nvn_sampler.cpp
+    runtime/src/nvn/nvn_shaders.cpp
+    runtime/src/nvn/nvn_tiling.cpp
     runtime/src/nvn/nvn_vk.cpp
+    runtime/src/nvn/nvn_pipeline.cpp
+    runtime/src/nvn/nvn_draw.cpp
     runtime/src/vk_bridge.cpp
     runtime/src/vk_gen.cpp
     runtime/src/vk_present.cpp
