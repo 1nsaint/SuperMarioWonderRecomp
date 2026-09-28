@@ -10,6 +10,12 @@
 #include <mutex>
 #include <string>
 
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <nx/runtime.h>
 
 #include "platform.h"
@@ -384,6 +390,40 @@ void MountCacheStorage(CPU& c) {  // (name, int index)
     c.x[0] = kOk;
 }
 
+// ---- SDK 16 additions (Super Mario Bros. Wonder) ---------------------------------------------------------------
+// MountRom(name) without a cache buffer, and ReadFile(size_t* out, FileHandle, s64, void*, size_t, const ReadOption&)
+// are the older calls with one argument less / more: the same functions serve them.
+
+void IsSaveDataExisting(CPU& c) { c.x[0] = 1; }  // (const account::Uid&) -> bool: EnsureSaveData made it
+
+void SetFileSize(CPU& c) {  // (FileHandle, s64 size)
+    auto file = open_file(c.x[0]);
+    if (!file) {
+        c.x[0] = kTargetNotFound;
+        return;
+    }
+    std::lock_guard lk(g_fs);
+    std::fflush(file->f);
+#if defined(_WIN32)
+    bool ok = _chsize_s(_fileno(file->f), int64_t(c.x[1])) == 0;
+#else
+    bool ok = ftruncate(fileno(file->f), off_t(c.x[1])) == 0;
+#endif
+    c.x[0] = ok ? kOk : kPathNotFound;
+}
+
+void DeleteDirectoryRecursively(CPU& c) {
+    std::lock_guard lk(g_fs);
+    fs::path p = resolve(cstr(c.x[0]));
+    std::error_code ec;
+    if (p.empty() || !fs::is_directory(p, ec)) {
+        c.x[0] = kPathNotFound;
+        return;
+    }
+    fs::remove_all(p, ec);
+    c.x[0] = ec ? kPathNotFound : kOk;
+}
+
 }  // namespace
 
 NX_HLE("_ZN2nn2fs22QueryMountRomCacheSizeEPm", QueryMountRomCacheSize);
@@ -415,6 +455,11 @@ NX_HLE("_ZN2nn2fs21CloseCacheStorageListENS0_22CacheStorageListHandleE", CloseCa
 NX_HLE("_ZN2nn2fs18CreateCacheStorageEill", CreateCacheStorage);
 NX_HLE("_ZN2nn2fs18DeleteCacheStorageEi", DeleteCacheStorage);
 NX_HLE("_ZN2nn2fs17MountCacheStorageEPKci", MountCacheStorage);
+NX_HLE("_ZN2nn2fs8MountRomEPKc", MountRom);
+NX_HLE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE", ReadFileOut);
+NX_HLE("_ZN2nn2fs18IsSaveDataExistingERKNS_7account3UidE", IsSaveDataExisting);
+NX_HLE("_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl", SetFileSize);
+NX_HLE("_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc", DeleteDirectoryRecursively);
 
 void add_virtual_file(const std::string& path, std::string data) {
     std::lock_guard lk(g_fs);

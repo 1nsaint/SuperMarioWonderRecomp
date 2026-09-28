@@ -45,7 +45,9 @@ def main():
         funcs = [f for f in funcs if f.start in want]
 
     with open(os.path.join(args.out, "funcs.h"), "w") as h:
-        h.write(f"#pragma once\n#include <nx/cpu.h>\n\n#undef NXB\n#define NXB {base:#x}ull\n\n")
+        # --base is an address in the reference layout (modules at 0x40_0000_0000); the build's NX_BASE (nx/cpu.h,
+        # per host) moves all modules together, so the same generated code serves every platform.
+        h.write(f"#pragma once\n#include <nx/cpu.h>\n\n#undef NXB\n#define NXB (NX_BASE + {base - REF_BASE:#x}ull)\n\n")
         for f in an.functions:
             h.write(f"void {e.fn(f.start)}(nx::CPU& c);\n")
 
@@ -78,6 +80,9 @@ def main():
         print(f"  {n:7} {mn}")
 
 
+REF_BASE = 0x4000000000  # where --base addresses are measured from (NX_BASE of the reference layout)
+
+
 def write_table(path, m, an, e, name, base):
     with open(path, "w") as out:
         out.write('#include "funcs.h"\n#include <nx/module.h>\n\n')
@@ -98,7 +103,7 @@ def write_table(path, m, an, e, name, base):
         out.write(f"static const uint64_t init_array[] = {{{ia}}};\n")
         out.write(f"static const uint64_t fini_array[] = {{{fa}}};\n\n")
         out.write(f"extern const nx::ModuleInfo nx_module_{name} = {{\n")
-        out.write(f"    {cstr(name)}, {base:#x}ull,\n")
+        out.write(f"    {cstr(name)}, NX_BASE + {base - REF_BASE:#x}ull,\n")
         out.write(f"    {m.text[0]:#x}, {m.text[1]:#x}, {m.ro[0]:#x}, {m.ro[1]:#x}, "
                   f"{m.data[0]:#x}, {m.data[1]:#x}, {m.bss[0]:#x}, {m.bss[1]:#x},\n")
         out.write(f"    funcs, {len(an.functions)},\n")

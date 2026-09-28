@@ -53,12 +53,21 @@ static void call_preserving(CPU& c, uint64_t target) {
     for (int r = 19; r <= 31; r++) c.x[r] = saved[r - 19];
 }
 
-// DT_INIT starts with `adrp x19, page; ldr w8, [x19, #off]`: the word where it keeps __nnmusl_init_dso's result.
+// DT_INIT loads the word where it keeps __nnmusl_init_dso's result with `adrp xN, page` ... `ldr w8, [xN, #off]`
+// in its first instructions (SDK 9: adjacent; SDK 16: another adrp in between). Follow the adrp targets until
+// that load.
 static uint64_t init_status_addr(const ModuleInfo& m) {
-    uint64_t pc = m.base + kDtInit + 0x10;
-    uint32_t adrp = ld<uint32_t>(pc), ldr = ld<uint32_t>(pc + 4);
-    int64_t imm = int64_t(((adrp >> 5) & 0x7FFFF) << 2 | ((adrp >> 29) & 3)) << 43 >> 31;  // sign-extended << 12
-    return (pc & ~0xFFFull) + uint64_t(imm) + ((ldr >> 10) & 0xFFF) * 4;
+    uint64_t page[32] = {};
+    for (uint64_t pc = m.base + kDtInit; pc < m.base + kDtInit + 0x40; pc += 4) {
+        uint32_t w = ld<uint32_t>(pc);
+        if ((w & 0x9F000000) == 0x90000000) {  // adrp
+            int64_t imm = int64_t(((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)) << 43 >> 31;  // sign-extended << 12
+            page[w & 31] = (pc & ~0xFFFull) + uint64_t(imm);
+        } else if ((w & 0xFFC0001F) == 0xB9400008 && page[(w >> 5) & 31]) {  // ldr w8, [xN, #imm]
+            return page[(w >> 5) & 31] + ((w >> 10) & 0xFFF) * 4;
+        }
+    }
+    fatal("%s: DT_INIT does not load its init status as expected", m.name);
 }
 
 static void init_module(CPU& c, const ModuleInfo& m) {
@@ -71,6 +80,7 @@ static void init_module(CPU& c, const ModuleInfo& m) {
 
 static void rtld_init(CPU&) {}
 static void rtld_fini(CPU&) {}
+static void rtld_mark(CPU&) {}
 
 // nnMain, as called by nn::init::Start: the constructors need the program's allocator, which nninitStartup has
 // set up by now, so they run here, right before the real nnMain.
@@ -99,6 +109,7 @@ NX_HLE("longjmp", long_jmp);
 NX_HLE("_longjmp", long_jmp);
 NX_HLE("__rtld_init", rtld_init);
 NX_HLE("__rtld_fini", rtld_fini);
+NX_HLE("__rtld_mark", rtld_mark);
 NX_HLE("__process_return", process_return);
 
 // ---- boot -----------------------------------------------------------------------------------------------------
@@ -113,12 +124,21 @@ void boot() {
 
     uint32_t main_thread = create_main_thread(16ull << 20);
     CPU& c = current_cpu();
-    uint64_t start = find_symbol("_ZN2nn4init5StartEmmPFvvES2_");
-    if (!start) fatal("nn::init::Start not found");
     c.x[0] = main_thread;
     c.x[1] = nx_module_main.base;
-    c.x[2] = hle_address("__rtld_init");
-    c.x[3] = hle_address("__rtld_fini");
+    // SDK 9: Start(thread, main base, init, fini). SDK 16 adds a first callback: rtld's sets a word to 1 (rtld+0x1330
+    // in Wonder), before its init and fini that walk the module list.
+    uint64_t start = find_symbol("_ZN2nn4init5StartEmmPFvvES2_");
+    if (start) {
+        c.x[2] = hle_address("__rtld_init");
+        c.x[3] = hle_address("__rtld_fini");
+    } else if ((start = find_symbol("_ZN2nn4init5StartEmmPFvvES2_S2_"))) {
+        c.x[2] = hle_address("__rtld_mark");
+        c.x[3] = hle_address("__rtld_init");
+        c.x[4] = hle_address("__rtld_fini");
+    } else {
+        fatal("nn::init::Start not found");
+    }
     c.x[30] = hle_address("__process_return");
     log("entering nn::init::Start at %s", describe(start).c_str());
     call(c, start);

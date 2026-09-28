@@ -138,8 +138,31 @@ uint32_t ipc_request(CPU& c, uint32_t handle, uint64_t buf, uint64_t) {
         }
     }
 
-    if (ctx.type == 2) {  // Close
+    if (ctx.type == 2 || ctx.type == 15) {  // Close (CMIF / TIPC)
         handle_close(handle);
+        return 0;
+    }
+    if (ctx.type >= 16) {
+        // TIPC (SDK 12+, sm: and a few system services): the command is the message type - 16, the raw data
+        // follows the descriptors with no padding and no SFCI header; the response starts with the result code.
+        ctx.cmd = ctx.type - 16;
+        ctx.in = reinterpret_cast<const uint8_t*>(buf + data_start * 4);
+        ctx.in_size = ndata * 4;
+        if (g_trace) log("ipc: tipc %s cmd %u", sess->svc->name.c_str(), ctx.cmd);
+        uint32_t rc = sess->svc->handle(ctx);
+        for (auto& o : ctx.out_objects) ctx.out_move.push_back(new_session_handle(o));
+        std::memset(w, 0, 0x100);
+        bool has_special = !ctx.out_copy.empty() || !ctx.out_move.empty();
+        size_t q = 2;
+        if (has_special) {
+            w[q++] = (uint32_t(ctx.out_copy.size()) << 1) | (uint32_t(ctx.out_move.size()) << 5);
+            for (uint32_t h : ctx.out_copy) w[q++] = h;
+            for (uint32_t h : ctx.out_move) w[q++] = h;
+        }
+        w[q] = rc;
+        std::memcpy(&w[q + 1], ctx.out.data(), ctx.out.size());
+        w[0] = ctx.type;
+        w[1] = uint32_t(1 + (ctx.out.size() + 3) / 4) | (has_special ? 0x80000000u : 0);
         return 0;
     }
     // Raw data: aligned to 16 bytes from the message start.

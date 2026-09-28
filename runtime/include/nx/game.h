@@ -12,6 +12,9 @@ struct Info {
     uint64_t program_id;          // svcGetInfo(ProgramId)
     const char* android_package;  // the APK's package (games/<game>/AndroidManifest.xml)
     const char* pc_data_root;     // PC: where analysis/ and extract/ are ("private/<game>")
+    // main.npdm META +0x14. Non-zero enables nn::os virtual address memory (VammManager, SDK 16) over the alias
+    // region; svcGetInfo(SystemResourceSizeTotal) reports it.
+    uint64_t system_resource_size = 0;
 };
 extern const Info kInfo;
 

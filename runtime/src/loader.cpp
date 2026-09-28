@@ -95,15 +95,24 @@ static void missing_stub(CPU& c) {
     c.x[0] = 0;
 }
 
-uint64_t hle_address(const char* name) {
+uint64_t hle_address_or(const char* name, HleFn fallback) {
+    static std::mutex lock;  // NVN hands out procs by name at run time, from any thread
+    std::lock_guard lk(lock);
+    // Other threads index g_thunks while we add to it: never reallocate (one entry per 16 bytes of the region).
+    if (g_thunks.capacity() < kThunkSize / 16) g_thunks.reserve(kThunkSize / 16);
     auto it = g_thunk_by_name.find(name);
     if (it != g_thunk_by_name.end()) return it->second;
+    if (g_thunks.size() == kThunkSize / 16) fatal("out of HLE thunks");
     HleFn fn = hle_lookup(name);
     uint64_t addr = kThunkBase + g_thunks.size() * 16;
-    g_thunks.push_back({name, fn ? fn : missing_stub});
+    g_thunks.push_back({name, fn ? fn : fallback});
     g_thunk_by_name[name] = addr;
     return addr;
 }
+
+uint64_t hle_address(const char* name) { return hle_address_or(name, missing_stub); }
+
+const char* hle_current_name() { return t_missing_name; }
 
 // ---- dispatch -------------------------------------------------------------------------------------------------
 

@@ -50,7 +50,13 @@ functions, except where we choose HLE (NVN, audio).
 
 Hades used AudioOut. Wonder uses the **AudioRenderer** (`nn::audio::*` over `audren:u`): the game builds a
 renderer configuration (voices, wave buffers, ADPCM/PCM/Opus, mixes, effects: delay, reverb, I3DL2 reverb, aux,
-biquad) and the service, on hardware the audio DSP, mixes it. We implement the service side.
+biquad) and the service, on hardware the audio DSP, mixes it.
+
+The SDK 16 `sdk` also carries the renderer's **server** side: `nn::audio::server::AudioRendererManagerImpl` (with
+`AudioRendererImpl`, `AudioDeviceImpl`, `ExecuteAudioRendererRendering`), reachable in process through
+`nn::audio::CreateAudioRendererManagerByDfc` ("direct function call") next to the usual
+`CreateAudioRendererManagerByHipc`. If the DFC path can be selected, the update parsing, command generation and
+possibly the mixing come recompiled for free, and only the final output needs the host. To verify during boot.
 
 ## NVN
 

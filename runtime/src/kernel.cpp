@@ -557,7 +557,7 @@ static uint64_t get_info(uint32_t type, uint32_t handle, uint64_t sub, uint32_t&
         case 13: return kAddressSpaceSize;
         case 14: return kStackBase;
         case 15: return kStackSize;
-        case 16: return 0;  // SystemResourceSizeTotal
+        case 16: return game::kInfo.system_resource_size;  // SystemResourceSizeTotal
         case 17: return 0;
         case 18: return game::kInfo.program_id;  // ProgramId
         case 20: return 0;  // UserExceptionContextAddress

@@ -15,8 +15,16 @@
 #include <intrin.h>
 #endif
 
+// Where the modules are mapped. macOS on Apple silicon keeps 0x10_0000_0000..0x6F_FFFF_FFFF for itself (fixed
+// mappings there fail) and puts the dyld shared cache at 0x1_8000_0000..0x3_0000_0000, so the guest address space
+// moves to 0x3_0000_0000..0xF_FFFF_FFFF there, still inside Horizon's 39 bits. Generated code adds each module's
+// offset to this.
 #ifndef NX_BASE
+#if defined(__APPLE__)
+#define NX_BASE 0x0000000300000000ull
+#else
 #define NX_BASE 0x0000004000000000ull
+#endif
 #endif
 
 namespace nx {

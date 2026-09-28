@@ -39,6 +39,8 @@ foreach(mod main sdk)
     if(ANDROID)
         # Hidden visibility: calls between recompiled functions are direct, not through the PLT.
         target_compile_options(game_${mod} PRIVATE -O2 -fPIC -fvisibility=hidden -fno-semantic-interposition)
+    elseif(APPLE)
+        target_compile_options(game_${mod} PRIVATE -O2 -fvisibility=hidden)
     endif()
 endforeach()
 
@@ -58,6 +60,8 @@ set(NX_RUNTIME_SOURCES
     runtime/src/hle_hid.cpp
     runtime/src/hle_net.cpp
     runtime/src/hle_audio.cpp
+    runtime/src/nvn/nvn_trace.cpp
+    runtime/src/nvn/nvn_device.cpp
     runtime/src/vk_bridge.cpp
     runtime/src/vk_gen.cpp
     runtime/src/vk_present.cpp
@@ -84,6 +88,17 @@ if(ANDROID)
     target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden -fno-semantic-interposition)
     # The glue's ANativeActivity_onCreate must be exported.
     target_link_options(${NX_GAME} PRIVATE -u ANativeActivity_onCreate)
+elseif(APPLE)
+    # macOS: SDL3 (window, input, audio) and the Vulkan loader + MoltenVK from Homebrew
+    # (brew install sdl3 vulkan-headers vulkan-loader molten-vk).
+    find_package(SDL3 REQUIRED CONFIG)
+    find_path(NX_VULKAN_INCLUDE vulkan/vulkan.h HINTS /opt/homebrew/include /usr/local/include)
+    add_executable(${NX_GAME} ${NX_RUNTIME_SOURCES} runtime/src/platform_mac.cpp)
+    target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}" "${NX_VULKAN_INCLUDE}")
+    target_link_libraries(${NX_GAME} PRIVATE game_main game_sdk SDL3::SDL3)
+    target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden)
+    # The executable loads near 0x1_0000_0000, below the guest ranges (0x40_0000_0000 and up). The game runs on its
+    # own thread with a 64 MiB stack (platform_mac.cpp), so the main thread's stack size does not matter.
 else()
     add_executable(${NX_GAME} ${NX_RUNTIME_SOURCES} runtime/src/platform_win.cpp)
     target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}" "${NX_VULKAN_SDK}/Include")

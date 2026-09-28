@@ -21,18 +21,29 @@ extern bool g_trace;  // verbose tracing (NX_TRACE=1)
 
 constexpr uint64_t kAddressSpaceBase = 0x0008000000ull;
 constexpr uint64_t kAddressSpaceSize = 0x7FF8000000ull;  // 39-bit, like an application on Horizon
-constexpr uint64_t kModuleBase = 0x4000000000ull;        // main; sdk at +0x10000000 (baked into the code)
-constexpr uint64_t kHeapBase = 0x5000000000ull;
+constexpr uint64_t kModuleBase = NX_BASE;  // main; sdk at +0x10000000 (NX_BASE, nx/cpu.h)
 constexpr uint64_t kHeapMax = 0x180000000ull;  // 6 GiB
+constexpr uint64_t kStackSize = 0x100000000ull;
+constexpr uint64_t kKernelSize = 0x100000000ull;
+constexpr uint64_t kThunkSize = 0x100000ull;
+#if defined(__APPLE__)
+// macOS: only 0x3_0000_0000..0xF_FFFF_FFFF is free below 0x70_0000_0000 (see NX_BASE).
+constexpr uint64_t kHeapBase = 0x400000000ull;
+constexpr uint64_t kAliasBase = 0x600000000ull;
+constexpr uint64_t kAliasSize = 0x400000000ull;
+constexpr uint64_t kStackBase = 0xA00000000ull;
+constexpr uint64_t kKernelBase = 0xB00000000ull;
+constexpr uint64_t kThunkBase = 0xE00000000ull;
+#else
+constexpr uint64_t kHeapBase = 0x5000000000ull;
 constexpr uint64_t kAliasBase = 0x5800000000ull;
 constexpr uint64_t kAliasSize = 0x1000000000ull;
 constexpr uint64_t kStackBase = 0x6800000000ull;
-constexpr uint64_t kStackSize = 0x100000000ull;
 // Kept below 0x70_0000_0000: Android (39-bit address space) maps the process's own libraries and heap up there.
-constexpr uint64_t kKernelBase = 0x6A00000000ull;  // TLS pages, main thread stack: memory we hand out
-constexpr uint64_t kKernelSize = 0x100000000ull;
-constexpr uint64_t kThunkBase = 0x6F00000000ull;  // HLE function addresses (never mapped)
-constexpr uint64_t kThunkSize = 0x100000ull;
+constexpr uint64_t kKernelBase = 0x6A00000000ull;
+constexpr uint64_t kThunkBase = 0x6F00000000ull;
+#endif
+// kKernelBase: TLS pages, main thread stack (memory we hand out). kThunkBase: HLE function addresses (never mapped).
 
 void memory_init();
 bool commit(uint64_t addr, uint64_t size);   // make [addr, addr+size) read/write
@@ -82,6 +93,8 @@ struct HleRegistrar {
 #define NX_HLE(sym, fn) static ::nx::HleRegistrar NX_HLE_CAT(hle_reg_, __LINE__)(sym, fn)
 
 uint64_t hle_address(const char* name);  // thunk address; unknown names get a logging stub
+uint64_t hle_address_or(const char* name, HleFn fallback);  // unknown names get `fallback`
+const char* hle_current_name();  // inside an HLE function: the name its thunk was made for
 HleFn hle_lookup(const char* name);
 
 // Call guest code at `addr` on context c (args already in x0..).
