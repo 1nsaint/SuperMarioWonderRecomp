@@ -1,6 +1,7 @@
 // Kernel objects shared by kernel.cpp and ipc.cpp.
 #pragma once
 
+#include <condition_variable>
 #include <memory>
 #include <string>
 
@@ -33,6 +34,7 @@ struct KThread : KObject {
     uint32_t wait_result = 0;
     uint64_t wait_mutex = 0, wait_key = 0, wait_addr = 0;
     uint32_t wait_tag = 0;
+    std::condition_variable_any cv;  // this thread's own wake-up (with the kernel lock)
     bool signaled() const override { return exited; }
 };
 

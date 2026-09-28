@@ -24,7 +24,7 @@ constexpr uint32_t kPseudoCurrentThread = 0xFFFF8000;
 constexpr uint32_t kPseudoCurrentProcess = 0xFFFF8001;
 
 std::recursive_mutex g_k;              // the "kernel lock"
-std::condition_variable_any g_cv;      // any change of waitable state
+std::vector<KThread*> g_sync_waiters;  // threads in WaitSynchronization: woken by any change of waitable state
 std::unordered_map<uint32_t, std::shared_ptr<KObject>> g_handles;
 uint32_t g_next_handle = 0x10000;
 std::atomic<uint64_t> g_next_thread_id{0x50};
@@ -61,7 +61,13 @@ void handle_close(uint32_t h) {
     g_handles.erase(h);
 }
 
-void notify_all() { g_cv.notify_all(); }
+// A waitable object changed (event signalled, thread exited...): wake the threads waiting on objects, only them.
+// Mutex, condition variable and address waiters are woken one by one (wake()): one global condition variable woke
+// every waiting thread of the process on each signal (the engine's job system broadcasts all the time).
+void notify_all() {
+    std::lock_guard lk(g_k);
+    for (KThread* t : g_sync_waiters) t->cv.notify_one();
+}
 
 KThread* self_thread() { return t_self; }
 
@@ -95,11 +101,18 @@ NX_HLE("_ZN2nn2os13GetSystemTickEv", hle_get_system_tick);
 // Wait (with g_k held) until `self->wake` or timeout (ns, <0 = forever). Returns false on timeout.
 static bool block(std::unique_lock<std::recursive_mutex>& lk, KThread* self, int64_t timeout_ns) {
     if (timeout_ns < 0) {
-        g_cv.wait(lk, [&] { return self->wake; });
+        self->cv.wait(lk, [&] { return self->wake; });
         return true;
     }
     auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
-    return g_cv.wait_until(lk, until, [&] { return self->wake; });
+    return self->cv.wait_until(lk, until, [&] { return self->wake; });
+}
+
+// Wake a blocked thread (with g_k held).
+static void wake(KThread* t) {
+    t->wake = true;
+    t->wait_result = 0;
+    t->cv.notify_one();
 }
 
 static void remove(std::vector<KThread*>& v, KThread* t) { v.erase(std::remove(v.begin(), v.end(), t), v.end()); }
@@ -128,9 +141,7 @@ static void unlock_mutex(uint64_t addr) {
     }
     remove(g_mutex_waiters, next);
     store32(addr, next->wait_tag | (more ? kHandleWaitMask : 0));
-    next->wake = true;
-    next->wait_result = 0;
-    notify_all();
+    wake(next);
 }
 
 // ---- svc implementations --------------------------------------------------------------------------------------
@@ -191,8 +202,7 @@ static uint32_t svc_signal_process_wide_key(uint64_t key, int32_t count) {
             uint32_t v = load32(t->wait_mutex);
             if (v == 0) {
                 if (!cas32(t->wait_mutex, 0, t->wait_tag)) continue;
-                t->wake = true;
-                t->wait_result = 0;
+                wake(t);
                 break;
             }
             if (!(v & kHandleWaitMask) && !cas32(t->wait_mutex, v, v | kHandleWaitMask)) continue;
@@ -202,7 +212,6 @@ static uint32_t svc_signal_process_wide_key(uint64_t key, int32_t count) {
     }
     bool others = std::any_of(g_cv_waiters.begin(), g_cv_waiters.end(), [&](KThread* t) { return t->wait_key == key; });
     if (!others) store32(key, 0);
-    notify_all();
     return 0;
 }
 
@@ -245,11 +254,9 @@ static int wake_addr(uint64_t addr, int32_t count) {
             continue;
         }
         g_addr_waiters.erase(g_addr_waiters.begin() + i);
-        t->wake = true;
-        t->wait_result = 0;
+        wake(t);
         n++;
     }
-    notify_all();
     return n;
 }
 
@@ -296,6 +303,11 @@ static uint32_t svc_wait_synchronization(CPU& c, uint64_t handles, int32_t count
     auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout < 0 ? 0 : timeout);
     KThread* self = t_self;
     self->cancel = false;
+    g_sync_waiters.push_back(self);
+    struct Leave {
+        KThread* t;
+        ~Leave() { remove(g_sync_waiters, t); }
+    } leave{self};
     for (;;) {
         int i = ready();
         if (i >= 0) {
@@ -309,8 +321,8 @@ static uint32_t svc_wait_synchronization(CPU& c, uint64_t handles, int32_t count
         }
         if (timeout == 0) return 0xEA01;
         if (timeout < 0)
-            g_cv.wait(lk);
-        else if (g_cv.wait_until(lk, until) == std::cv_status::timeout && ready() < 0)
+            self->cv.wait(lk);
+        else if (self->cv.wait_until(lk, until) == std::cv_status::timeout && ready() < 0)
             return 0xEA01;
     }
 }
@@ -630,17 +642,16 @@ void svc(CPU& c, uint32_t imm, uint64_t pc) {
             }
             // Yield (0, -1, -2). On the Switch a thread yielding in a loop only takes time nobody else wants; here
             // each yield is a syscall on a real core (the network thread polls a flag this way and burned a whole
-            // core, heating the phone). Many yields in a row (64 within 1 ms of each other): sleep 0.2 ms.
+            // core, heating the phone). Past 32 yields in a row (each within 2 ms of the last), every yield sleeps
+            // 0.5 ms until the thread does something else for a while.
             KThread* t = t_self;
             uint64_t now = plat::monotonic_ns();
-            if (now - t->last_yield > 1'000'000) t->yields = 0;
-            t->last_yield = now;
-            if (++t->yields < 64) {
+            if (now - t->last_yield > 2'000'000) t->yields = 0;
+            if (++t->yields <= 32)
                 plat::yield();
-            } else {
-                t->yields = 0;
-                plat::sleep_ns(200'000);
-            }
+            else
+                plat::sleep_ns(500'000);
+            t->last_yield = plat::monotonic_ns();
             return;
         }
         case 0x0C: {  // GetThreadPriority(handle) -> prio
