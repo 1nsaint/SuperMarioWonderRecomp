@@ -4,6 +4,18 @@ Static recompilation of Nintendo Switch 1 games (AArch64) to native PC, CPU and 
 
 No game data here. Everything derived from the game, keys and firmware stays in `private/` (gitignored). Bring your own legally dumped copy.
 
+## Status
+
+**Hades boots to the main menu natively on PC**: the CPU code is recompiled (main + Nintendo's SDK, 3.0M AArch64
+instructions), the game's own Vulkan renderer (The Forge) runs on the host GPU through generated bridges, no
+emulation anywhere. RTX 3050 laptop, 1280x720, 143 fps (vsync).
+
+| Logo | Main menu |
+|---|---|
+| ![logo](docs/media/first-frame-logo.png) | ![menu](docs/media/main-menu.png) |
+
+Next: input into the menu and gameplay, audio output, native resolution. See the phase issues.
+
 ## Approach
 
 Hades' `main` module imports everything it needs from the system by name: libc/libc++, `nn::*` SDK functions and **Vulkan** (100 `vk*` entry points; `subsdk0` is Nintendo's Vulkan driver). So:
