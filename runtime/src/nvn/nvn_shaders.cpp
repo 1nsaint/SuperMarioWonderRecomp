@@ -192,7 +192,9 @@ void set_c0_offset(NvnMeaning& m, ShaderStage stage, int byte_offset) {
     m.c0_offset = byte_offset;
     m.source = NvnSource::Unknown;
     m.index = -1;
-    auto in = [&](int base, int count) { return byte_offset >= base && byte_offset < base + 0x10 * count && (byte_offset - base) % 0x10 == 0; };
+    auto in = [&](int base, int count) {
+        return byte_offset >= base && byte_offset < base + 0x10 * count && (byte_offset - base) % 0x10 == 0;
+    };
     if (stage == ShaderStage::Compute) {
         if (in(0x210, 16)) m.source = NvnSource::UniformAsStorage, m.index = (byte_offset - 0x210) / 0x10;
         else if (in(0x310, 16)) m.source = NvnSource::StorageBuffer, m.index = (byte_offset - 0x310) / 0x10;
@@ -448,12 +450,15 @@ bool reflect_spirv(const uint32_t* words, size_t count, ShaderReflection& out, s
             b.type = storage ? DescriptorType::StorageBuffer : DescriptorType::UniformBuffer;
         } else if (t->op == OpTypeSampledImage) {
             b.image = image_shape(t->w.empty() ? nullptr : type(t->w[0]));
-            b.type = b.image.dim == kDimBuffer ? DescriptorType::UniformTexelBuffer : DescriptorType::CombinedImageSampler;
+            b.type = b.image.dim == kDimBuffer ? DescriptorType::UniformTexelBuffer
+                                               : DescriptorType::CombinedImageSampler;
         } else if (t->op == OpTypeImage) {
             b.image = image_shape(t);
             bool storage = b.image.sampled == 2;
-            b.type = b.image.dim == kDimBuffer ? (storage ? DescriptorType::StorageTexelBuffer : DescriptorType::UniformTexelBuffer)
-                                               : (storage ? DescriptorType::StorageImage : DescriptorType::SampledImage);
+            if (b.image.dim == kDimBuffer)
+                b.type = storage ? DescriptorType::StorageTexelBuffer : DescriptorType::UniformTexelBuffer;
+            else
+                b.type = storage ? DescriptorType::StorageImage : DescriptorType::SampledImage;
         } else if (t->op == OpTypeSampler) {
             b.type = DescriptorType::Sampler;
         } else {
@@ -474,7 +479,7 @@ bool reflect_spirv(const uint32_t* words, size_t count, ShaderReflection& out, s
     return true;
 }
 
-// ---- harness records --------------------------------------------------------------------------------------------------
+// ---- harness records ------------------------------------------------------------------------------------------------
 
 bool parse_harness_resources(std::string_view text, std::vector<HarnessResource>& out) {
     out.clear();
@@ -501,7 +506,8 @@ bool parse_harness_resources(std::string_view text, std::vector<HarnessResource>
             r.kind = HarnessResource::Storage;
             size_t plus = lhs.find("+0x"), close = lhs.find(']');
             if (plus == std::string_view::npos || close == std::string_view::npos) return false;
-            if (!parse_uint(lhs.substr(4, plus - 4), 10, r.bank) || !parse_uint(lhs.substr(plus + 3, close - plus - 3), 16, r.word))
+            if (!parse_uint(lhs.substr(4, plus - 4), 10, r.bank) ||
+                !parse_uint(lhs.substr(plus + 3, close - plus - 3), 16, r.word))
                 return false;
         } else if (lhs.substr(0, 3) == "tex" || lhs.substr(0, 3) == "img") {
             // tex<type>[c<slot>:<handle>(x<n>)]
@@ -603,17 +609,21 @@ std::string describe_like_harness(const ShaderReflection& refl) {
         tmp[0] = 0;
         switch (b.type) {
         case DescriptorType::UniformBuffer:
-            if (m.source != NvnSource::SupportBuffer) std::snprintf(tmp, sizeof tmp, "cb%d=s%ub%u", m.bank, b.set, b.binding);
+            if (m.source != NvnSource::SupportBuffer)
+                std::snprintf(tmp, sizeof tmp, "cb%d=s%ub%u", m.bank, b.set, b.binding);
             break;
         case DescriptorType::StorageBuffer:
-            if (m.c0_offset >= 0) std::snprintf(tmp, sizeof tmp, "sb[c0+0x%x]=s%ub%u", m.c0_offset / 4, b.set, b.binding);
-            else std::snprintf(tmp, sizeof tmp, "sb[?]=s%ub%u", b.set, b.binding);
+            if (m.c0_offset >= 0)
+                std::snprintf(tmp, sizeof tmp, "sb[c0+0x%x]=s%ub%u", m.c0_offset / 4, b.set, b.binding);
+            else
+                std::snprintf(tmp, sizeof tmp, "sb[?]=s%ub%u", b.set, b.binding);
             break;
         default: {
             bool image = b.type == DescriptorType::StorageImage || b.type == DescriptorType::StorageTexelBuffer;
             std::string arr = b.count != 1 ? "x" + std::to_string(b.count) : "";
-            std::snprintf(tmp, sizeof tmp, "%s%s[c%d:%d%s]=s%ub%u", image ? "img" : "tex", sampler_type_text(b.image).c_str(),
-                          m.default_bank ? -1 : m.bank, m.word, arr.c_str(), b.set, b.binding);
+            std::snprintf(tmp, sizeof tmp, "%s%s[c%d:%d%s]=s%ub%u", image ? "img" : "tex",
+                          sampler_type_text(b.image).c_str(), m.default_bank ? -1 : m.bank, m.word, arr.c_str(), b.set,
+                          b.binding);
         }
         }
         if (!tmp[0]) continue;
@@ -623,7 +633,7 @@ std::string describe_like_harness(const ShaderReflection& refl) {
     return out;
 }
 
-// ---- support buffer --------------------------------------------------------------------------------------------------
+// ---- support buffer -------------------------------------------------------------------------------------------------
 
 SupportBuffer support_buffer_defaults() {
     SupportBuffer sb;
@@ -699,7 +709,7 @@ const char* source_name(NvnSource s) {
     }
 }
 
-// ---- the runtime cache ------------------------------------------------------------------------------------------------
+// ---- the runtime cache ----------------------------------------------------------------------------------------------
 #ifndef NX_SHADERS_STANDALONE
 
 static_assert(uint32_t(DescriptorType::Sampler) == VK_DESCRIPTOR_TYPE_SAMPLER &&
@@ -775,7 +785,8 @@ const ShaderInfo* shader_for(uint64_t code_host, uint64_t control) {
     auto res = k.resources.find(hash);
     auto info = std::make_unique<ShaderInfo>();
     std::string error;
-    if (!make_shader_info(code, ctrl, std::move(words), res == k.resources.end() ? nullptr : &res->second, *info, &error)) {
+    const std::string* record = res == k.resources.end() ? nullptr : &res->second;
+    if (!make_shader_info(code, ctrl, std::move(words), record, *info, &error)) {
         log("nvn: shader %s: %s", hash.c_str(), error.c_str());
         return nullptr;
     }

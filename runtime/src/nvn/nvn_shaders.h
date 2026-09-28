@@ -176,7 +176,8 @@ std::string sampler_type_text(const ImageShape& s);  // Ryujinx SamplerType text
 // MIT License, Copyright (c) Ryujinx Team and Contributors. Every field is a 16-byte vec4 slot.
 //
 // With the answers the harness baked (TRANSLATOR.md, "What only the runtime knows") Wonder's SPIR-V reads only
-// render_scale (texture size queries and texel fetches, gl_FragCoord.xy): with all scales 1 those are identities.
+// render_scale (texture size queries, texel fetches, gl_FragCoord.xy; 3,390 shaders) and frag_scale_count (183 vertex
+// shaders index their scales past the fragment ones): with every scale 1 those reads are identities.
 // viewport_* are read only by variants with viewport transform disabled or Y negate, is_bgra only when the host has
 // no BGRA formats (Vulkan has), alpha_test never (the alpha test is baked into the shader from the graphics state).
 struct SupportBuffer {

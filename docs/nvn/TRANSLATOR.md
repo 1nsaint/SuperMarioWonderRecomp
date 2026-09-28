@@ -280,3 +280,49 @@ the N5 validation plan: run shaders in isolation, and compare frames against a r
 Reproducible outputs in `private/wonder/`: `spirv/` (SPIR-V, `results.tsv`, `summary.txt`),
 `spirv_results_noretry.tsv` and `spirv_summary_noretry.txt` (the first-pass numbers), `spirv_debug/summary.txt`
 (the DebugMode pass), `msl/` and `msl_check.log`.
+
+## Runtime side
+
+`runtime/src/nvn/nvn_shaders.{h,cpp}` is what the pipeline builder uses. `shader_for(code_host, control)` reads the
+code block size at control +0x704, hashes the block (SHA-1, first 16 hex digits), loads
+`<data root>/spirv/<hash>.spv` once and returns a `ShaderInfo`: the SPIR-V words, the stage (from its execution
+model), a reflection of the module, the constant data `c[1]` (control +0x700 offset, +0x6fc size) and the compute
+work-group size (control +0x748). Call it when the program is set and keep the pointer: hashing is a pass over the
+block.
+
+The reflection reads the SPIR-V itself: descriptor bindings with their Vulkan type, vertex input and fragment output
+locations with their component type, built-ins. The NVN meaning of each binding comes from the translator's names
+and numbers (`ResourceManager.cs`), which follow the scheme above:
+
+| SPIR-V binding | Name | NVN |
+|---|---|---|
+| set 0, binding 0 | `support_buffer` | the support buffer, filled by us (below) |
+| set 0, `slot × 18 + 1 + k` | `<st>_c<k>` | `c[0]` driver constants, `c[1]` constant data, `c[3+n]` uniform block *n* |
+| set 1, `slot × 16 + i` | `<st>_s<i>` | the buffer whose descriptor is at a `c[0]` offset: graphics `0x110 + 0x100 × stage + 0x10 × n` = storage binding *n*; compute `0x210 + 0x10 × n` = uniform block *n*, `0x310 + 0x10 × n` = storage binding *n* |
+| set 2, `slot × 128 + i` | `<st>_t_tcb_<w>` | handle at `c[2]` word *w* (hex): sampler binding `(w - 8) / 2` |
+| set 2 | `<st>_t_cb<k>_<w>` | a handle the game wrote into uniform block `k - 3`, at byte `4w` |
+| set 3, `slot × 32 + i` | `<st>_i_cb2_<w>_<fmt>` | image binding `(w - 72) / 2` (inferred: `c[2]` 0x120 + 8n) |
+
+`<st>` is `vp`, `fp` or `cp`. `slot` is 0 for vertex and compute, 1 for fragment. The only fact the SPIR-V does not
+carry is the `c[0]` offset of a storage buffer (the name gives only the translator's slot), so the runtime reads it
+from the `resources` column of `spirv/results.tsv`. Once the harness serializes `ShaderProgramInfo` (next step 2),
+read that file instead.
+
+`tests/shader_cache_test.cpp` runs the same code standalone. On all 47,797 manifest stages the size at +0x704, the
+constant data fields and the hash agree with the extraction. On all 12,717 shaders the reflected bindings, described
+the way the harness does, equal the `resources` column, and every binding gets a meaning. Counts: 42,315 uniform
+blocks, 6,756 `c[1]`, 32 `c[0]`, 34,361 sampler-binding textures, 2,393 textures with handles in uniform blocks
+(`c[4]`, `c[6]`, `c[7]`, `c[8]`), 63 images, 498 storage buffers and 145 compute uniform blocks read as storage. All
+vertex inputs and fragment outputs are float `vec4` (the baked default). Every shader declares the support buffer.
+
+**Support buffer** (std140, 0x570 bytes, layout from Ryujinx's `SupportBuffer.cs`, MIT): `alpha_test` 0x000,
+`is_bgra[8]` 0x010, `viewport_inverse` 0x090, `viewport_size` 0x0a0, `frag_scale_count` 0x0b0, `render_scale[73]`
+0x0c0 (x only: render target, 64 textures, 8 images), `tfe_offset` 0x550, `tfe_vertex_count` 0x560. With the baked
+defaults, Wonder's shaders read only `render_scale` (3,390 shaders) and `frag_scale_count` (183 vertex shaders,
+to index their texture scales). With every scale at 1.0 those reads are identities, whatever the count.
+`support_buffer_defaults()` returns exactly that.
+
+```sh
+clang++ -std=c++20 -O2 -DNX_SHADERS_STANDALONE -Iruntime/src/nvn tests/shader_cache_test.cpp \
+    runtime/src/nvn/nvn_shaders.cpp -o private/build/shader_cache_test && private/build/shader_cache_test private/wonder
+```
