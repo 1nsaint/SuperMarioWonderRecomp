@@ -148,13 +148,6 @@ void BufferInvalidateMappedRange(CPU&) {}
 
 // ---- textures ---------------------------------------------------------------------------------------------------
 
-struct Texture : Object {
-    uint32_t target = 0, format = 0, flags = 0, levels = 0, samples = 0, depth_stencil_mode = 0;
-    uint32_t width = 0, height = 0, depth = 0, stride = 0;
-    uint64_t pool = 0, offset = 0, storage_size = 0;
-    uint64_t memory = 0, gpu = 0;
-};
-
 void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBuilder*)
     uint64_t guest = c.x[0], builder = c.x[1];
     auto& t = make<Texture>(guest);

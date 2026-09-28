@@ -37,18 +37,18 @@ std::atomic<uint64_t> g_presents{0};
 
 void QueueInitialize(CPU& c) { c.x[0] = 1; }  // NVNboolean (NVNqueue*, const NVNqueueBuilder*)
 void QueueFinalize(CPU&) {}
-void QueueSubmitCommands(CPU&) {}  // (NVNqueue*, int count, const NVNcommandHandle*)
+void QueueSubmitCommands(CPU& c) {  // (NVNqueue*, int count, const NVNcommandHandle*)
+    std::vector<std::shared_ptr<CmdList>> lists;
+    for (uint32_t k = 0; k < uint32_t(c.x[1]); k++)
+        if (auto l = command_list(ld<uint64_t>(c.x[2] + 8 * k))) lists.push_back(std::move(l));
+    gpu_submit(lists);
+}
 void QueueFlush(CPU&) {}
 void QueueFinish(CPU&) {}
 void QueueFenceSync(CPU& c) { signal_sync(c.x[1]); }  // (NVNqueue*, NVNsync*, NVNsyncCondition, int flags)
 void QueueWaitSync(CPU& c) { c.x[0] = 1; }            // NVNboolean (NVNqueue*, const NVNsync*)
 
 // ---- windows ----------------------------------------------------------------------------------------------------
-
-struct Window : Object {
-    std::vector<uint64_t> textures;  // guest NVNtexture*
-    int active = 0, next = 0, interval = 1;
-};
 
 void WindowInitialize(CPU& c) {  // NVNboolean (NVNwindow*, const NVNwindowBuilder*)
     uint64_t guest = c.x[0], builder = c.x[1];
@@ -102,19 +102,12 @@ void WindowSetPresentInterval(CPU& c) {
 
 // (NVNqueue*, NVNwindow*, int textureIndex)
 void QueuePresentTexture(CPU& c) {
+    if (auto* w = get<Window>(c.x[1]))
+        if (int(c.x[2]) >= 0 && size_t(c.x[2]) < w->textures.size()) gpu_present(w->textures[size_t(c.x[2])]);
     uint64_t n = ++g_presents;
     if (n == 1 || (n & (n - 1)) == 0) log("nvn: present #%llu (texture %d)", (unsigned long long)n, int(c.x[2]));
     g_frame++;
 }
-
-// ---- command buffers --------------------------------------------------------------------------------------------
-
-std::atomic<uint64_t> g_next_handle{1};
-
-void CommandBufferInitialize(CPU& c) { c.x[0] = 1; }  // NVNboolean (NVNcommandBuffer*, NVNdevice*)
-void CommandBufferFinalize(CPU&) {}
-void CommandBufferBeginRecording(CPU&) {}
-void CommandBufferEndRecording(CPU& c) { c.x[0] = g_next_handle++; }  // NVNcommandHandle
 
 }  // namespace
 
@@ -137,9 +130,5 @@ NX_HLE("nvnWindowGetNumActiveTextures", WindowGetNumActiveTextures);
 NX_HLE("nvnWindowSetNumActiveTextures", WindowSetNumActiveTextures);
 NX_HLE("nvnWindowGetPresentInterval", WindowGetPresentInterval);
 NX_HLE("nvnWindowSetPresentInterval", WindowSetPresentInterval);
-NX_HLE("nvnCommandBufferInitialize", CommandBufferInitialize);
-NX_HLE("nvnCommandBufferFinalize", CommandBufferFinalize);
-NX_HLE("nvnCommandBufferBeginRecording", CommandBufferBeginRecording);
-NX_HLE("nvnCommandBufferEndRecording", CommandBufferEndRecording);
 
 }  // namespace nx::nvn

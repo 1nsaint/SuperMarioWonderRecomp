@@ -68,6 +68,9 @@ set(NX_RUNTIME_SOURCES
     runtime/src/nvn/nvn_texture_layout.cpp
     runtime/src/nvn/nvn_program.cpp
     runtime/src/nvn/nvn_queue.cpp
+    runtime/src/nvn/nvn_cmd.cpp
+    runtime/src/nvn/nvn_format.cpp
+    runtime/src/nvn/nvn_vk.cpp
     runtime/src/vk_bridge.cpp
     runtime/src/vk_gen.cpp
     runtime/src/vk_present.cpp

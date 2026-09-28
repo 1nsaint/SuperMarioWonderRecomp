@@ -13,8 +13,11 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <nx/runtime.h>
+
+#include "vk_bridge.h"  // Vulkan headers without prototypes; the dispatch table is vk_gen.h
 
 namespace nx::nvn {
 
@@ -72,6 +75,46 @@ uint64_t gpu_alloc(uint64_t size);
 MemoryPool* pool_at_gpu(uint64_t gpu, uint64_t* offset);
 void pool_register(MemoryPool* pool);
 void pool_unregister(MemoryPool* pool);
+
+// ---- textures and windows ---------------------------------------------------------------------------------------
+
+struct GpuImage;  // the Vulkan side of a texture (nvn_vk.cpp)
+
+struct Texture : Object {
+    uint32_t target = 0, format = 0, flags = 0, levels = 0, samples = 0, depth_stencil_mode = 0;
+    uint32_t width = 0, height = 0, depth = 0, stride = 0;
+    uint64_t pool = 0, offset = 0, storage_size = 0;
+    uint64_t memory = 0, gpu = 0;
+    std::shared_ptr<GpuImage> image;  // made on first use by the GPU
+};
+
+struct Window : Object {
+    std::vector<uint64_t> textures;  // guest NVNtexture*
+    int active = 0, next = 0, interval = 1;
+};
+
+// NVNformat -> VkFormat, and whether it is color (0), depth (1), stencil (2) or both (3) (nvn_format.cpp).
+VkFormat vk_format(uint32_t format);
+uint32_t format_aspect(uint32_t format);
+
+// ---- recorded commands ----------------------------------------------------------------------------------------
+// A command buffer records into a list of these; nvnQueueSubmitCommands replays the lists into Vulkan.
+
+struct Cmd {
+    enum Op : uint8_t { SetRenderTargets, ClearColor, ClearDepthStencil, SetViewport, SetScissor, CallList } op;
+    uint32_t n = 0, mask = 0;
+    uint64_t a[9] = {};  // textures (render targets: colors then depth), command handles, ...
+    float f[4] = {};
+    int32_t i[4] = {};
+};
+using CmdList = std::vector<Cmd>;
+
+std::shared_ptr<CmdList> command_list(uint64_t handle);  // a recorded handle's commands (nvn_cmd.cpp)
+
+// ---- the GPU (nvn_vk.cpp) -------------------------------------------------------------------------------------
+
+void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists);
+void gpu_present(uint64_t texture);  // guest NVNtexture* of a window texture
 
 // Bytes a texture built from `builder` occupies in its pool (nvn_texture_layout.cpp).
 uint64_t texture_storage_size(CPU& c, uint64_t builder);

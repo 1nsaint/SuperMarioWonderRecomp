@@ -221,6 +221,7 @@ void* create_window() {
             log_line(SDL_GetError());
             return;
         }
+        SDL_RaiseWindow(g_window);  // a process without an app bundle does not come to the front on its own
         g_view = SDL_Metal_CreateView(g_window);
         g_layer = SDL_Metal_GetLayer(g_view);
         int pw = 0, ph = 0;
