@@ -2706,8 +2706,6 @@ NX_HLE("vkDestroySurfaceKHR", w_vkDestroySurfaceKHR);
 
 
 PFN_vkDestroySwapchainKHR p_vkDestroySwapchainKHR = nullptr;
-static void w_vkDestroySwapchainKHR(CPU& c) { p_vkDestroySwapchainKHR(arg<VkDevice>(c.x[0]), arg<VkSwapchainKHR>(c.x[1]), nullptr); }
-NX_HLE("vkDestroySwapchainKHR", w_vkDestroySwapchainKHR);
 
 
 
@@ -4041,8 +4039,6 @@ NX_HLE("vkGetSwapchainCounterEXT", w_vkGetSwapchainCounterEXT);
 
 
 PFN_vkGetSwapchainImagesKHR p_vkGetSwapchainImagesKHR = nullptr;
-static void w_vkGetSwapchainImagesKHR(CPU& c) { c.x[0] = ret_u64(p_vkGetSwapchainImagesKHR(arg<VkDevice>(c.x[0]), arg<VkSwapchainKHR>(c.x[1]), arg<uint32_t*>(c.x[2]), arg<VkImage*>(c.x[3]))); }
-NX_HLE("vkGetSwapchainImagesKHR", w_vkGetSwapchainImagesKHR);
 
 
 

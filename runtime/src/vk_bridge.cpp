@@ -31,7 +31,7 @@ const std::unordered_set<std::string> kSpecial = {
     "vkCreateDebugReportCallbackEXT", "vkDestroyInstance", "vkEnumeratePhysicalDevices",
     "vkDestroyDebugUtilsMessengerEXT", "vkDestroyDebugReportCallbackEXT", "vkGetPhysicalDeviceQueueFamilyProperties",
     "vkGetPhysicalDeviceQueueFamilyProperties2", "vkGetPhysicalDeviceQueueFamilyProperties2KHR", "vkQueuePresentKHR", "vkGetDeviceQueue", "vkCreateSwapchainKHR",
-    "vkAcquireNextImageKHR",
+    "vkAcquireNextImageKHR", "vkGetSwapchainImagesKHR", "vkDestroySwapchainKHR",
 };
 
 void load_loader() {
@@ -270,14 +270,82 @@ void w_vkCreateViSurfaceNN(CPU& c) {  // (instance, const VkViSurfaceCreateInfoN
 
 // ---- screenshots: NX_SCREENSHOT=<frame>[,<frame>...] writes private/captures/frame_<n>.bmp ---------------------
 
+// Hades keeps its per-frame command pools and buffers in fixed arrays of 3 (main+26e428), indexed by the swapchain
+// image index. Hosts that hand out more images (Android: 4+) get a virtual swapchain: the game sees 3 plain images
+// and each present copies the rendered one into the host image acquired for it.
+constexpr uint32_t kMaxGuestImages = 3;
+
 struct SwapchainInfo {
     VkDevice device;
     VkFormat format;
     VkExtent2D extent;
-    std::vector<VkImage> images;
+    uint32_t layers = 1;
+    std::vector<VkImage> images;  // what the game sees (the virtual images when `virt`)
+    // Virtual swapchain.
+    bool virt = false;
+    std::vector<VkImage> host;           // the host swapchain's images
+    std::vector<VkDeviceMemory> memory;  // of the virtual images
+    std::vector<uint32_t> host_of;       // virtual index -> host index acquired for it
+    uint32_t next = 0;                   // next virtual index to hand out
+    std::vector<VkSemaphore> copied;     // per host image: its copy is done, present may start
+    VkCommandPool pool = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> cmds;  // ring of copy command buffers
+    std::vector<VkFence> fences;
+    uint32_t slot = 0;
 };
 std::unordered_map<uint64_t, SwapchainInfo> g_swapchains;
 std::unordered_map<uint64_t, std::pair<VkDevice, uint32_t>> g_queues;  // queue -> (device, family)
+
+uint32_t find_memory_type(VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFlags want) {
+    VkPhysicalDeviceMemoryProperties mp;
+    p_vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+        if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
+    return 0;
+}
+
+void destroy_virtual(SwapchainInfo& s) {
+    if (!s.virt) return;
+    p_vkDeviceWaitIdle(s.device);
+    for (VkImage i : s.images) p_vkDestroyImage(s.device, i, nullptr);
+    for (VkDeviceMemory m : s.memory) p_vkFreeMemory(s.device, m, nullptr);
+    for (VkSemaphore x : s.copied) p_vkDestroySemaphore(s.device, x, nullptr);
+    for (VkFence f : s.fences) p_vkDestroyFence(s.device, f, nullptr);
+    if (s.pool) p_vkDestroyCommandPool(s.device, s.pool, nullptr);
+}
+
+// Plain images with the swapchain's format, size and usage, standing in for the host swapchain's images.
+bool make_virtual(SwapchainInfo& s, const VkSwapchainCreateInfoKHR& ci) {
+    s.virt = true;
+    s.images.assign(kMaxGuestImages, VK_NULL_HANDLE);
+    s.memory.assign(kMaxGuestImages, VK_NULL_HANDLE);
+    s.host_of.assign(kMaxGuestImages, 0);
+    for (uint32_t k = 0; k < kMaxGuestImages; k++) {
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.imageType = VK_IMAGE_TYPE_2D;
+        ii.format = ci.imageFormat;
+        ii.extent = {ci.imageExtent.width, ci.imageExtent.height, 1};
+        ii.mipLevels = 1;
+        ii.arrayLayers = ci.imageArrayLayers;
+        ii.samples = VK_SAMPLE_COUNT_1_BIT;
+        ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.usage = ci.imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (p_vkCreateImage(s.device, &ii, nullptr, &s.images[k]) != VK_SUCCESS) return false;
+        VkMemoryRequirements mr;
+        p_vkGetImageMemoryRequirements(s.device, s.images[k], &mr);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size;
+        mai.memoryTypeIndex = find_memory_type(g_physical, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (p_vkAllocateMemory(s.device, &mai, nullptr, &s.memory[k]) != VK_SUCCESS) return false;
+        p_vkBindImageMemory(s.device, s.images[k], s.memory[k], 0);
+    }
+    VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    s.copied.assign(s.host.size(), VK_NULL_HANDLE);
+    for (VkSemaphore& x : s.copied) p_vkCreateSemaphore(s.device, &sci, nullptr, &x);
+    return true;
+}
 
 void w_vkGetDeviceQueue(CPU& c) {  // (device, family, index, VkQueue*)
     VkQueue q = VK_NULL_HANDLE;
@@ -295,6 +363,8 @@ void w_vkCreateSwapchainKHR(CPU& c) {  // (device, const VkSwapchainCreateInfoKH
         p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_physical, ci.surface, &caps);
         if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
             ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;  // for screenshots
+        if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+            ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;  // for a virtual swapchain's copies
         if (!(caps.supportedCompositeAlpha & ci.compositeAlpha))
             for (VkCompositeAlphaFlagBitsKHR a : {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
                                                    VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR})
@@ -321,12 +391,38 @@ void w_vkCreateSwapchainKHR(CPU& c) {  // (device, const VkSwapchainCreateInfoKH
         s.device = arg<VkDevice>(c.x[0]);
         s.format = ci.imageFormat;
         s.extent = ci.imageExtent;
+        s.layers = ci.imageArrayLayers;
         uint32_t n = 0;
         p_vkGetSwapchainImagesKHR(s.device, sc, &n, nullptr);
-        s.images.resize(n);
-        p_vkGetSwapchainImagesKHR(s.device, sc, &n, s.images.data());
+        s.host.resize(n);
+        p_vkGetSwapchainImagesKHR(s.device, sc, &n, s.host.data());
+        s.images = s.host;
+        if (n > kMaxGuestImages) {
+            if (!(ci.imageUsage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) || !make_virtual(s, ci))
+                fatal("swapchain has %u images, the game handles %u, and no virtual swapchain could be made", n,
+                      kMaxGuestImages);
+            log("vk: %u host swapchain images, the game sees %u (copied on present)", n, kMaxGuestImages);
+        }
     }
     c.x[0] = ret_u64(r);
+}
+
+void w_vkGetSwapchainImagesKHR(CPU& c) {  // (device, swapchain, uint32_t* count, VkImage*)
+    auto it = g_swapchains.find(c.x[1]);
+    if (it == g_swapchains.end()) {
+        c.x[0] = ret_u64(p_vkGetSwapchainImagesKHR(arg<VkDevice>(c.x[0]), arg<VkSwapchainKHR>(c.x[1]),
+                                                   arg<uint32_t*>(c.x[2]), arg<VkImage*>(c.x[3])));
+        return;
+    }
+    c.x[0] = ret_u64(enumerate(it->second.images, c.x[2], c.x[3]));
+}
+
+void w_vkDestroySwapchainKHR(CPU& c) {  // (device, swapchain, alloc)
+    if (auto it = g_swapchains.find(c.x[1]); it != g_swapchains.end()) {
+        destroy_virtual(it->second);
+        g_swapchains.erase(it);
+    }
+    p_vkDestroySwapchainKHR(arg<VkDevice>(c.x[0]), arg<VkSwapchainKHR>(c.x[1]), nullptr);
 }
 
 std::vector<uint64_t> screenshot_frames() {
@@ -337,14 +433,6 @@ std::vector<uint64_t> screenshot_frames() {
             if (*p == ',') p++;
         }
     return v;
-}
-
-uint32_t find_memory_type(VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFlags want) {
-    VkPhysicalDeviceMemoryProperties mp;
-    p_vkGetPhysicalDeviceMemoryProperties(pd, &mp);
-    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
-        if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
-    return 0;
 }
 
 // Copies the image about to be presented into a host buffer (waiting on the game's semaphores and signalling a
@@ -466,10 +554,127 @@ void wait_while_minimized() {
 
 void w_vkAcquireNextImageKHR(CPU& c) {  // (device, swapchain, timeout, semaphore, fence, uint32_t* index)
     wait_while_minimized();
+    // The game's semaphore and fence go to the host acquire: they signal when the host image is free, which is
+    // what the copy on present writes. The game gets the next virtual image.
+    auto it = g_swapchains.find(c.x[1]);
+    SwapchainInfo* s = it != g_swapchains.end() && it->second.virt ? &it->second : nullptr;
+    uint32_t host = 0;
     VkResult r = p_vkAcquireNextImageKHR(arg<VkDevice>(c.x[0]), arg<VkSwapchainKHR>(c.x[1]), c.x[2],
-                                         arg<VkSemaphore>(c.x[3]), arg<VkFence>(c.x[4]), arg<uint32_t*>(c.x[5]));
+                                         arg<VkSemaphore>(c.x[3]), arg<VkFence>(c.x[4]),
+                                         s ? &host : arg<uint32_t*>(c.x[5]));
+    if (s && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)) {
+        uint32_t v = s->next;
+        s->next = (v + 1) % kMaxGuestImages;
+        s->host_of[v] = host;
+        st<uint32_t>(c.x[5], v);
+    }
     if (r != VK_SUCCESS) log("vkAcquireNextImageKHR -> %d", r);
     c.x[0] = ret_u64(r);
+}
+
+// Records and submits the copies of a present's virtual images into their host images: waits on the game's
+// semaphores, signals the per-host-image `copied` semaphores the host present waits on instead, and rewrites the
+// image indices to the host ones.
+void copy_virtual(VkQueue queue, VkPresentInfoKHR& pi, std::vector<uint32_t>& indices, std::vector<VkSemaphore>& waits) {
+    SwapchainInfo* first = nullptr;
+    for (uint32_t k = 0; k < pi.swapchainCount; k++) {
+        auto it = g_swapchains.find(reinterpret_cast<uint64_t>(pi.pSwapchains[k]));
+        if (it != g_swapchains.end() && it->second.virt) {
+            first = &it->second;
+            break;
+        }
+    }
+    if (!first) return;
+    VkDevice dev = first->device;
+    if (!first->pool) {
+        auto q = g_queues.find(reinterpret_cast<uint64_t>(queue));
+        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = q != g_queues.end() ? q->second.second : 0;
+        p_vkCreateCommandPool(dev, &pci, nullptr, &first->pool);
+        first->cmds.resize(kMaxGuestImages);
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = first->pool;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = kMaxGuestImages;
+        p_vkAllocateCommandBuffers(dev, &cai, first->cmds.data());
+        first->fences.resize(kMaxGuestImages);
+        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        for (VkFence& f : first->fences) p_vkCreateFence(dev, &fci, nullptr, &f);
+    }
+    uint32_t slot = first->slot;
+    first->slot = (slot + 1) % kMaxGuestImages;
+    VkFence fence = first->fences[slot];
+    VkCommandBuffer cb = first->cmds[slot];
+    p_vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
+    p_vkResetFences(dev, 1, &fence);
+    p_vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    p_vkBeginCommandBuffer(cb, &bi);
+
+    indices.assign(pi.pImageIndices, pi.pImageIndices + pi.swapchainCount);
+    std::vector<VkSemaphore> signals;
+    for (uint32_t k = 0; k < pi.swapchainCount; k++) {
+        auto it = g_swapchains.find(reinterpret_cast<uint64_t>(pi.pSwapchains[k]));
+        if (it == g_swapchains.end() || !it->second.virt) continue;
+        SwapchainInfo& s = it->second;
+        uint32_t v = indices[k], h = s.host_of[v];
+        VkImage src = s.images[v], dst = s.host[h];
+        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, s.layers};
+        auto barrier = [&](VkImage img, VkAccessFlags sa, VkAccessFlags da, VkImageLayout from, VkImageLayout to) {
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.srcAccessMask = sa;
+            b.dstAccessMask = da;
+            b.oldLayout = from;
+            b.newLayout = to;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = img;
+            b.subresourceRange = range;
+            return b;
+        };
+        VkImageMemoryBarrier pre[2] = {
+            barrier(src, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+            barrier(dst, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+        };
+        p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                               nullptr, 2, pre);
+        VkImageCopy region{};
+        region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, s.layers};
+        region.extent = {s.extent.width, s.extent.height, 1};
+        p_vkCmdCopyImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                         &region);
+        // The virtual image goes back to the layout the game left it in; later work on it (next frames) waits
+        // for the copy through this barrier.
+        VkImageMemoryBarrier post[2] = {
+            barrier(src, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
+            barrier(dst, VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
+        };
+        p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                               nullptr, 2, post);
+        indices[k] = h;
+        signals.push_back(s.copied[h]);
+    }
+    p_vkEndCommandBuffer(cb);
+
+    std::vector<VkPipelineStageFlags> stages(pi.waitSemaphoreCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.waitSemaphoreCount = pi.waitSemaphoreCount;
+    si.pWaitSemaphores = pi.pWaitSemaphores;
+    si.pWaitDstStageMask = stages.data();
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    si.signalSemaphoreCount = uint32_t(signals.size());
+    si.pSignalSemaphores = signals.data();
+    p_vkQueueSubmit(queue, 1, &si, fence);
+    waits = std::move(signals);
+    pi.waitSemaphoreCount = uint32_t(waits.size());
+    pi.pWaitSemaphores = waits.data();
+    pi.pImageIndices = indices.data();
 }
 
 void w_vkQueuePresentKHR(CPU& c) {
@@ -481,6 +686,9 @@ void w_vkQueuePresentKHR(CPU& c) {
     VkPresentInfoKHR pi = *arg<const VkPresentInfoKHR*>(c.x[1]);
     VkSemaphore extra = VK_NULL_HANDLE;
     if (std::find(shots.begin(), shots.end(), frames + 1) != shots.end()) capture(queue, pi, frames + 1, extra);
+    std::vector<uint32_t> host_indices;
+    std::vector<VkSemaphore> copied;
+    copy_virtual(queue, pi, host_indices, copied);
     VkResult r = p_vkQueuePresentKHR(queue, &pi);
     nx::g_frame = frames + 1;
     if (extra) {
@@ -518,6 +726,8 @@ NX_HLE("vkQueuePresentKHR", w_vkQueuePresentKHR);
 NX_HLE("vkAcquireNextImageKHR", w_vkAcquireNextImageKHR);
 NX_HLE("vkGetDeviceQueue", w_vkGetDeviceQueue);
 NX_HLE("vkCreateSwapchainKHR", w_vkCreateSwapchainKHR);
+NX_HLE("vkGetSwapchainImagesKHR", w_vkGetSwapchainImagesKHR);
+NX_HLE("vkDestroySwapchainKHR", w_vkDestroySwapchainKHR);
 NX_HLE("vkCreateDebugUtilsMessengerEXT", w_create_debug_callback);
 NX_HLE("vkCreateDebugReportCallbackEXT", w_create_debug_callback);
 NX_HLE("vkDestroyDebugUtilsMessengerEXT", w_destroy_debug_callback);
