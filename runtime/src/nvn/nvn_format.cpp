@@ -43,7 +43,10 @@ constexpr Entry kFormats[] = {
     /* 0x39 */ {VK_FORMAT_A4B4G4R4_UNORM_PACK16, 0}, {VK_FORMAT_A1R5G5B5_UNORM_PACK16, 0},
     /* 0x3b */ {VK_FORMAT_A1R5G5B5_UNORM_PACK16, 0}, {VK_FORMAT_R5G6B5_UNORM_PACK16, 0},
     /* 0x3d */ {VK_FORMAT_A2B10G10R10_UNORM_PACK32, 0}, {VK_FORMAT_A2B10G10R10_UINT_PACK32, 0},
-    /* 0x3f */ {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 0}, {VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, 0},
+    // 0x3f R11G11B10F becomes RGBA16F: Maxwell stores negative/NaN results of blending as 0 in this unsigned float
+    // format, Metal writes Inf/NaN, and the NaN spread through every later pass (bloom, the dialog's frosted-glass
+    // blur: green screens). Twice the bandwidth, same values otherwise.
+    /* 0x3f */ {VK_FORMAT_R16G16B16A16_SFLOAT, 0}, {VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, 0},
     /* 0x41 */ {VK_FORMAT_BC1_RGB_UNORM_BLOCK, 0}, {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 0}, {VK_FORMAT_BC2_UNORM_BLOCK, 0},
     /* 0x44 */ {VK_FORMAT_BC3_UNORM_BLOCK, 0}, {VK_FORMAT_BC1_RGB_SRGB_BLOCK, 0}, {VK_FORMAT_BC1_RGBA_SRGB_BLOCK, 0},
     /* 0x47 */ {VK_FORMAT_BC2_SRGB_BLOCK, 0}, {VK_FORMAT_BC3_SRGB_BLOCK, 0},

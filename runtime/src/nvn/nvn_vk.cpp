@@ -626,9 +626,28 @@ void gpu_submit(CPU&, const std::vector<std::shared_ptr<CmdList>>& lists) {
     if (uint64_t n = draw_take_dump_request(); n && dump_every() && n % dump_every() == 0) debug_dump_textures(n);
 }
 
+// Headless: the presented texture is only counted, logged and dumped (no swapchain).
+void present_headless(uint64_t texture) {
+    if (!begin()) return;
+    GpuImage* src = image_of(texture);
+    static uint64_t presents = 0;
+    presents++;
+    if (presents % (presents < 300 ? 60 : 300) == 0) draw_log_stats();
+    if (presents % 60 == 0) log_timing(60), gpu_profile_log(60);
+    bool dump = false;
+    if (src && src->layout != VK_IMAGE_LAYOUT_UNDEFINED && dump_every() && presents % dump_every() == 0) {
+        transition(g_cb, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        dump = readback_record(*src);
+    }
+    end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);
+    if (dump) readback_write(*src, presents);
+    if (dump_every() && presents % dump_every() == 0) debug_dump_textures(presents);
+}
+
 void gpu_present(uint64_t texture) {
     std::lock_guard lk(g_gpu);
     if (!init()) return;
+    if (plat::headless()) return present_headless(texture);
     if (plat::window_minimized()) return;
     if (!g_swapchain && !make_swapchain()) return;
     uint32_t index = 0;

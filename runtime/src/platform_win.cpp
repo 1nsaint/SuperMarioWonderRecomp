@@ -222,6 +222,11 @@ void screen_size(uint32_t& w, uint32_t& h) { window_size(w, h); }
 
 static bool key(int vk) { return g_window && GetForegroundWindow() == g_window && (GetAsyncKeyState(vk) & 0x8000); }
 
+bool headless() {  // NX_HEADLESS (platform.h)
+    static const bool on = std::getenv("NX_HEADLESS") != nullptr;
+    return on;
+}
+
 void read_pad(PadState& p) {
     XINPUT_STATE xs{};
     if (XInputGetState(0, &xs) == ERROR_SUCCESS) {

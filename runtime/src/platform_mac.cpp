@@ -209,6 +209,11 @@ std::string setting(const std::string& key) {
 
 // ---- window ---------------------------------------------------------------------------------------------------
 
+bool headless() {
+    static const bool on = std::getenv("NX_HEADLESS") != nullptr;
+    return on;
+}
+
 void* create_window() {
     run_on_main([] {
         if (g_window) return;
@@ -216,12 +221,13 @@ void* create_window() {
         std::string r = setting("resolution");
         if (!r.empty()) std::sscanf(r.c_str(), "%dx%d", &w, &h);
         g_window = SDL_CreateWindow(nx::game::kInfo.title, w, h,
-                                    SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_METAL);
+                                    SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_METAL |
+                                        (headless() ? SDL_WINDOW_HIDDEN : 0));
         if (!g_window) {
             log_line(SDL_GetError());
             return;
         }
-        SDL_RaiseWindow(g_window);  // a process without an app bundle does not come to the front on its own
+        if (!headless()) SDL_RaiseWindow(g_window);  // without an app bundle it does not come to the front
         g_view = SDL_Metal_CreateView(g_window);
         g_layer = SDL_Metal_GetLayer(g_view);
         int pw = 0, ph = 0;

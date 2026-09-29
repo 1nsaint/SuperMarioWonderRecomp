@@ -531,7 +531,8 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     static uint64_t traced = 0;
     // NX_TRACE_FS_HASH=<hash>: only draws with that fragment shader.
     static const char* fs_env = std::getenv("NX_TRACE_FS_HASH");
-    if (trace_env && g_stats.done >= trace_from && traced < 80 && (!trace_target || t.colors[0] == trace_target) &&
+    static const uint64_t trace_count = std::getenv("NX_TRACE_COUNT") ? std::strtoull(std::getenv("NX_TRACE_COUNT"), nullptr, 10) : 80;
+    if (trace_env && g_stats.done >= trace_from && traced < trace_count && (!trace_target || t.colors[0] == trace_target) &&
         (!fs_env || (fs && fs->hash == fs_env))) {
         traced++;
         std::string tex;

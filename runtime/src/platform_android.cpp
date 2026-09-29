@@ -1,3 +1,4 @@
+#include <cstdlib>
 // Android host (NativeActivity): memory (mmap at fixed addresses), pthreads, the app's window (ANativeWindow),
 // game controllers + touch, AAudio, the Vulkan loader and android surface, a signal crash handler and
 // android_main. Game data lives in the app's external files dir (see docs/ANDROID.md):
@@ -459,6 +460,11 @@ int32_t on_input(android_app*, AInputEvent* e) {
     return 1;
 }
 }  // namespace
+
+bool headless() {  // NX_HEADLESS (platform.h)
+    static const bool on = std::getenv("NX_HEADLESS") != nullptr;
+    return on;
+}
 
 void read_pad(PadState& p) {
     std::lock_guard lk(g_in);
