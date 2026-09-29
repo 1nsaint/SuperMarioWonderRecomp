@@ -9,6 +9,7 @@
 //   SetDepthRanges(cmd, first, count, const float* {near, far})
 //   SetRasterizerDiscard(cmd, NVNboolean), SetRenderEnable(cmd, NVNboolean)
 // Only viewport/scissor/depth range 0 are replayed (one viewport).
+#include <atomic>
 #include <cmath>
 #include <cstring>
 
@@ -56,6 +57,9 @@ void SetViewports(CPU& c) {
     Cmd cmd{Cmd::SetViewport};
     for (int k = 0; k < 4; k++) cmd.i[k] = int32_t(std::lround(ld<float>(c.x[3] + 4ull * k)));
     record(c.x[0], cmd);
+    static std::atomic<int> logged{0};
+    if ((cmd.i[3] < 0 || cmd.i[2] < 0) && logged++ < 10)
+        log("nvn: SetViewports with a negative size: %d %d %d %d", cmd.i[0], cmd.i[1], cmd.i[2], cmd.i[3]);
 }
 
 void SetScissors(CPU& c) {
@@ -81,6 +85,19 @@ void SetRasterizerDiscard(CPU& c) {
 void SetRenderEnable(CPU& c) {
     Cmd cmd{Cmd::SetRenderEnable};
     cmd.n = uint32_t(c.x[1] & 1);
+    record(c.x[0], cmd);
+    static std::atomic<uint64_t> counts[2];
+    uint64_t n = ++counts[cmd.n];
+    if (n == 1 || n % 5000 == 0)
+        log("nvn: SetRenderEnable(%u) x%llu", cmd.n, (unsigned long long)n);
+}
+
+// SetRenderEnableConditional(cmd, NVNconditionalRenderMode, NVNbufferAddress): rendering on or off from values the
+// GPU wrote (occlusion results). Treated as "on": drawing what might have been culled is only extra work, while
+// staying off after a SetRenderEnable(false) dropped whole passes.
+void SetRenderEnableConditional(CPU& c) {
+    Cmd cmd{Cmd::SetRenderEnable};
+    cmd.n = 1;
     record(c.x[0], cmd);
 }
 
@@ -136,5 +153,6 @@ NX_HLE("nvnCommandBufferSetScissors", SetScissors);
 NX_HLE("nvnCommandBufferSetDepthRanges", SetDepthRanges);
 NX_HLE("nvnCommandBufferSetRasterizerDiscard", SetRasterizerDiscard);
 NX_HLE("nvnCommandBufferSetRenderEnable", SetRenderEnable);
+NX_HLE("nvnCommandBufferSetRenderEnableConditional", SetRenderEnableConditional);
 
 }  // namespace nx::nvn

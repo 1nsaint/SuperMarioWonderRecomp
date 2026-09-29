@@ -182,6 +182,9 @@ void SetViewport(CPU& c) {
     Cmd cmd{Cmd::SetViewport};
     for (int k = 0; k < 4; k++) cmd.i[k] = int32_t(c.x[1 + k]);
     record(c.x[0], cmd);
+    static std::atomic<int> logged{0};
+    if ((cmd.i[3] < 0 || cmd.i[2] < 0) && logged++ < 10)
+        log("nvn: SetViewport with a negative size: %d %d %d %d", cmd.i[0], cmd.i[1], cmd.i[2], cmd.i[3]);
 }
 
 void SetScissor(CPU& c) {

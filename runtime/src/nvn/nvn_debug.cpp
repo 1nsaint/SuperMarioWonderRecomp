@@ -258,4 +258,73 @@ void gpu_profile_log(uint64_t frames) {
     g_totals.clear();
 }
 
+// ---- mid-frame snapshots (NX_SNAP_DRAWS=<draw>,<draw>,...) -------------------------------------------------------
+// Right after each listed draw (numbers as NX_TRACE_DRAWS prints them), colour target 0 is blitted to RGBA8 in the
+// same command buffer; after the submit each copy is written to frames/snap_<draw>.ppm. Shows a frame being built.
+
+namespace {
+
+struct Snap {
+    Scratch s;
+    uint32_t w = 0, h = 0;
+    uint64_t draw = 0;
+};
+std::vector<Snap> g_snaps;
+
+}  // namespace
+
+bool debug_snap_wanted(uint64_t draw) {
+    static const std::vector<uint64_t> list = [] {
+        std::vector<uint64_t> v;
+        const char* e = std::getenv("NX_SNAP_DRAWS");
+        while (e && *e) {
+            char* end = nullptr;
+            uint64_t n = std::strtoull(e, &end, 10);
+            if (end == e) break;
+            v.push_back(n);
+            e = *end == ',' ? end + 1 : end;
+        }
+        return v;
+    }();
+    return std::find(list.begin(), list.end(), draw) != list.end();
+}
+
+void debug_snapshot(VkCommandBuffer cb, GpuImage& img, uint64_t draw) {
+    if (!img.image || !(img.aspect & VK_IMAGE_ASPECT_COLOR_BIT)) return;
+    Snap snap;
+    snap.w = img.width, snap.h = img.height, snap.draw = draw;
+    if (!make_scratch(snap.s, snap.w, snap.h)) {
+        snap.s.destroy(vk_device());
+        return;
+    }
+    VkImageLayout back = img.layout;
+    transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    GpuImage dst;
+    dst.image = snap.s.image;
+    dst.format = VK_FORMAT_R8G8B8A8_UNORM;
+    transition(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = {int32_t(snap.w), int32_t(snap.h), 1};
+    blit.dstSubresource = blit.srcSubresource;
+    blit.dstOffsets[1] = blit.srcOffsets[1];
+    p_vkCmdBlitImage(cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, snap.s.image,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    transition(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy r{};
+    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.imageExtent = {snap.w, snap.h, 1};
+    p_vkCmdCopyImageToBuffer(cb, snap.s.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, snap.s.buffer, 1, &r);
+    if (back != VK_IMAGE_LAYOUT_UNDEFINED) transition(cb, img, back);
+    g_snaps.push_back(snap);
+}
+
+void debug_snapshots_write() {  // after the submit's fence
+    for (Snap& snap : g_snaps) {
+        write_ppm(snap.s, snap.w, snap.h, 0, snap.draw);  // frames/00000_<draw in hex>.ppm
+        snap.s.destroy(vk_device());
+    }
+    g_snaps.clear();
+}
+
 }  // namespace nx::nvn

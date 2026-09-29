@@ -299,10 +299,9 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = key.polygon.mode == 0 ? VK_POLYGON_MODE_POINT : key.polygon.mode == 1 ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
     rs.cullMode = vk_cull(key.polygon.cull);
-    // NVNfrontFace CW 0 / CCW 1 is in the GL sense (y up). Wonder sets the upper-left window origin, where the
-    // hardware negates y like Vulkan does, so a face the game calls CCW is wound CW in Vulkan's framebuffer: with
-    // the enum taken as is, the fullscreen composite was culled and the window kept its guest memory (magenta).
-    rs.frontFace = key.polygon.front == 0 ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+    // NVNfrontFace CW 0 / CCW 1, taken as is: the draws use a negative-height viewport (nvn_draw.cpp) that gives NVN's
+    // upper-left-origin mapping, so windings match NVN's.
+    rs.frontFace = key.polygon.front == 0 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.0f;
 
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -313,6 +312,10 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     ds.depthTestEnable = has_depth && key.depth.depth_test;
     ds.depthWriteEnable = has_depth && key.depth.depth_write;
     ds.depthCompareOp = vk_compare(key.depth.depth_func);
+    // EQUAL after a depth pre-pass (the colour pass does not write depth) needs both passes to compute bit-identical
+    // depth; two translated shaders compiled separately by Metal do not, and Wonder's whole course colour pass was
+    // discarded (only the sky showed). LESS_OR_EQUAL keeps what EQUAL keeps for opaque geometry after a pre-pass.
+    if (key.depth.depth_func == 3 && !key.depth.depth_write) ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
     ds.stencilTestEnable = has_depth && key.depth.stencil_test;
     VkStencilOpState* faces[2] = {&ds.front, &ds.back};
     for (int f = 0; f < 2; f++) {

@@ -465,6 +465,11 @@ void replay(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth) {
                 transition(cb, *img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 img->rendered = true;
                 VkClearDepthStencilValue v{c.f[0], uint32_t(c.i[0])};
+                if (std::getenv("NX_TRACE_DRAWS")) {
+                    static int logged = 0;
+                    if (logged++ < 40) log("clear depth %llx (%ux%u) to %g stencil %d mask %x", (unsigned long long)st.depth,
+                                           img->width, img->height, c.f[0], c.i[0], c.mask);
+                }
                 VkImageSubresourceRange r{img->aspect, std::min<uint32_t>(st.views.level[8], img->levels - 1), 1,
                                           std::min<uint32_t>(st.views.layer[8], img->layers - 1), 1};
                 p_vkCmdClearDepthStencilImage(cb, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);

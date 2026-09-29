@@ -8,7 +8,8 @@ from a small harness on the code blocks that `tools/maxwell/containers.py` extra
 **Result in one line:** every one of Wonder's 12,717 distinct Maxwell programs (47,797 stages) translates to SPIR-V
 that passes `spirv-val` for Vulkan 1.2, and all 12,717 also go through SPIRV-Cross to Metal and compile on the M1.
 Ryujinx does 95.8% of the blocks (98.1% of the stages) as it is. The rest hit two bugs in its SPIR-V back end, which
-the harness works around.
+the harness works around. A third back-end bug produced valid but wrong code (`else if` chains, 793 blocks); the
+harness builds the translator with a patch for it.
 
 Everything here was measured on our own cartridge dump (1.0.0, 010015100B514000). The translator source is not
 vendored: it lives in `private/third_party/` like the game data, and the harness references it by path.
@@ -31,14 +32,16 @@ $DOTNET_ROOT/dotnet build tools/maxwell/spirv_harness/SpirvHarness.csproj -c Rel
 H="$DOTNET_ROOT/dotnet private/build/spirv_harness/bin/Release/net10.0/spirv_harness.dll"
 ```
 
-Build products go to `private/build/spirv_harness/` (set in the harness's `Directory.Build.props`). The Ryujinx
-projects build inside their own checkout.
+Build products go to `private/build/spirv_harness/` (set in the harness's `Directory.Build.props`; one `obj/<project>`
+per project). `Ryujinx.Common` and `Spv.Generator` build inside their own checkout; the translator itself is built by
+`translator/` (below). The build needs `patch` (macOS has it).
 
 ## The harness (`tools/maxwell/spirv_harness/`)
 
 | File | What |
 |---|---|
-| `SpirvHarness.csproj` | a console program; one `ProjectReference` to `Ryujinx.Graphics.Shader.csproj` in `private/third_party` |
+| `SpirvHarness.csproj` | a console program; one `ProjectReference` to `translator/Ryujinx.Graphics.Shader.csproj` |
+| `translator/` | builds `Ryujinx.Graphics.Shader` from the sources in `private/third_party`, with our patches (`*.patch`) applied to copies under `private/build`; the checkout is never modified. See *Local patches* |
 | `StaticGpuAccessor.cs` | our implementation of the translator's `IGpuAccessor`, the interface through which it asks "the GPU" for everything it cannot read from the code |
 | `Program.cs` | single-stage and batch modes, `spirv-val`, the summary |
 | `msl_check.swift` | compiles Metal source with the system Metal compiler (the MoltenVK-path check) |
@@ -133,6 +136,66 @@ No texture access was dropped: no "failed to find handle source for bindless acc
    declares them with `Unknown` format, but it never emits `OpCapability StorageImageReadWithoutFormat` /
    `StorageImageWriteWithoutFormat`. Drivers tend to accept this; `spirv-val` does not. **Workaround:** the harness
    inserts both capabilities after the module header when the shader uses images.
+
+### Silent miscompile: `else if` chains (fixed by a local patch)
+
+`spirv-val` cannot see this one: the module is valid, it just computes the wrong thing. Found through the dialog
+text, which drew nothing (glyph vertex shaders `a106c763cf05f818` and `2fc962d8d063c1c9`, `exefs` group).
+
+**What the Maxwell code does.** Each glyph is 64 bytes in a storage buffer; words 4..7 are its atlas rectangle
+(u0, v0, u1, v1). The corner number picks which of the four words become the texture coordinate, through a
+`switch` the compiler turned into a jump table in the block's own constant data (`c[1]`):
+
+```
+0x348  IADD32I R12, R12, -1            ; flag from c[1] (x: word 16 + 8 * corner, y: word 20 + 8 * corner)
+0x350  IMNMX.U32 R12, R12, 2           ; clamp to the table
+0x358  SHL R12, R12, 2
+0x368  LDC R12, c[1][R12 + 0xc0]       ; words 48..50: 0x378, 0x390, 0x3a0
+0x370  BRX R12                         ; jump to program start + R12
+0x378  MOV R1, R5 ; BRK                ; case 1: v0
+0x390  MOV R1, R6 ; BRK                ; case 2: u1
+0x3a8  MOV R1, R7 ; BRK                ; case 3: v1
+```
+
+(flag 0 skips the switch and takes R4 = u0.) So 0x378, 0x390, 0x3a0 and 0x450, 0x430, 0x440 are **code offsets**:
+`BRX` targets, in bytes from the start of the program (after the SPH). 0x450 in the second table is the `SYNC` after
+the `v` switch, i.e. "keep R5". The corner flags in `c[1]` are x = {0, 2, 0, 2}, y = {1, 3, 1, 3}: corners
+(u0,v0), (u1,v0), (u0,v1), (u1,v1).
+
+**Decoder: right.** Ryujinx follows the pattern (`Decoder.FindBrxTargetRange`: `IMNMX.U32` / `SHL 2` /
+`LDC c[1]`), reads the table through `IGpuAccessor.ConstantBuffer1Read` (our constant data) and finds all three
+targets. `InstEmitFlowControl.Brx` turns them into `if (R12 == 0x378) ... else if (R12 == 0x390) ... else ...`. The
+GLSL back end prints exactly that.
+
+**SPIR-V back end: wrong.** With expression propagation on (not in DebugMode), `AstOptimizer.RemoveEmptyBlocks`
+turns an `else` whose only content is an `if` into an `AstBlockType.ElseIf` block. `SpirvGenerator` does not know
+that block type: the `If` before it branches to its merge block when false, and the `ElseIf` gets no condition and no
+incoming edge. Every `else if` and the final `else` of a chain become unreachable code. Here that left only the
+first case (`== 888`, `== 1072`); corners that needed u1 got a position value and those that needed v1 got v0, so
+most of each glyph quad sampled empty atlas.
+
+**Fix** (`translator/spirv-else-if.patch`, about 60 lines in `SpirvGenerator.Generate`): each `ElseIf` is emitted as a
+nested selection. Its first label is the header (the previous condition's false target), it gets its own merge
+block, and at the end of the chain the merge blocks branch outwards, innermost first. Upstream candidate.
+
+**Reach.** 793 of the 12,751 blocks (8,760 stages) had unreachable blocks, all of them from this, all translated on
+the first attempt (DebugMode output has no `ElseIf`): agl 378 (365 fragment), effects 367 (281 vertex, 57 fragment,
+29 compute), secred 24, layouts 21, `exefs` 3 (the two glyph shaders and `395389fe95f3f4b1`). Not only jump tables:
+any `if / else if` the optimizer produced. After the patch, a full batch leaves the other 11,958 `.spv` byte for byte
+the same, no module has an unreachable block, all 12,751 pass `spirv-val`, and the 793 go through SPIRV-Cross to MSL
+and compile with Metal. The previous files are kept next to the new ones as `private/wonder/spirv/<hash>.spv.orig`
+(and `results.tsv.orig`).
+
+Finding them again: a label that no branch, merge or phi instruction names (other than a function's first) is dead
+code, and Ryujinx's back end emits none otherwise.
+
+### Local patches
+
+`translator/Ryujinx.Graphics.Shader.csproj` compiles the translator's sources straight from
+`private/third_party/ryubing` under its own assembly name, except each file named by a `ShaderPatch` item: that one
+is copied to `private/build/spirv_harness/obj/Ryujinx.Graphics.Shader/patched/`, patched with `patch`, and compiled
+from there. To add a fix, add a `.patch` (paths as in the Ryujinx tree) and a `ShaderPatch` line. Bug 1 above could
+move here the same way.
 
 ### Metal check
 

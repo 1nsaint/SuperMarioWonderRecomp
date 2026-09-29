@@ -425,6 +425,21 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     if (!skip.empty() && fs && skip.find(fs->hash) != std::string::npos) return false;
     const ProgramLayout& layout = program_layout(*shaders);
 
+    // NX_SNAP_FS_BEFORE=<hash>[@<first draw>]: snapshot colour target 0 before draws with that fragment shader
+    // (what a feedback pass like a tonemap reads), 8 at most.
+    {
+        static const std::string before = std::getenv("NX_SNAP_FS_BEFORE") ? std::getenv("NX_SNAP_FS_BEFORE") : "";
+        static const uint64_t from = before.find('@') != std::string::npos
+                                         ? std::strtoull(before.c_str() + before.find('@') + 1, nullptr, 10) : 0;
+        static int taken = 0;
+        if (!before.empty() && fs && before.compare(0, 16, fs->hash) == 0 && g_stats.total >= from && taken < 8 &&
+            t.color_count && t.colors[0])
+            if (GpuImage* img = image_of(t.colors[0])) {
+                taken++;
+                draw_end_rendering(cb);
+                debug_snapshot(cb, *img, 0xB0000000ull + g_stats.total);
+            }
+    }
     // Textures first: an upload or a layout change cannot happen inside the render pass.
     std::vector<std::pair<const ShaderInfo*, const DescriptorBinding*>> tex_bindings;
     std::vector<uint64_t> handles;
@@ -494,6 +509,12 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     if (g_state.has_viewport)
         vp = {float(g_state.viewport[0]), float(g_state.viewport[1]), float(g_state.viewport[2]),
               float(g_state.viewport[3]), g_state.depth_near, g_state.depth_far};
+    // NVN's upper-left window origin (what Wonder sets) maps NDC +Y to the top of the render target, like D3D;
+    // Vulkan maps it to the bottom. A negative-height viewport gives NVN's mapping, and with it NVN's front faces.
+    // (Before this, the front face was inverted instead: triangles were culled right, but every render target was
+    // upside down, which the post chain undid in some scenes and not in others: the first course showed a
+    // mirrored sky.)
+    vp.y += vp.height, vp.height = -vp.height;
     VkRect2D sc{{0, 0}, g_pass_extent};
     if (g_state.has_scissor)
         sc = {{std::max(0, g_state.scissor[0]), std::max(0, g_state.scissor[1])},
@@ -528,6 +549,15 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         p_vkCmdDraw(cb, uint32_t(c.i[1]), uint32_t(std::max(1, c.i[3])), uint32_t(c.i[0]), uint32_t(c.i[2]));
     }
     g_stats.done++;
+    // NX_SNAP_FS=<hash>,<hash>[@<first draw>]: also snapshot after draws with those fragment shaders (8 at most).
+    static const std::string snap_fs = std::getenv("NX_SNAP_FS") ? std::getenv("NX_SNAP_FS") : "";
+    static const uint64_t snap_from = snap_fs.find('@') != std::string::npos
+                                          ? std::strtoull(snap_fs.c_str() + snap_fs.find('@') + 1, nullptr, 10) : 0;
+    static int snap_count = 0;
+    bool snap_by_fs = !snap_fs.empty() && fs && g_stats.done >= snap_from && snap_count < 8 &&
+                      snap_fs.find(fs->hash) != std::string::npos && ++snap_count;
+    if ((snap_by_fs || debug_snap_wanted(g_stats.done)) && t.color_count && t.colors[0])
+        if (GpuImage* snap = image_of(t.colors[0])) draw_end_rendering(cb), debug_snapshot(cb, *snap, g_stats.done);
     // NX_DUMP_ON_TARGET=<hex NVNtexture*>: every NX_DUMP_FRAMES-th draw into it asks for NX_DUMP_TEXTURES to be read
     // back right after this submit (before later frames change them).
     static const char* dump_env = std::getenv("NX_DUMP_ON_TARGET");
@@ -562,6 +592,20 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                           tx && tx->image && tx->image->rendered ? " rt" : "");
             tex += b;
         }
+        if (std::getenv("NX_TRACE_VS_BLOCKS"))
+            if (const Range& u = g_state.uniforms[0][0]; u.address)
+                if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
+                    for (int row = 0; row < std::min<int>(int(u.size / 16), 24); row++)
+                        log("  vs c3[%d]: %g %g %g %g", row, f[4 * row], f[4 * row + 1], f[4 * row + 2], f[4 * row + 3]);
+        for (int blk = 1; blk <= 3 && std::getenv("NX_TRACE_VS_BLOCKS"); blk++)
+            if (const Range& u = g_state.uniforms[0][blk]; u.address)
+                if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
+                    log("  vs c%d: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", blk + 3, f[0], f[1], f[2], f[3],
+                        f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+        if (const Range& u = g_state.uniforms[0][0]; u.address)
+            if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
+                log("  vs c3 @%llx: %g %g %g %g | %g %g %g %g", (unsigned long long)u.address, f[0], f[1], f[2], f[3], f[4],
+                    f[5], f[6], f[7]);
         if (const Range& u = g_state.uniforms[1][0]; u.address)
             if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
                 for (uint64_t k = 0; k < std::min<uint64_t>(u.size / 16, 8); k++)
@@ -617,6 +661,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         log("  blend %u (%u %u %u %u eq %u %u) mask %x logic %x alpha %x fmt %d", g_state.color.blend_enable[0], b0.src_rgb,
             b0.dst_rgb, b0.src_a, b0.dst_a, b0.eq_rgb, b0.eq_a, g_state.mask.mask[0], g_state.color.logic_op,
             g_state.color.alpha_test, t.colors[0] ? int(image_of(t.colors[0])->format) : -1);
+        log("  depth func %u write %u", g_state.depth.depth_func, g_state.depth.depth_write);
         log("  viewport %d %d %d %d (%d) scissor %d %d %d %d (%d) cull %u front %u depth %g..%g test %u", g_state.viewport[0],
             g_state.viewport[1], g_state.viewport[2], g_state.viewport[3], g_state.has_viewport, g_state.scissor[0],
             g_state.scissor[1], g_state.scissor[2], g_state.scissor[3], g_state.has_scissor, g_state.polygon.cull,
@@ -630,7 +675,8 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
 
 }  // namespace
 
-void draw_end_submit() {  // after the submit's fence: compute results to guest memory
+void draw_end_submit() {  // after the submit's fence: compute results to guest memory, debug snapshots
+    debug_snapshots_write();
     for (const WriteBack& w : g_write_backs) std::memcpy(w.to, w.from, w.size);
     g_write_backs.clear();
 }

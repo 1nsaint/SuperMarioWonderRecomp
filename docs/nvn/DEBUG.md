@@ -31,6 +31,10 @@ Everything below is switched on with environment variables on the normal build: 
 | `NX_TRACE_COUNT=<n>` | how many draws `NX_TRACE_DRAWS` logs (default 80) | nvn_draw.cpp |
 | `NX_TRACE_GLYPHS=1` | with the draw trace: the first glyph records of text draws, the atlas memory at their UVs, the sampler | nvn_draw.cpp |
 | `NX_SWAP_FS=<from>:<to>` | draws with fragment shader `<from>` use `<to>` (already loaded): shows what a draw covers | nvn_draw.cpp |
+| `NX_SNAP_DRAWS=<n>,<n>` | mid-frame snapshots: colour target 0 right after those draws → `frames/00000_<draw hex>.ppm` (use `seq -f %.0f`: macOS `seq` prints big numbers in scientific notation) | nvn_debug.cpp |
+| `NX_SNAP_FS=<hash>,...[@<draw>]` | snapshots after draws with those fragment shaders (8 at most), from draw `<draw>` on | nvn_draw.cpp |
+| `NX_SNAP_FS_BEFORE=<hash>[@<draw>]` | snapshot of colour target 0 *before* such a draw (what a feedback pass like a tonemap reads) | nvn_draw.cpp |
+| `NX_TRACE_VS_BLOCKS=1` | with the draw trace: the vertex stage's uniform blocks (camera block rows, c4..c6) | nvn_draw.cpp |
 | `NX_TRACE_UPLOADS=1` | uploads of big textures, with how much of their memory is non-zero | nvn_pipeline.cpp |
 
 Always on: every 60 presents `nvn/vk: per frame over 60: submits, replay ms (host), GPU wait ms, present wait ms,
@@ -119,3 +123,20 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
     register (x24) is set by an `adrp/add` on another control-flow path, 0x5000 bytes before; the linear backward
     search found an unrelated `movk`. The recompiler now tries every constant the function puts in the base register
     when the bound is known, and keeps the one whose entries all land on instructions of the function.
+17. **The first course showed a mirrored sky; the whole scene was upside down** (`NX_SNAP_DRAWS` mid-frame: the course
+    was drawn flipped, sky gradient included; the tonemap then produced half a mirrored sky). Root cause, older than
+    all of this: NVN with the upper-left window origin maps NDC +Y to the top of the render target, like D3D; Vulkan
+    maps it to the bottom. Bug #2 had been "fixed" by inverting the front face, which made culling right but left
+    every render target upside down; some scenes (the title, the opening) came out right because their post chain
+    flipped twice, the course did not. A global experiment (`NX_TMP_FLIPY`: negative-height viewports, front face as
+    is) made the title, the opening and the course all correct. Fix: every draw uses a negative-height viewport and
+    NVN's front face unchanged.
+18. **Dialog text invisible (#15) — and 792 other shaders silently wrong.** Found by a parallel investigation of the
+    offline translator: the glyph vertex shader's per-corner texture coordinates come from a Maxwell `BRX` jump table
+    (0x378/0x390/0x3a0 are jump targets, not data); Ryujinx decodes it into `if / else if / else`, and its SPIR-V back
+    end drops `else if` blocks (they become unreachable), so only the first case survived. Fixed in the harness with a
+    local patch to `SpirvGenerator.Generate` (docs/nvn/TRANSLATOR.md, "Silent miscompile: `else if` chains"); 793
+    blocks regenerated, all validated and compiled to Metal.
+19. **EQUAL depth after a pre-pass** — relaxed to LESS_OR_EQUAL when the pass does not write depth (Metal compiles the
+    pre-pass and colour-pass vertex shaders separately; bit-identical depth is not guaranteed). Kept as a safety net;
+    it was not the cause of #17.
