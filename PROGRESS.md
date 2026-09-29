@@ -23,6 +23,39 @@ NVN implemented over Vulkan (MoltenVK).
 
 ## Log
 
+### 2026-09-29 (late morning): the opening cutscene plays in 3D
+
+![Opening: the Flower Kingdom](docs/media/wonder/12-opening-flower-kingdom-3d.png)
+![Opening: hills and the airship](docs/media/wonder/13-opening-hills-airship.png)
+![Opening: the logo](docs/media/wonder/14-opening-logo.png)
+
+- The opening now runs past its dialogs: Peach's voice, the party timeline music, Kamek's airship flying over the
+  Flower Kingdom, the logo. The recompiler fix that got it there: a jump table whose base register comes from another
+  control-flow path (DEBUG.md #16). Memory stays under 4.6 GB.
+- Some frames alternate with the sky/mirrored view (to look at), dialog text still invisible.
+
+### 2026-09-29 (morning): character select, the opening, audio, a memory leak fixed
+
+![Character select](docs/media/wonder/07-character-select.png)
+![Opening, sky](docs/media/wonder/10-opening-sky.png)
+![HUD after the opening dialogs](docs/media/wonder/11-hud-after-opening.png)
+
+- **Title → file select → player count → character select → confirmation → opening cutscene → HUD.** Menus need
+  A held ~1 s (short presses were missed); the opening dialogs advance with repeated/long presses.
+- **NVN coverage**: plural and deferred binds, viewports/scissors/depth ranges, rasterizer discard and render
+  enable, `CopyTextureToTexture` (copy or blit), `DispatchCompute[Indirect]` with storage images, `c[0]` driver
+  constants (the buffer descriptor table compute shaders search; a zero table made them write garbage), texture
+  writes (`WriteTexels`), CPU-written textures re-uploaded (flushes, pitch-linear content hashes), long-lived command
+  lists kept (LRU), uniform/storage padding (Metal has no bounds checks), 256 MB upload buffer.
+- **Audio renders**: the in-process AudioRenderer only renders in the manual/CPU mode; switched after opening, frames
+  take ~250 us and streamed music is consumed (the opening waited for it).
+- **Memory leak that froze the Mac (85 GB)**: images of destroyed textures were never freed. Fixed (freed at the next
+  submit); the same run now stays at ~4.5 GB. A **memory guard** ends the process past `NX_MEM_LIMIT_GB` (default 8).
+- **Headless test runs** (`NX_HEADLESS=1`): no window, nothing presented, frames still dumped.
+- Open: dialog text is invisible (the glyph vertex shader's corner-indexed texture-coordinate load was only partly
+  resolved by the offline translator); the dialog box shows a green-cyan gradient; a second recompiler jump-table case
+  (table base defined on another control-flow path) crashed after the HUD, fixed in the recompiler.
+
 ### 2026-09-29 (early morning): 30 fps, past the title to the file select
 
 ![File select](docs/media/wonder/06-file-select.png)
@@ -193,10 +226,10 @@ layouts (`Layout/*.blarc`).
 
 ## Next
 
-1. Text rendering (the file select and every menu have none): the SDF font path.
-2. Past the file select: the opening and World 1-1 (then input to play).
+1. Past the opening into World 1-1 "Welcome to the Flower Kingdom!" (Pipe-Rock Plateau), then play it.
+2. Text: the glyph vertex shader's indexed texture-coordinate load (translator), the dialog box colours.
 3. Performance beyond 30 fps headroom: stop waiting for the GPU at every submit, cache descriptor sets.
-4. Audio to the Mac speakers; c[0] driver constants for compute; `docs/nvn/API.md`.
+4. Audio to the Mac speakers (the renderer now renders; the device sink output is next); `docs/nvn/API.md`.
 5. Split `nvn_shaders.cpp` (815 lines, over the 700-line cap).
 
 Branch: `feat/nvn-n1-wonder-cpu`, stacked on `feat/nvn-n0-core-split`.

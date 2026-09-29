@@ -262,29 +262,59 @@ def _jump_table(an, f, br):
     mem = re.match(r"\[(\w+)(?:, (\w+))?", ld_ops[1])
     if not size or not mem or not mem.group(2):
         return None
-    table = _const(an, f, a_ld, _regno(mem.group(1)))
-    if table is None or not m.in_image(table):
-        return None
+    base_reg = _regno(mem.group(1))
     idx = _regno(mem.group(2))
     count = _bound(an, f, a_ld, idx)
-    # Without a bound, take every entry that lands on an instruction of this function (up to 256): a superset only
-    # adds labels, while a missing target would be a call into the middle of the function at run time.
-    limit = count if count is not None else 256
-    out = []
-    misses = 0
-    for k in range(limit):
-        p = table + k * size
-        if p + size > len(m.image):
-            break
-        v = int.from_bytes(m.image[p:p + size], "little", signed=signed)
-        t = anchor + (v << shift)
-        if not (f.start <= t < f.end) or t not in an.insns:
-            misses += 1
-            if count is None and misses > 4:
+
+    def entries(table):
+        """(targets, misses) of the table at `table`."""
+        # Without a bound, take every entry that lands on an instruction of this function (up to 256): a superset
+        # only adds labels, while a missing target would be a call into the middle of the function at run time.
+        limit = count if count is not None else 256
+        out = []
+        misses = 0
+        for k in range(limit):
+            p = table + k * size
+            if p + size > len(m.image):
                 break
-            continue
-        out.append(t)
-    return sorted(set(out)) if out else None
+            v = int.from_bytes(m.image[p:p + size], "little", signed=signed)
+            t = anchor + (v << shift)
+            if not (f.start <= t < f.end) or t not in an.insns:
+                misses += 1
+                if count is None and misses > 4:
+                    break
+                continue
+            out.append(t)
+        return out, misses
+
+    table = _const(an, f, a_ld, base_reg)
+    if table is not None and m.in_image(table):
+        out, _ = entries(table)
+        return sorted(set(out)) if out else None
+    # The base register's last definition in address order is not a constant (control flow reaches the load from
+    # another path: Wonder's main+28b3bc takes x24 from an adrp/add 0x5000 bytes earlier, the linear search found an
+    # unrelated movk). With a known bound, try every constant the function puts in that register and keep one whose
+    # entries all land on instructions of this function.
+    if count is None:
+        return None
+    candidates = []
+    a = f.start
+    while a < f.end:
+        mn, op = an.insns.get(a, ("", ""))
+        ops = _ops(op)
+        if mn in ("adrp", "adr", "add") and ops and _regno(ops[0]) == base_reg:
+            c = _const(an, f, a + 4, base_reg)
+            if c is not None and m.in_image(c) and c not in candidates:
+                candidates.append(c)
+        a += 4
+    # Several constants can pass that test (main+28b3bc: an add x24, x23, #0x90 as well as the real adrp/add), and
+    # extra labels are harmless (a case only fires on its exact target), so the union of all of them is taken.
+    found = set()
+    for c in candidates:
+        out, misses = entries(c)
+        if out and misses == 0:
+            found.update(out)
+    return sorted(found) if found else None
 
 
 def _bound(an, f, before, idx):

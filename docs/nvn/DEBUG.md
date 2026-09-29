@@ -23,7 +23,15 @@ Everything below is switched on with environment variables on the normal build: 
 | `NX_SKIP_FS=<hash>,<hash>` | drops draws with those fragment shaders (measure what they cost, or hide a broken one) | nvn_draw.cpp |
 | `NX_INPUT_SCRIPT="<s>:<button>:<hold s>;..."` | presses buttons at times after the first pad read (A B X Y L R ZL ZR PLUS MINUS LEFT RIGHT UP DOWN; directions also push the stick) | input_script.cpp |
 | `NX_INPUT="<frame>:<button>,..."` | older, per presented frame, 8-frame presses | hle_hid.cpp |
-| `NX_TRACE_FS=1` | every file the game opens or looks for | hle_fs.cpp |
+| `NX_TRACE_FS=1` | every file the game opens or looks for; also counts reads of streamed audio (`.bwav`) | hle_fs.cpp |
+| `NX_HEADLESS=1` | no visible window, nothing presented; frames still render and dump (unattended runs) | platform_mac.cpp, nvn_vk.cpp |
+| `NX_MEM_LIMIT_GB=<n>` | the memory guard ends the process past this footprint (default 8); `memory:` lines every 30 s | memguard_mac.cpp |
+| `NX_THREAD_DUMP_AT=<s>` | once, every guest thread's call chain (frame-pointer walk) | kernel.cpp |
+| `NX_TRACE_FS_HASH=<hash>` | with `NX_TRACE_DRAWS`: only draws with that fragment shader | nvn_draw.cpp |
+| `NX_TRACE_COUNT=<n>` | how many draws `NX_TRACE_DRAWS` logs (default 80) | nvn_draw.cpp |
+| `NX_TRACE_GLYPHS=1` | with the draw trace: the first glyph records of text draws, the atlas memory at their UVs, the sampler | nvn_draw.cpp |
+| `NX_SWAP_FS=<from>:<to>` | draws with fragment shader `<from>` use `<to>` (already loaded): shows what a draw covers | nvn_draw.cpp |
+| `NX_TRACE_UPLOADS=1` | uploads of big textures, with how much of their memory is non-zero | nvn_pipeline.cpp |
 
 Always on: every 60 presents `nvn/vk: per frame over 60: submits, replay ms (host), GPU wait ms, present wait ms,
 upload MB`.
@@ -85,3 +93,29 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
     select (`NX_TRACE_FS`). `GetNpadStates` now keeps a 16-sample history like hid (Wonder ignores the count and reads
     all 16 entries), and `BindNpadStyleSetUpdateEvent` signals its event once (the controller is connected).
     Screenshot: `06-file-select.png` (text still missing).
+11. **The opening was garbage after compute** (chevron patterns). Compute shaders search the buffer descriptor table
+    in `c[0]` to find which buffer an address falls in; it was bound as zeros. Also, storage buffers are copies in the
+    upload buffer and Metal does not bound-check, so a shader writing past a small or missing one overwrote the next
+    data. Fix: `c[0]` filled with the bound descriptors, storage padded to 64 KB, compute writes copied back to guest
+    memory after the submit.
+12. **"upload buffer full"**: a busy submit needed 67 MB of the 64 MB ring and wrapped over its own data. 256 MB now.
+13. **The opening never advanced: streamed music was never consumed** (`NX_TRACE_FS` showed each `.bwav` read 2-3
+    times, then never). `ExecuteAudioRendererRendering` returned 0x40299 in 0.5 us: it only renders when the render
+    system's execution mode and rendering device are manual/CPU (`GetExecutionMode`, `GetRenderingDevice`, render
+    system +0x2d0/+0x2d4), and the game opens the renderer in the automatic mode. Switched after opening: ~250 us a
+    frame, the streams play.
+14. **The Mac froze: the process reached 85 GB.** GPU images of destroyed textures were never freed (no
+    `vkDestroyImage` anywhere) and the opening creates textures continuously; with unified memory the machine ran out
+    of RAM and swapped until it hung. Fix: a texture's image goes to a graveyard freed at the next submit/present,
+    with its cached views. The same run stays at ~4.5 GB. The memory guard (`NX_MEM_LIMIT_GB`) now stops any leak
+    before it matters.
+15. **Dialog text invisible** (open). With `NX_SWAP_FS` the glyph quads land correctly; without the view swizzle
+    they are solid boxes, so the pipeline works and the sampled coverage is 0. The glyph atlas (GPU copy and guest
+    memory) holds the glyphs at the recorded UVs (`NX_TRACE_GLYPHS`). The translated vertex shader picks each corner's
+    texture coordinate through a table in `c[1]` (values 0x378, 0x390, 0x3a0, 0x450, 0x430, 0x440) and compares the
+    looked-up value with a single constant (888, 1072) the offline translator resolved; the other corners fall back to
+    a position value, so they sample empty atlas. Needs the translator to express that indexed load.
+16. **Another "call into the middle of a function"** (main+28b3c0, after the opening dialogs): a jump table whose base
+    register (x24) is set by an `adrp/add` on another control-flow path, 0x5000 bytes before; the linear backward
+    search found an unrelated `movk`. The recompiler now tries every constant the function puts in the base register
+    when the bound is known, and keeps the one whose entries all land on instructions of the function.
