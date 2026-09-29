@@ -110,6 +110,7 @@ ShaderControl read_control(const uint8_t* control) {
     c.code_size = rd32(control + 0x704);
     c.program_start = rd32(control + 0x708);
     for (int i = 0; i < 3; i++) c.local_size[i] = rd32(control + 0x748 + 4 * i);
+    c.shared_size = rd32(control + 0x754);
     return c;
 }
 

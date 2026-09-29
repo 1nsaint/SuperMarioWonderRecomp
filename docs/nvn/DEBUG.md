@@ -168,3 +168,41 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
     restarted. Safeguards: a lost device (`VK_ERROR_DEVICE_LOST`) or a submit not finishing within 2 s ends the
     process at once (nvn_vk.cpp), so a hang cannot keep the GPU busy. Test runs must use a build with the current
     fixes, one game process at a time.
+23. **Compute pipelines refused: "Threadgroup memory size (49152) exceeds the maximum threadgroup memory allowed
+    (32768)"** (compute `0cd5c52ea70a3bb0`, world map and first course; its effect was missing). The translator sizes
+    shared memory with `IGpuAccessor.QueryComputeSharedMemorySize()`. The harness did not answer it, so Ryujinx's
+    default of 0xc000 applied, and all 21 of Wonder's 71 compute shaders that use shared memory declared `uint[12288]`
+    (48 KB). The M1 allows 32 KB, so Metal refused every one of them. The real size is in the control section at
+    **+0x754**, right after the work-group size. It is 384 to 2,312 bytes in Wonder, and it is 0 for exactly the 50
+    compute shaders without shared memory. The SPIR-V agrees with it. In the 18 shaders with a 32x1x1 work group,
+    every access is `shared[(tid * S + k) >> 2]` with a constant `k < S` and `32 * S` equal to the control size (for
+    `0cd5c52ea70a3bb0`, S = 60 and the size is 1,920 bytes). The three 16x16 ones are tiles with a border: 800 bytes
+    = 20 rows of 40 bytes, and 2,312 = 17 x 17 x 8. This is also the amount Maxwell allocates per work group. Fix
+    (`resize_shared_memory`, nvn_spirv_patch.cpp): `ShaderControl::shared_size` reads +0x754, and when a module is
+    created, the Workgroup array is redeclared with `ceil(size / 4)` elements. It only ever shrinks the array. The
+    harness answers the query from +0x754 too (`StaticGpuAccessor.QueryComputeSharedMemorySize`), so a future
+    re-translation declares the right size and the runtime pass does nothing. Offline check
+    (`private/wonder/patchwork/test/run.sh`): all 21 modules pass `spirv-val`, and `spirv-cross --msl` gives
+    `threadgroup spvUnsafeArray<uint, 480>` for `0cd5c52ea70a3bb0`, not 12288. Metal
+    `makeComputePipelineState` refuses all 21 before the fix and accepts all 21 after it (1,920 B for
+    `0cd5c52ea70a3bb0`).
+24. **Graphics pipeline refused: "Fragment input(s) `user(locn6)` mismatching vertex shader output type(s) or not
+    written by vertex shader"** (vs `c5f64e8c84fa824d` + fs `4a9740c442f9ba61`, effect_static). The vertex shader
+    writes locations 0-5 and 7, and the fragment shader reads 0-7. Vulkan allows an input that nothing writes (its
+    value is undefined), but Metal links the stages by name and refuses the pipeline. On Maxwell such an attribute
+    reads as (0, 0, 0, 1): Ryujinx initializes every output the next stage reads to that (Translator.cs,
+    `InitializeOutputComponent`). This shader multiplies its alpha by `in6.w`, so 0 would make the effect invisible.
+    Fix (`unwritten_inputs` + `default_unwritten_inputs`, nvn_spirv_patch.cpp): at pipeline creation, the fragment
+    input locations missing from the vertex shader's reflected outputs become Private variables that start as
+    (0, 0, 0, 1). The patch takes out their Location decoration, retypes the access chains to Private pointers, and
+    removes them from the entry point interface (SPIR-V 1.3). The fragment module cache is keyed by that mask as
+    well. When a pipeline needs it, the log says `inputs 0x40 not written by the vertex stage read (0, 0, 0, 1)`.
+    Offline check: `spirv-val` and `spirv-cross --msl` pass, and the MSL fragment keeps inputs `locn0-5,7` with
+    `float4 _45 = float4(0.0, 0.0, 0.0, 1.0)`. Metal `makeRenderPipelineState` on the pair fails as above before the
+    fix and links after it. As a worst case, all 7,662 fragment shaders with inputs were patched with every input
+    marked unwritten: 0 refused, 0 `spirv-val` failures, and a sample of 510 passed through `spirv-cross --msl`.
+25. **Huge flat pale-green wedges across the course** (and still no characters). They came with the work-in-progress
+    SPIR-V patch that retypes vertex inputs to integers for integer attribute formats (`patch_int_inputs`): an A/B run
+    with it off (`NX_NO_INT_ATTRIBS`, now inverted to `NX_INT_ATTRIBS=1` to turn it on) showed clean scenes (the Wonder
+    Flower, the airship, the golden Wonder sky). Off by default until it is right; characters are still invisible
+    either way, so integer inputs are not (or not the only) cause.

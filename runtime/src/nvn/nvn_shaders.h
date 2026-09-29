@@ -51,6 +51,7 @@ struct ShaderControl {
     uint32_t code_size = 0;       // +0x704: the whole code block, the bytes the hash covers
     uint32_t program_start = 0;   // +0x708: 0x30 graphics (SPH there), 0x100 compute
     uint32_t local_size[3] = {};  // +0x748: compute work-group size
+    uint32_t shared_size = 0;     // +0x754: compute shared memory bytes (0 = none)
 };
 
 ShaderControl read_control(const uint8_t* control);

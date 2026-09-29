@@ -415,7 +415,8 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         static const uint64_t from = before.find('@') != std::string::npos
                                          ? std::strtoull(before.c_str() + before.find('@') + 1, nullptr, 10) : 0;
         static int taken = 0;
-        if (!before.empty() && fs && before.compare(0, 16, fs->hash) == 0 && g_stats.total >= from && taken < 8 &&
+        bool match = (fs && before.compare(0, 16, fs->hash) == 0) || before.compare(0, 16, vs->hash) == 0;
+        if (!before.empty() && match && g_stats.total >= from && taken < 8 &&
             t.color_count && t.colors[0])
             if (GpuImage* img = image_of(t.colors[0])) {
                 taken++;
@@ -537,8 +538,10 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     static const uint64_t snap_from = snap_fs.find('@') != std::string::npos
                                           ? std::strtoull(snap_fs.c_str() + snap_fs.find('@') + 1, nullptr, 10) : 0;
     static int snap_count = 0;
-    bool snap_by_fs = !snap_fs.empty() && fs && g_stats.done >= snap_from && snap_count < 8 &&
-                      snap_fs.find(fs->hash) != std::string::npos && ++snap_count;
+    bool snap_by_fs = !snap_fs.empty() && g_stats.done >= snap_from && snap_count < 8 &&
+                      ((fs && snap_fs.find(fs->hash) != std::string::npos) ||
+                       snap_fs.find(vs->hash) != std::string::npos) &&
+                      ++snap_count;  // the vertex shader's hash matches too
     if ((snap_by_fs || debug_snap_wanted(g_stats.done)) && t.color_count && t.colors[0])
         if (GpuImage* snap = image_of(t.colors[0])) draw_end_rendering(cb), debug_snapshot(cb, *snap, g_stats.done);
     // NX_DUMP_ON_TARGET=<hex NVNtexture*>: every NX_DUMP_FRAMES-th draw into it asks for NX_DUMP_TEXTURES to be read

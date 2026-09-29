@@ -47,6 +47,16 @@ bool patch_int_inputs(const std::vector<uint32_t>& in, const uint8_t kinds[16], 
 // set 0 bindings read that way are returned: those are bound zero-padded to 64 KB (nvn_spirv_patch.cpp).
 bool clamp_uniform_indices(const std::vector<uint32_t>& in, std::vector<uint32_t>& out, uint64_t* bindings);
 uint64_t dynamic_uniform_bindings(const ShaderInfo* s);
+// Compute: the shared memory array redeclared with the control section's size (the translator declares 48 KB, past
+// Metal's 32 KB). Fragment: the input locations in `locations` (bit mask) that the vertex stage does not write become
+// private variables holding (0, 0, 0, 1), Maxwell's value for them (nvn_spirv_patch.cpp).
+bool resize_shared_memory(const std::vector<uint32_t>& in, uint32_t bytes, std::vector<uint32_t>& out);
+bool default_unwritten_inputs(const std::vector<uint32_t>& in, uint32_t locations, std::vector<uint32_t>& out);
+// The fragment input locations `vs` does not write (0 without both stages).
+uint32_t unwritten_inputs(const ShaderInfo* vs, const ShaderInfo* fs);
+// The code of a stage's module: its SPIR-V with every patch above that applies (`kinds` as patch_int_inputs, or
+// null; `unwritten` as default_unwritten_inputs). `int_inputs` gets whether patch_int_inputs changed it.
+std::vector<uint32_t> patched_spirv(const ShaderInfo* s, const uint8_t* kinds, uint32_t unwritten, bool* int_inputs);
 
 VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgramLayout& layout);
 

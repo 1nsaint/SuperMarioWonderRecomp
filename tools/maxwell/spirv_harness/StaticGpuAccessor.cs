@@ -28,7 +28,7 @@ namespace SpirvHarness
         readonly byte[] _code;        // the whole code block (0x30-byte NVN header, SPH, instructions, constant data)
         readonly int _constOff, _constSize;
         readonly int _stageSlot;      // 0 vertex/compute, 1 fragment (Ryujinx's GetStageIndex remap)
-        readonly int _localX, _localY, _localZ;
+        readonly int _localX, _localY, _localZ, _sharedSize;
         int _staticTextures, _staticImages, _arrayTextures, _arrayImages;
 
         public readonly List<string> Messages = new();
@@ -51,6 +51,9 @@ namespace SpirvHarness
                 _localY = Math.Max(1, BitConverter.ToInt32(ctrl, 0x74c));
                 _localZ = Math.Max(1, BitConverter.ToInt32(ctrl, 0x750));
             }
+            // Shared memory bytes: control +0x754 (0 exactly for the compute shaders without shared memory). Without
+            // it the translator declares its default, 0xc000, past the 32 KB Metal allows (docs/nvn/DEBUG.md #23).
+            if (ctrl != null && ctrl.Length >= 0x758) _sharedSize = BitConverter.ToInt32(ctrl, 0x754);
         }
 
         public void Log(string message)
@@ -134,6 +137,7 @@ namespace SpirvHarness
         public int QueryComputeLocalSizeX() => _localX;
         public int QueryComputeLocalSizeY() => _localY;
         public int QueryComputeLocalSizeZ() => _localZ;
+        public int QueryComputeSharedMemorySize() => _sharedSize;  // 0: the translator uses 4 KB (never happens here)
 
         // Sizes of bindless arrays: pool sizes are draw-time state; a fixed bound makes the SPIR-V valid.
         public int QuerySamplerArrayLengthFromPool() { DrawTimeQueries.Add("poolSize"); return 4096; }

@@ -28,6 +28,24 @@ struct Inst {
     uint32_t op, len;
 };
 
+// True if the instruction at `w` passes pointer `id` to something other than a load or an access chain: OpStore,
+// OpCopyMemory, OpFunctionCall, OpCopyObject, OpPtrAccessChain, OpExtInst (InterpolateAt*); with `load`, OpLoad too.
+// Only operand positions that hold ids are compared (a literal, such as an OpExtInst number, can equal the id).
+bool other_pointer_use(const uint32_t* w, uint32_t op, uint32_t len, uint32_t id, bool load) {
+    auto any = [&](uint32_t from, uint32_t to) {
+        for (uint32_t k = from; k < std::min(to, len); k++)
+            if (w[k] == id) return true;
+        return false;
+    };
+    switch (op) {
+        case 61: return load && any(3, 4);                    // OpLoad: the pointer
+        case 62: case 63: return any(1, 3);                   // OpStore, OpCopyMemory: the two operands
+        case 57: case 12: return any(op == 57 ? 4 : 5, len);  // OpFunctionCall, OpExtInst: the arguments
+        case 83: case 67: return any(3, len);                 // OpCopyObject, OpPtrAccessChain
+        default: return false;
+    }
+}
+
 }  // namespace
 
 // 0 float (as is), 1 unsigned integer bits, 2 signed integer bits.
@@ -229,6 +247,190 @@ bool clamp_uniform_indices(const std::vector<uint32_t>& in, std::vector<uint32_t
     }
     out[3] = bound;
     return true;
+}
+
+// ---- shared memory sized by the translator's default -------------------------------------------------------------
+// The translator sizes a compute shader's shared memory with IGpuAccessor.QueryComputeSharedMemorySize(), which the
+// harness does not answer: Ryujinx's default is 0xc000, so all 21 of Wonder's compute shaders that use shared memory
+// declare uint[12288] (48 KB), past the M1's 32 KB of threadgroup memory, and Metal refuses the pipeline. The size
+// the NVN compiler gave the program is in the control section (+0x754: 384..2312 bytes in Wonder; 0 exactly for the
+// shaders without shared memory), the size Maxwell allocates per work group (docs/nvn/DEBUG.md #23).
+// resize_shared_memory() redeclares the Workgroup array with ceil(bytes / 4) elements. Only shrinks.
+bool resize_shared_memory(const std::vector<uint32_t>& in, uint32_t bytes, std::vector<uint32_t>& out) {
+    enum : uint32_t { OpTypeArray = 28, OpConstant = 43, StorageWorkgroup = 4 };
+    if (in.size() < 5 || !bytes) return false;
+    std::vector<Inst> insts;
+    for (size_t i = 5; i < in.size();) {
+        uint32_t len = in[i] >> 16;
+        if (!len || i + len > in.size()) return false;
+        insts.push_back({i, in[i] & 0xffff, len});
+        i += len;
+    }
+    std::map<uint32_t, std::pair<uint32_t, uint32_t>> constant, array, ptr;  // id -> (type, value) / (elem, length id)
+    std::map<uint32_t, uint32_t> int_width;                                  //   / (storage, pointee)
+    uint32_t var = 0, count = 0;
+    size_t var_at = 0;
+    for (const Inst& n : insts) {
+        const uint32_t* w = &in[n.at];
+        if (n.op == OpTypeInt && n.len == 4) int_width[w[1]] = w[2];
+        else if (n.op == OpConstant && n.len == 4) constant[w[2]] = {w[1], w[3]};
+        else if (n.op == OpTypeArray && n.len == 4) array[w[1]] = {w[2], w[3]};
+        else if (n.op == OpTypePointer && n.len == 4) ptr[w[1]] = {w[2], w[3]};
+        else if (n.op == OpVariable && n.len >= 4 && w[3] == StorageWorkgroup) var = w[2], var_at = n.at, count++;
+    }
+    if (count != 1) return false;  // none, or several (the translator declares one): leave the module as it is
+    auto p = ptr.find(in[var_at + 1]);
+    if (p == ptr.end()) return false;
+    auto a = array.find(p->second.second);
+    if (a == array.end() || int_width[a->second.first] != 32) return false;  // uint[N]
+    auto c = constant.find(a->second.second);
+    uint32_t elems = (bytes + 3) / 4;
+    if (c == constant.end() || elems >= c->second.second) return false;
+    // Uses other than access chains (a load or copy of the whole array) would need the old type.
+    // (OpLoad, OpStore, OpCopyMemory, OpFunctionCall, OpCopyObject, OpPtrAccessChain; the translator emits none.)
+    for (const Inst& n : insts)
+        if (other_pointer_use(&in[n.at], n.op, n.len, var, true)) return false;
+    uint32_t bound = in[3], length = bound++, type = bound++, pointer = bound++;
+    out.assign(in.begin(), in.begin() + var_at);
+    out.insert(out.end(), {(4u << 16) | OpConstant, c->second.first, length, elems,         //
+                           (4u << 16) | OpTypeArray, type, a->second.first, length,          //
+                           (4u << 16) | OpTypePointer, pointer, StorageWorkgroup, type});
+    out.insert(out.end(), in.begin() + var_at, in.end());
+    out[var_at + 12 + 1] = pointer;  // the variable's result type
+    out[3] = bound;
+    return true;
+}
+
+// ---- fragment inputs the vertex stage does not write -----------------------------------------------------------
+// Metal links the stages by name: a fragment input with no vertex output of the same location fails the pipeline
+// ("Fragment input(s) `user(locn6)` mismatching vertex shader output type(s) or not written by vertex shader"). On
+// Maxwell such an attribute reads as (0, 0, 0, 1): Ryujinx initializes every output the next stage reads to that
+// (Translator.cs, InitializeOutputComponent). default_unwritten_inputs() turns the chosen input locations of a
+// fragment module into Private variables with that initializer (docs/nvn/DEBUG.md #24).
+bool default_unwritten_inputs(const std::vector<uint32_t>& in, uint32_t locations, std::vector<uint32_t>& out) {
+    enum : uint32_t { OpEntryPoint = 15, OpConstant = 43, OpConstantComposite = 44, StoragePrivate = 6, ModelFragment = 4 };
+    if (in.size() < 5 || !locations) return false;
+    std::vector<Inst> insts;
+    for (size_t i = 5; i < in.size();) {
+        uint32_t len = in[i] >> 16;
+        if (!len || i + len > in.size()) return false;
+        insts.push_back({i, in[i] & 0xffff, len});
+        i += len;
+    }
+    std::map<uint32_t, uint32_t> location, scalar_width;         // id -> Location / int or float width
+    std::map<uint32_t, std::pair<uint32_t, uint32_t>> vec, ptr;  // id -> (component, count) / (storage, pointee)
+    bool fragment = false;
+    for (const Inst& n : insts) {
+        const uint32_t* w = &in[n.at];
+        if (n.op == OpEntryPoint && n.len >= 3) fragment |= w[1] == ModelFragment;
+        else if (n.op == OpDecorate && n.len >= 4 && w[2] == DecorationLocation) location[w[1]] = w[3];
+        else if (n.op == OpTypeInt && n.len == 4) scalar_width[w[1]] = w[2];
+        else if (n.op == OpTypeFloat && n.len == 3) scalar_width[w[1]] = w[2];
+        else if (n.op == OpTypeVector && n.len == 4) vec[w[1]] = {w[2], w[3]};
+        else if (n.op == OpTypePointer && n.len == 4) ptr[w[1]] = {w[2], w[3]};
+    }
+    if (!fragment) return false;
+
+    // The variables: 32-bit scalars or vectors (the translator declares user attributes as vec4).
+    uint32_t bound = in[3];
+    std::map<uint32_t, uint32_t> patched;  // variable or access chain id -> Private pointer type of its result
+    std::map<uint32_t, uint32_t> private_ptr;  // pointee -> new Private pointer type
+    std::map<uint32_t, uint32_t> init;         // variable -> initializer
+    std::vector<uint32_t> globals;
+    size_t insert_at = in.size();
+    auto pointer_to = [&](uint32_t pointee) {
+        auto& id = private_ptr[pointee];
+        if (!id) {
+            id = bound++;
+            globals.insert(globals.end(), {(4u << 16) | OpTypePointer, id, StoragePrivate, pointee});
+        }
+        return id;
+    };
+    for (const Inst& n : insts) {
+        const uint32_t* w = &in[n.at];
+        if (n.op != OpVariable || n.len != 4 || w[3] != StorageInput) continue;
+        auto l = location.find(w[2]);
+        if (l == location.end() || l->second >= 32 || !(locations >> l->second & 1)) continue;
+        auto p = ptr.find(w[1]);
+        if (p == ptr.end()) return false;
+        uint32_t pointee = p->second.second, comp = pointee, count = 1;
+        if (auto v = vec.find(pointee); v != vec.end()) comp = v->second.first, count = v->second.second;
+        if (scalar_width[comp] != 32) return false;  // arrays, blocks, 16/64-bit: not produced for attributes
+        insert_at = std::min(insert_at, n.at);
+        uint32_t zero = bound++, one = bound++, value = bound++;
+        globals.insert(globals.end(), {(4u << 16) | OpConstant, comp, zero, 0u,  //
+                                       (4u << 16) | OpConstant, comp, one, 0x3f800000u});  // 1.0f (bits for ints)
+        if (count == 1) {
+            value = zero;
+        } else {
+            globals.insert(globals.end(), {((3u + count) << 16) | OpConstantComposite, pointee, value});
+            for (uint32_t k = 0; k < count; k++) globals.push_back(k == 3 ? one : zero);
+        }
+        pointer_to(comp);  // for the access chains
+        patched[w[2]] = pointer_to(pointee);
+        init[w[2]] = value;
+    }
+    if (patched.empty()) return false;
+
+    const bool interface_private = in[1] >= 0x10400;  // SPIR-V 1.4+: every global is in the interface list
+    out.assign(in.begin(), in.begin() + 5);
+    for (const Inst& n : insts) {
+        if (n.at == insert_at) out.insert(out.end(), globals.begin(), globals.end());
+        std::vector<uint32_t> w(in.begin() + n.at, in.begin() + n.at + n.len);
+        if (n.op == OpEntryPoint && !interface_private) {
+            size_t k = 3;
+            while (k < w.size() && (w[k] >> 24) != 0) k++;  // the name: a nul-terminated string
+            std::vector<uint32_t> e(w.begin(), w.begin() + std::min(k + 1, w.size()));
+            for (size_t j = k + 1; j < w.size(); j++)
+                if (!patched.count(w[j])) e.push_back(w[j]);
+            e[0] = uint32_t(e.size()) << 16 | OpEntryPoint;
+            w = std::move(e);
+        } else if (n.op == OpDecorate && n.len >= 3 && patched.count(w[1])) {
+            continue;  // Location, interpolation: Input/Output only
+        } else if (n.op == OpVariable && patched.count(w[2]) && init.count(w[2])) {
+            w = {(5u << 16) | OpVariable, patched[w[2]], w[2], StoragePrivate, init[w[2]]};
+        } else if ((n.op == OpAccessChain || n.op == OpInBoundsAccessChain) && n.len >= 4 && patched.count(w[3])) {
+            auto p = ptr.find(w[1]);
+            if (p == ptr.end() || !private_ptr.count(p->second.second)) return false;
+            w[1] = patched[w[2]] = private_ptr[p->second.second];
+        } else {
+            for (auto& [id, type] : patched)
+                if (other_pointer_use(w.data(), n.op, n.len, id, false)) return false;
+        }
+        out.insert(out.end(), w.begin(), w.end());
+    }
+    out[3] = bound;
+    return true;
+}
+
+uint32_t unwritten_inputs(const ShaderInfo* vs, const ShaderInfo* fs) {
+    uint32_t mask = 0;
+    if (!vs || !fs) return 0;
+    for (const ShaderIo& in : fs->refl.inputs)
+        for (uint32_t l = in.location; l < in.location + in.array && l < 32; l++) mask |= 1u << l;
+    for (const ShaderIo& out : vs->refl.outputs)
+        for (uint32_t l = out.location; l < out.location + out.array && l < 32; l++) mask &= ~(1u << l);
+    return mask;
+}
+
+std::vector<uint32_t> patched_spirv(const ShaderInfo* s, const uint8_t* kinds, uint32_t unwritten, bool* int_inputs) {
+    std::vector<uint32_t> code = s->spirv, next;  // each pass reads `code` and leaves its result in `next`
+    bool is_int = kinds && patch_int_inputs(code, kinds, next);
+    if (is_int) code.swap(next);
+    if (int_inputs) *int_inputs = is_int;
+    if (s->stage == ShaderStage::Compute && s->control.shared_size &&
+        resize_shared_memory(code, s->control.shared_size, next)) {
+        code.swap(next);
+        log("nvn/vk: shader %s: shared memory declared as %u bytes", s->hash.c_str(), s->control.shared_size);
+    }
+    if (unwritten) {
+        bool ok = default_unwritten_inputs(code, unwritten, next);
+        if (ok) code.swap(next);
+        log("nvn/vk: shader %s: inputs %#x not written by the vertex stage%s", s->hash.c_str(), unwritten,
+            ok ? " read (0, 0, 0, 1)" : ", left as they are");
+    }
+    if (clamp_uniform_indices(code, next, nullptr)) code.swap(next);
+    return code;
 }
 
 uint64_t dynamic_uniform_bindings(const ShaderInfo* s) {

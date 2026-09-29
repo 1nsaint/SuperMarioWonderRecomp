@@ -25,18 +25,18 @@ VkShaderStageFlags stage_bit(ShaderStage s) {
 }
 
 // `kinds`: per vertex input location, 0 float or the integer kind of its attribute format (vertex_int_kind).
-VkShaderModule module_of(const ShaderInfo* s, const uint8_t* kinds = nullptr) {
-    static std::map<std::pair<const ShaderInfo*, std::string>, VkShaderModule> cache;
-    static const bool off = std::getenv("NX_NO_INT_ATTRIBS") != nullptr;
+// `unwritten`: fragment input locations the vertex stage does not write (default_unwritten_inputs).
+VkShaderModule module_of(const ShaderInfo* s, const uint8_t* kinds = nullptr, uint32_t unwritten = 0) {
+    static std::map<std::tuple<const ShaderInfo*, std::string, uint32_t>, VkShaderModule> cache;
+    // The integer-vertex-input patch is off unless NX_INT_ATTRIBS=1: as it stands it deformed models into huge
+    // flat wedges in the course (DEBUG.md #25).
+    static const bool off = std::getenv("NX_INT_ATTRIBS") == nullptr;
     std::string k = kinds && !off ? std::string(reinterpret_cast<const char*>(kinds), 16) : std::string(16, '\0');
-    auto& m = cache[{s, k}];
+    auto& m = cache[{s, k, unwritten}];
     if (!m) {
-        std::vector<uint32_t> patched;
-        bool is_patched = k != std::string(16, '\0') &&
-                          patch_int_inputs(s->spirv, reinterpret_cast<const uint8_t*>(k.data()), patched);
-        std::vector<uint32_t> clamped;
-        bool is_clamped = clamp_uniform_indices(is_patched ? patched : s->spirv, clamped, nullptr);
-        const std::vector<uint32_t>& code = is_clamped ? clamped : is_patched ? patched : s->spirv;
+        bool is_patched = false;
+        const uint8_t* int_kinds = k != std::string(16, '\0') ? reinterpret_cast<const uint8_t*>(k.data()) : nullptr;
+        std::vector<uint32_t> code = patched_spirv(s, int_kinds, unwritten, &is_patched);
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         ci.codeSize = code.size() * 4;
         ci.pCode = code.data();
@@ -276,12 +276,13 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
         }
         log("nvn/vk: vs %s inputs (location:format/stream+offset)%s", key.vs->hash.c_str(), line.c_str());
     }
+    uint32_t unwritten = unwritten_inputs(key.vs, key.fs);
     for (const ShaderInfo* s : {key.vs, key.fs}) {
         if (!s) continue;
         auto& st = stages[nstages++];
         st.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         st.stage = VkShaderStageFlagBits(stage_bit(s->stage));
-        st.module = module_of(s, s == key.vs ? int_kinds : nullptr);
+        st.module = module_of(s, s == key.vs ? int_kinds : nullptr, s == key.fs ? unwritten : 0);
         st.pName = "main";
     }
 
