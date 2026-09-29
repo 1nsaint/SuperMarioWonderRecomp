@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 
 #include "nvn_draw_state.h"
@@ -128,5 +129,130 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
             vs->hash.c_str(), fs ? fs->hash.c_str() : "-", mode, indexed ? "indexed" : "arrays",
             indexed ? c.i[0] : c.i[1], c.i[3], t.color_count, (unsigned long long)t.colors[0], (unsigned long long)t.depth, tex.c_str());
     }}
+
+// NX_TRACE_SKIN=1: the first 3 draws of every vertex shader with an integer vertex input (skinned models: bone
+// indices), 60 at most: each input's format and stream, the vertex uniform blocks, the first vertices' integer input
+// and weights (location 4 bytes), and the bone rows (3 vec4 at index * 48 of c8) they select.
+namespace {
+
+// Component size and count of an integer vertex format; {0, 0} if it is not one.
+std::pair<uint32_t, uint32_t> int_layout(uint32_t format) {
+    switch (vk_vertex_format(format)) {
+        case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: return {1, 1};
+        case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT: return {1, 2};
+        case VK_FORMAT_R8G8B8_UINT: case VK_FORMAT_R8G8B8_SINT: return {1, 3};
+        case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT: return {1, 4};
+        case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT: return {2, 1};
+        case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT: return {2, 2};
+        case VK_FORMAT_R16G16B16_UINT: case VK_FORMAT_R16G16B16_SINT: return {2, 3};
+        case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT: return {2, 4};
+        case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: return {4, 1};
+        case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: return {4, 2};
+        case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32_SINT: return {4, 3};
+        case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: return {4, 4};
+        default: return {0, 0};
+    }
+}
+
+const uint8_t* attrib_at(const VertexAttrib& va, uint32_t vertex) {
+    if (va.stream >= g_state.streams.size() || va.stream >= 16) return nullptr;
+    const Range& vb = g_state.vertex_buffers[va.stream];
+    uint64_t at = uint64_t(vertex) * g_state.streams[va.stream].stride + va.offset;
+    if (!vb.address || at + 16 > vb.size) return nullptr;
+    return guest_bytes(vb.address + at);
+}
+
+std::string floats(const uint8_t* p, uint32_t n) {
+    std::string s;
+    for (uint32_t k = 0; k < n; k++) {
+        float f;
+        std::memcpy(&f, p + 4 * k, 4);
+        char b[24];
+        std::snprintf(b, sizeof b, "%s%.4g", k ? " " : "", f);
+        s += b;
+    }
+    return s;
+}
+
+uint32_t read_uint(const uint8_t* p, uint32_t size, uint32_t k) {
+    uint32_t v = 0;
+    std::memcpy(&v, p + size * k, size);
+    return v;
+}
+
+}  // namespace
+
+void trace_skin(bool indexed, const Cmd& c, const ShaderInfo* vs, const ShaderInfo* fs) {
+    static const bool on = std::getenv("NX_TRACE_SKIN") != nullptr;
+    static std::map<const ShaderInfo*, int> seen;
+    static int total = 0;
+    if (!on || !vs || total >= 60) return;
+    int int_loc = -1;
+    for (const ShaderIo& in : vs->refl.inputs)
+        if (in.location < g_state.attribs.size() && int_layout(g_state.attribs[in.location].format).first)
+            int_loc = int(in.location);
+    if (int_loc < 0 || seen[vs]++ >= 3) return;
+    total++;
+    uint32_t count = uint32_t(indexed ? c.i[0] : c.i[1]);
+    log("skin: vs %s fs %s %s count %u base %d first %d x%d", vs->hash.c_str(), fs ? fs->hash.c_str() : "-",
+        indexed ? "indexed" : "arrays", count, indexed ? c.i[1] : 0, indexed ? 0 : c.i[0], c.i[3]);
+    std::string line;
+    for (const ShaderIo& in : vs->refl.inputs) {
+        if (in.location >= g_state.attribs.size()) continue;
+        const VertexAttrib& va = g_state.attribs[in.location];
+        uint32_t stride = va.stream < g_state.streams.size() ? g_state.streams[va.stream].stride : 0;
+        char b[80];
+        std::snprintf(b, sizeof b, " %u:%x/s%u+%u/%u", in.location, va.format, va.stream, va.offset, stride);
+        line += b;
+    }
+    log("skin:  inputs (loc:format/stream+offset/stride)%s", line.c_str());
+    // The vertex stage's uniform blocks: name, binding n, size, first row.
+    const uint8_t* bank[18] = {};
+    uint64_t bank_size[18] = {};
+    for (const DescriptorBinding& b : vs->refl.bindings) {
+        if (b.nvn.source != NvnSource::UniformBlock || b.nvn.index < 0 || b.nvn.index >= 18) continue;
+        const Range& r = g_state.uniforms[0][b.nvn.index];
+        const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
+        if (b.nvn.bank >= 0 && b.nvn.bank < 18) bank[b.nvn.bank] = p, bank_size[b.nvn.bank] = p ? r.size : 0;
+        log("skin:  %s = block %d bank %d, %llu bytes%s%s", b.name.c_str(), b.nvn.index, b.nvn.bank,
+            (unsigned long long)r.size, p ? ", row 0: " : " (unbound)", p ? floats(p, 4).c_str() : "");
+    }
+    if (bank[4] && bank_size[4] >= 0x90) log("skin:  c4[8] %s", floats(bank[4] + 0x80, 4).c_str());
+    // The vertices (through the index buffer): the first 4 in detail, the largest bone index over all.
+    const uint8_t* idx = indexed ? guest_bytes(c.a[0]) : nullptr;
+    uint32_t isz = indexed ? index_size(c.mask) : 0;
+    const VertexAttrib& ia = g_state.attribs[int_loc];
+    auto [size, n] = int_layout(ia.format);
+    uint32_t max_bone = 0, missing = 0;
+    for (uint32_t k = 0; k < count; k++) {
+        uint32_t v = idx ? read_uint(idx, isz, k) + uint32_t(c.i[1]) : uint32_t(c.i[0]) + k;
+        const uint8_t* p = attrib_at(ia, v);
+        if (!p) {
+            missing++;
+            continue;
+        }
+        uint32_t bones[4] = {};
+        for (uint32_t j = 0; j < n; j++) max_bone = std::max(max_bone, bones[j] = read_uint(p, size, j));
+        if (k >= 4) continue;
+        std::string w = "-";
+        if (g_state.attribs.size() > 4)
+            if (const uint8_t* q = attrib_at(g_state.attribs[4], v)) {
+                char b[64];
+                std::snprintf(b, sizeof b, "%02x%02x%02x%02x %02x%02x%02x%02x", q[0], q[1], q[2], q[3], q[4], q[5],
+                              q[6], q[7]);
+                w = b;
+            }
+        log("skin:  vertex %u: loc%d %u %u %u %u, loc4 bytes %s", v, int_loc, bones[0], bones[1], bones[2], bones[3],
+            w.c_str());
+        for (uint32_t j = 0; j < n && j < 2 && bank[8]; j++)
+            if (uint64_t(bones[j]) * 48 + 48 <= bank_size[8])
+                log("skin:   bone %u: %s | %s | %s", bones[j], floats(bank[8] + bones[j] * 48, 4).c_str(),
+                    floats(bank[8] + bones[j] * 48 + 16, 4).c_str(), floats(bank[8] + bones[j] * 48 + 32, 4).c_str());
+            else
+                log("skin:   bone %u: past c8 (%llu bytes)", bones[j], (unsigned long long)bank_size[8]);
+    }
+    log("skin:  max bone index %u (c8 needs %u bytes, bound %llu); %u vertices outside their buffer", max_bone,
+        (max_bone + 1) * 48, (unsigned long long)bank_size[8], missing);
+}
 
 }  // namespace nx::nvn::replay

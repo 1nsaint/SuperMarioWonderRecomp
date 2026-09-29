@@ -185,7 +185,12 @@ struct Cmd {
 struct CmdList {
     std::vector<Cmd> cmds;
     std::vector<std::vector<uint8_t>> blobs;
+    uint64_t handle = 0;     // its NVNcommandHandle
+    uint32_t skinned = 0;    // NX_TRACE_SKINLISTS: binds of skinned programs (a vertex input at location 6) in it
 };
+// NX_TRACE_SKINLISTS (nvn_cmd.cpp): follows the lists that bind skinned programs, from recording to replay.
+bool skin_lists_on();
+void skin_list_replayed(const CmdList& list, int depth);
 
 // Decoded state objects (values are NVN enums, see nvn_state.cpp).
 struct VertexAttrib {

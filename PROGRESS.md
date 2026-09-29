@@ -23,6 +23,21 @@ NVN implemented over Vulkan (MoltenVK).
 
 ## Log
 
+### 2026-09-29 (evening): Mario and every character appear
+
+![Mario in the course](docs/media/wonder/19-mario-appears-course.png)
+![The cast at the Flower Castle](docs/media/wonder/20-cast-at-flower-castle.png)
+![Bowser arrives](docs/media/wonder/21-bowser-arrives.png)
+
+- **Characters render.** Two bugs hid them (docs/nvn/DEBUG.md #26): Metal refused every skinned pipeline (integer
+  bone-index inputs declared as float; the integer input patch is now on by default), and the per-mesh draw lists the
+  characters use, recorded when the course loads, were dropped by our command-handle limit before the game first
+  called them. Handles now live as long as their command memory.
+- New debug tools: `NX_ZERO_DRAWS` (occlusion query per draw), `NX_TRACE_SKIN`, `NX_TRACE_SKINLISTS`.
+- Studied in parallel by four read-only agents (shader classification, emulator research, CPU-side draw issue, GPU
+  sync/state audit). Found for later: stencil reference and masks are stubs, a stencil-only clear also clears depth,
+  polygon offset and depth bounds are ignored.
+
 ### 2026-09-29 (afternoon): sound on the Mac, right-side-up course, 793 shaders fixed
 
 - **Audio plays on the Mac's speakers.** The AudioRenderer's final mix is a DeviceSink command that the SDK's DSP

@@ -508,6 +508,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     p_vkCmdSetBlendConstants(cb, g_state.blend_color);
     p_vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
 
+    trace_skin(indexed, c, vs, fs);
     if (indexed) {
         uint32_t count = uint32_t(c.i[0]);
         const uint8_t* p = guest_bytes(c.a[0]);

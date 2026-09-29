@@ -437,6 +437,7 @@ void make_upload_buffer(uint64_t size) {
 }
 
 void replay(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth) {
+    if (skin_lists_on()) skin_list_replayed(list, depth);
     for (const Cmd& c : list.cmds) {
         switch (c.op) {
             case Cmd::SetRenderTargets:

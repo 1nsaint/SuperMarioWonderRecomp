@@ -19,6 +19,9 @@ Everything below is switched on with environment variables on the normal build: 
 | `NX_NVN_STATES=1` | decoded state objects and samplers as they are bound | nvn_state.cpp, nvn_sampler.cpp |
 | `NX_DUMP_SHADER_MISSES=1` | writes shader blocks that have no SPIR-V yet (to translate offline) | nvn_shaders.cpp |
 | `NX_NVN_REAL=1` | records every proc's real driver address in `nvn_trace.txt` | nvn_trace.cpp |
+| `NX_TRACE_SKIN=1` | the first draws of every vertex shader with an integer vertex input (skinned models): input formats and streams, vertex uniform blocks, the first vertices' bone indices and the bone rows of c8 they select | nvn_draw_trace.cpp |
+| `NX_TRACE_SKINLISTS=1` | follows command lists that bind skinned programs: recorded (handle, command buffer), called, replayed; dumps the first ones' commands (`P<vs>` binds, `*` skinned, `D` draws, `C<handle>(cmds/draws/programs)` calls, `GONE` for a handle already dropped) | nvn_cmd.cpp |
+| `NX_INT_ATTRIBS=0` | turns off the integer vertex input patch (on by default since #26) | nvn_pipeline.cpp |
 | `NX_ZERO_DRAWS=1` | every draw inside an occlusion query; every 300 frames lists the `vs fs` shader pairs whose draws never passed a single sample (what the scene draws but we lose) | nvn_debug.cpp |
 | `NX_GPU_PROFILE=1` | GPU time per render pass (timestamps at pass starts), top 10 labels every 60 frames: `ms/frame WxH L<level> fs <hash>` | nvn_debug.cpp |
 | `NX_SKIP_FS=<hash>,<hash>` | drops draws with those fragment shaders (measure what they cost, or hide a broken one) | nvn_draw.cpp |
@@ -206,4 +209,24 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
     SPIR-V patch that retypes vertex inputs to integers for integer attribute formats (`patch_int_inputs`): an A/B run
     with it off (`NX_NO_INT_ATTRIBS`, now inverted to `NX_INT_ATTRIBS=1` to turn it on) showed clean scenes (the Wonder
     Flower, the airship, the golden Wonder sky). Off by default until it is right; characters are still invisible
-    either way, so integer inputs are not (or not the only) cause.
+    either way, so integer inputs are not (or not the only) cause. **Update (#26):** the patch is right and is now on by default. The
+    characters were missing for another reason (#26); with both fixes no wedge showed up in the course runs.
+26. **No character in the course: Mario, Luigi, the Talking Flowers, Bowser... never drawn.** Two layers.
+    - *Metal refused every skinned pipeline.* The bone indices (vertex location 6) have an integer format, and the
+      translated shader declares every input as `vec4`: MoltenVK logged `SPIR-V to MSL conversion error: Vertex
+      attribute type mismatch between host and shader` (on stderr only, in the `.out` files, not in `NX_LOG`) and the
+      draws were dropped as `no pipeline` (83,680 in one play session). `patch_int_inputs` (#25) fixes it; it was off.
+    - *The draw lists were gone.* With the patch on, most runs still drew no skinned model at all: no pipeline was
+      even requested. `NX_TRACE_SKINLISTS` showed that the lists binding the skinned programs are recorded, called
+      and replayed every frame, but right after each skinned bind they call per-mesh lists recorded when the course
+      loaded (handles like 0x5833, ~60,000 lists earlier), and those were `GONE`: nvn_cmd.cpp kept the last 65,536
+      handles and dropped older ones that had not been used yet. The characters' lists are first called only after
+      the intro, so whether they survived depended on timing (runs differed: some logged the pipeline errors above,
+      most never drew a character). `NX_ZERO_DRAWS` could not see any of this, since those draws never reached the GPU.
+    - Fix: a handle now lives as long as its command memory, as on the GPU. Each list remembers the bytes it used
+      (memory added by `AddCommandMemory` + our usage estimate), and a newer list recorded over those bytes drops it.
+      The count limit is a safety net only (2^18), and it never drops a list that was not called yet. Memory stayed
+      at 3.2 GB (peak 3.5) through the course. The integer input patch is on by default (`NX_INT_ATTRIBS=0` turns it
+      off). Result: Mario, Luigi, Peach, Daisy, the Toads, Yoshi, Nabbit, Prince Florian, Bowser and Kamek all render
+      (docs/media/wonder/19-21).
+

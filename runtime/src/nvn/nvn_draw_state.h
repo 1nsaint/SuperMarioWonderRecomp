@@ -52,4 +52,7 @@ using TexBindings = std::vector<std::pair<const ShaderInfo*, const DescriptorBin
 void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, const ShaderInfo* vs,
                 const ShaderInfo* fs, const TexBindings& tex_bindings, const std::vector<uint64_t>& handles);
 
+// NX_TRACE_SKIN: skinned draws' inputs, vertex uniform blocks and the bone rows they select.
+void trace_skin(bool indexed, const Cmd& c, const ShaderInfo* vs, const ShaderInfo* fs);
+
 }  // namespace nx::nvn::replay

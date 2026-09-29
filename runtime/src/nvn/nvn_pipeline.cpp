@@ -28,9 +28,10 @@ VkShaderStageFlags stage_bit(ShaderStage s) {
 // `unwritten`: fragment input locations the vertex stage does not write (default_unwritten_inputs).
 VkShaderModule module_of(const ShaderInfo* s, const uint8_t* kinds = nullptr, uint32_t unwritten = 0) {
     static std::map<std::tuple<const ShaderInfo*, std::string, uint32_t>, VkShaderModule> cache;
-    // The integer-vertex-input patch is off unless NX_INT_ATTRIBS=1: as it stands it deformed models into huge
-    // flat wedges in the course (DEBUG.md #25).
-    static const bool off = std::getenv("NX_INT_ATTRIBS") == nullptr;
+    // The integer-vertex-input patch (skinned models' bone indices; without it Metal refuses every character's
+    // pipeline, DEBUG.md #25/#26). NX_INT_ATTRIBS=0 turns it off.
+    static const char* int_env = std::getenv("NX_INT_ATTRIBS");
+    static const bool off = int_env && int_env[0] == '0';
     std::string k = kinds && !off ? std::string(reinterpret_cast<const char*>(kinds), 16) : std::string(16, '\0');
     auto& m = cache[{s, k, unwritten}];
     if (!m) {
