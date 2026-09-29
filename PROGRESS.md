@@ -23,6 +23,20 @@ NVN implemented over Vulkan (MoltenVK).
 
 ## Log
 
+### 2026-09-29 (afternoon): sound on the Mac, right-side-up course, 793 shaders fixed
+
+- **Audio plays on the Mac's speakers.** The AudioRenderer's final mix is a DeviceSink command that the SDK's DSP
+  command processor skips in CPU mode (the ADSP does it on the console); an HLE around
+  `CommandListProcessor::Process` now reads the sink's mix buffers after each 5 ms frame, folds 6 channels to stereo
+  and queues them to SDL3 (40-55 ms latency). A race between the game's sound thread and our render thread
+  (`AudioRenderSystem::Update` vs command generation) is serialized. `NX_AUDIO_DUMP=file.wav` records 10 s.
+- **The course was rendered upside down** since the beginning: NVN's upper-left origin maps NDC +Y to the top like D3D.
+  Negative-height viewports now, NVN's front faces as is (DEBUG.md #17).
+- **793 shaders were silently miscompiled** by the offline translator's SPIR-V back end (dropped `else if` chains):
+  the dialog text among them. Patched in the harness and regenerated (DEBUG.md #18, TRANSLATOR.md).
+- Two investigations ran in parallel with the main line (the translator and the audio output) while the orientation
+  bug was being found; the approach works and will continue.
+
 ### 2026-09-29 (late morning): the opening cutscene plays in 3D
 
 ![Opening: the Flower Kingdom](docs/media/wonder/12-opening-flower-kingdom-3d.png)
@@ -229,7 +243,7 @@ layouts (`Layout/*.blarc`).
 1. Past the opening into World 1-1 "Welcome to the Flower Kingdom!" (Pipe-Rock Plateau), then play it.
 2. Text: the glyph vertex shader's indexed texture-coordinate load (translator), the dialog box colours.
 3. Performance beyond 30 fps headroom: stop waiting for the GPU at every submit, cache descriptor sets.
-4. Audio to the Mac speakers (the renderer now renders; the device sink output is next); `docs/nvn/API.md`.
+4. Audio: longer runs for a rare limiter crash; pace rendering from the device clock; `docs/nvn/API.md`.
 5. Split `nvn_shaders.cpp` (815 lines, over the 700-line cap).
 
 Branch: `feat/nvn-n1-wonder-cpu`, stacked on `feat/nvn-n0-core-split`.

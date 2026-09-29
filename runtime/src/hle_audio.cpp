@@ -1,10 +1,14 @@
 // nn::audio AudioOut at the API level. FMOD (inside main) mixes s16 stereo 48 kHz into AudioOutBuffers and appends
-// them; a player thread hands each one to the platform's audio device (XAudio2 / AAudio) and gives it back to the
-// game (released + system event signalled) when it has been played, so the device clock paces FMOD's mixer.
-// Without a device the same pacing runs on a timer. Audio input reports no devices.
+// them; a player thread hands each one to the platform's audio device (XAudio2 / AAudio / SDL3) and gives it back to
+// the game (released + system event signalled) when it has been played, so the device clock paces FMOD's mixer.
+// Without a device the same pacing runs on a timer. Audio input reports no devices. SDK 16 games (Wonder) use the
+// AudioRenderer instead, rendered in process; its final mix goes to the same device (see below).
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -39,8 +43,25 @@ void release(void* ctx) {
     g_out.cv.notify_all();
 }
 
+// The platform device has one completion callback: AudioOut buffers are guest addresses, the renderer's blocks
+// live in g_render (below) and go back to its free list.
+void render_block_done(void* ctx);
+bool render_owns(void* ctx);
+
+void device_done(void* ctx) {
+    if (render_owns(ctx))
+        render_block_done(ctx);
+    else
+        release(ctx);
+}
+
+bool device_open() {
+    static const bool ok = plat::audio_open(device_done);
+    return ok;
+}
+
 void player() {
-    bool device = plat::audio_open(release);
+    bool device = device_open();
     log("audio: %s", device ? "device output (48 kHz stereo s16)" : "no audio device, timer pacing");
     using clock = std::chrono::steady_clock;
     auto next = clock::now();
@@ -157,8 +178,7 @@ void CreateAudioRendererManagerByHipc(CPU& c) {
 // renderer object (AudioRendererManagerImpl::AudioRendererImpl) has ExecuteAudioRendererRendering, which generates
 // the frame's commands and runs the sdk's own DSP command processor on the calling thread, and its render system
 // (impl + 0x60) signals its own event, which has no kernel object in process. A guest thread of ours renders every
-// 5 ms and signals the game's event itself. (Sending the final mix to the
-// host device is the next step of phase NA; for now the frames are rendered and dropped.)
+// 5 ms and signals the game's event itself, then sends the frame's final mix to the host device.
 constexpr uint64_t kRendererVtable = 0xd04910;     // sdk: vtable of the sf object wrapping AudioRendererImpl
 constexpr uint64_t kExecuteRendering = 0x20cac8;   // sdk: AudioRendererImpl::ExecuteAudioRendererRendering
 
@@ -195,6 +215,167 @@ uint64_t find_renderer(uint64_t handle) {
     return 0;
 }
 
+// ---- the renderer's final mix to the host device ----
+// The command list ends with a DeviceSink command (id 19) naming the final mix's buffers, but the sdk's DSP command
+// processor skips it: on the console the ADSP's sink stage hands those buffers to the output device. So
+// CommandListProcessor::Process is wrapped: after the real one has run the list, the sink's input mix buffers (s32
+// samples in the PCM16 range, one buffer per channel) are summed into g_render.mix; the render thread converts each
+// 5 ms frame to s16 stereo and queues it on the device. Command header: {u32 magic 0xcafebabe; u8 enabled; s8 id;
+// s16 size; u32 estimated time}. DeviceSink (CommandBuffer::Generate<DeviceSink>, sdk+211e10): +0x128 the mix
+// buffers (or the upsampler's), +0x130 input count, +0x134 s16 buffer index per input.
+constexpr uint8_t kCmdDownMix6chTo2ch = 17, kCmdDeviceSink = 19;
+constexpr int kFrame = 240;          // samples per 5 ms at 48 kHz
+constexpr int kBlocks = 64;          // 320 ms of output blocks
+constexpr uint32_t kMaxQueued = 12;  // 60 ms in the device queue: past that, frames are dropped
+constexpr size_t kPrime = 4;         // after an underrun, 20 ms are gathered before playing again
+
+struct RenderOut {
+    std::mutex lock;
+    int32_t mix[kFrame * 2] = {};
+    bool mixed = false;
+    int16_t blocks[kBlocks][kFrame * 2];
+    std::vector<int> free, held;
+    bool priming = true;
+    // statistics since the last log, and the optional dump (NX_AUDIO_DUMP=file.wav: 10 s from the first sound)
+    uint64_t frames = 0, dropped = 0, underruns = 0, silent = 0;
+    double sum_sq = 0;
+    int peak = 0;
+    std::vector<int16_t> dump;
+    RenderOut() {
+        for (int k = kBlocks - 1; k >= 0; k--) free.push_back(k);
+    }
+};
+RenderOut g_render;
+
+bool render_owns(void* ctx) {
+    auto p = static_cast<const uint8_t*>(ctx), b = reinterpret_cast<const uint8_t*>(g_render.blocks);
+    return p >= b && p < b + sizeof g_render.blocks;
+}
+
+void render_block_done(void* ctx) {
+    std::lock_guard lk(g_render.lock);
+    g_render.free.push_back(int((static_cast<int16_t*>(ctx) - g_render.blocks[0]) / (kFrame * 2)));
+}
+
+void capture_device_sink(uint64_t proc) {  // proc: nn::audio::dsp::CommandListProcessor after Process
+    uint64_t cmd = ld<uint64_t>(proc) + 0x20;  // the list header, then the commands (+8 is the cursor: at the end)
+    uint32_t count = ld<uint32_t>(proc + 0x1c), samples = ld<uint32_t>(proc + 0x20), rate = ld<uint32_t>(proc + 0x28);
+    uint32_t frames = rate == 48000 ? samples : kFrame;  // other rates: the upsampler's 48 kHz buffers
+    bool downmixed = false;
+    for (uint32_t i = 0; i < count && ld<uint32_t>(cmd) == 0xcafebabe; i++, cmd += ld<int16_t>(cmd + 6)) {
+        if (!ld<uint8_t>(cmd + 4)) continue;
+        uint8_t id = ld<uint8_t>(cmd + 5);
+        if (id == kCmdDownMix6chTo2ch) downmixed = true;
+        if (id != kCmdDeviceSink) continue;
+        uint64_t buffers = ld<uint64_t>(cmd + 0x128);
+        uint32_t inputs = ld<uint32_t>(cmd + 0x130);
+        static bool once = false;
+        if (!once) {
+            once = true;
+            log("audio: device sink '%s', %u inputs%s, %u samples at %u Hz", reinterpret_cast<const char*>(cmd + 0x20),
+                inputs, downmixed ? " (downmixed to stereo)" : "", samples, rate);
+        }
+        if (!buffers || !inputs || frames != kFrame) continue;
+        auto ch = [&](uint32_t k) {
+            return reinterpret_cast<const int32_t*>(buffers + uint64_t(ld<int16_t>(cmd + 0x134 + 2 * k)) * frames * 4);
+        };
+        const int32_t* l = ch(0);
+        const int32_t* r = inputs > 1 ? ch(1) : l;
+        // Six channels without the sdk's own downmix (FL FR FC LFE RL RR): fold them to stereo here.
+        const int32_t *c = nullptr, *rl = nullptr, *rr = nullptr;
+        if (inputs >= 6 && !downmixed) c = ch(2), rl = ch(4), rr = ch(5);
+        std::lock_guard lk(g_render.lock);
+        for (int s = 0; s < kFrame; s++) {
+            int64_t a = l[s], b = r[s];
+            if (c) {
+                a += (int64_t(c[s]) + rl[s]) * 707 / 1000;
+                b += (int64_t(c[s]) + rr[s]) * 707 / 1000;
+            }
+            g_render.mix[2 * s] += int32_t(std::clamp<int64_t>(a, INT32_MIN, INT32_MAX));
+            g_render.mix[2 * s + 1] += int32_t(std::clamp<int64_t>(b, INT32_MIN, INT32_MAX));
+        }
+        g_render.mixed = true;
+    }
+}
+
+// AudioRenderSystem::Update (the game's RequestUpdate) takes the render system's mutex, but GenerateCommand runs
+// without it: on the console both run on the audio system's side, one after the other. Here the game's sound thread
+// updates while our render thread generates, and an effect being updated mid-generation crashed
+// (EffectContext::UpdateStateByDspShared on a null effect). Both are serialized by this lock.
+std::mutex g_render_system;
+
+void AudioRenderSystemUpdate(CPU& c) {
+    static uint64_t real = find_symbol("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm");
+    std::lock_guard lk(g_render_system);
+    call(c, real);
+}
+
+void CommandListProcessorProcess(CPU& c) {
+    static uint64_t real = find_symbol("_ZN2nn5audio3dsp20CommandListProcessor7ProcessEv");
+    uint64_t proc = c.x[0];
+    call(c, real);
+    capture_device_sink(proc);
+}
+
+void write_wav(const char* path, const std::vector<int16_t>& pcm) {
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return;
+    auto u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+    auto u16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, f); };
+    uint32_t bytes = uint32_t(pcm.size() * 2);
+    std::fwrite("RIFF", 1, 4, f), u32(36 + bytes), std::fwrite("WAVEfmt ", 1, 8, f);
+    u32(16), u16(1), u16(2), u32(48000), u32(48000 * 4), u16(4), u16(16);
+    std::fwrite("data", 1, 4, f), u32(bytes), std::fwrite(pcm.data(), 2, pcm.size(), f);
+    std::fclose(f);
+    log("audio: wrote %s (%zu frames)", path, pcm.size() / 2);
+}
+
+// Called by the render thread after each 5 ms frame.
+void render_submit() {
+    static const bool device = device_open();
+    static const char* dump_path = std::getenv("NX_AUDIO_DUMP");
+    std::lock_guard lk(g_render.lock);
+    RenderOut& o = g_render;
+    if (!o.mixed) return;
+    o.mixed = false;
+    int16_t pcm[kFrame * 2];
+    bool any = false;
+    for (int s = 0; s < kFrame * 2; s++) {
+        int v = std::clamp(o.mix[s], -32768, 32767);
+        pcm[s] = int16_t(v);
+        o.mix[s] = 0;
+        o.peak = std::max(o.peak, std::abs(v));
+        o.sum_sq += double(v) * v;
+        any |= v != 0;
+    }
+    o.silent += !any;
+    if (dump_path && o.dump.size() < 48000 * 2 * 10 && (any || !o.dump.empty())) {
+        o.dump.insert(o.dump.end(), pcm, pcm + kFrame * 2);
+        if (o.dump.size() >= 48000 * 2 * 10) write_wav(dump_path, o.dump);
+    }
+    if (++o.frames % 2000 == 0) {
+        log("audio: mix out: peak %d, rms %.0f, %llu of 2000 frames silent, %llu dropped, %llu underruns, queue %u",
+            o.peak, std::sqrt(o.sum_sq / (2000.0 * kFrame * 2)), (unsigned long long)o.silent,
+            (unsigned long long)o.dropped, (unsigned long long)o.underruns, device ? plat::audio_queued() : 0);
+        o.peak = 0, o.sum_sq = 0, o.silent = o.dropped = o.underruns = 0;
+    }
+    if (!device) return;
+    uint32_t queued = plat::audio_queued();
+    if (queued + o.held.size() >= kMaxQueued || o.free.empty()) {  // the device fell behind: keep latency bounded
+        o.dropped++;
+        return;
+    }
+    if (queued == 0 && !o.priming) o.priming = true, o.underruns++;
+    int k = o.free.back();
+    o.free.pop_back();
+    std::memcpy(o.blocks[k], pcm, sizeof pcm);
+    o.held.push_back(k);
+    if (o.priming && o.held.size() < kPrime) return;
+    o.priming = false;
+    for (int h : o.held) plat::audio_submit(o.blocks[h], sizeof pcm, o.blocks[h]);
+    o.held.clear();
+}
+
 void audio_render_thread(CPU& c) {
     log("audio: render thread running");
     uint64_t next = plat::monotonic_ns();
@@ -213,11 +394,13 @@ void audio_render_thread(CPU& c) {
             uint64_t saved[31];
             std::memcpy(saved, c.x, sizeof saved);
             c.x[0] = impl;
+            std::lock_guard lk(g_render_system);
             call(c, sdk_base() + kExecuteRendering);
             last_rc = c.x[0];
             std::memcpy(c.x, saved, sizeof saved);
         }
         busy_ns += plat::monotonic_ns() - t0;
+        render_submit();
         if (++frames % 2000 == 0)
             log("audio: %llu frames rendered, %.1f us each, last result %llx", (unsigned long long)frames,
                 double(busy_ns) / 1000.0 / 2000.0, (unsigned long long)last_rc), busy_ns = 0;
@@ -339,5 +522,7 @@ NX_HLE("_ZN2nn5audio26InitializeAudioInParameterEPNS0_16AudioInParameterE", zero
 NX_HLE("_ZN2nn5audio32CreateAudioRendererManagerByHipcEv", CreateAudioRendererManagerByHipc);
 NX_HLE("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm", OpenAudioRenderer);
 NX_HLE("__audio_render_thread", audio_render_thread);
+NX_HLE("_ZN2nn5audio3dsp20CommandListProcessor7ProcessEv", CommandListProcessorProcess);
+NX_HLE("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm", AudioRenderSystemUpdate);
 
 }  // namespace nx
