@@ -66,6 +66,13 @@ void replay_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list);  // nvn
 void forget_image_views(const GpuImage& img);
 // nvn_debug.cpp: NX_SNAP_DRAWS mid-frame snapshots of colour target 0.
 bool debug_snap_wanted(uint64_t draw);
+// nvn_debug.cpp: NX_ZERO_DRAWS, shader pairs whose draws produce no pixel.
+bool zero_draws_on();
+void zero_draws_begin_submit(VkCommandBuffer cb);
+bool zero_draws_begin(VkCommandBuffer cb, const std::string& label);
+void zero_draws_end(VkCommandBuffer cb);
+void zero_draws_collect();
+void zero_draws_log();
 void debug_snapshot(VkCommandBuffer cb, GpuImage& img, uint64_t draw);
 void debug_snapshots_write();  // nvn_pipeline.cpp: before an image is freed
 

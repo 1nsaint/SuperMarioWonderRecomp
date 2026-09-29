@@ -672,6 +672,7 @@ void gpu_submit(CPU&, const std::vector<std::shared_ptr<CmdList>>& lists) {
     if (!begin()) return;
     draw_begin_submit();
     gpu_profile_begin(g_cb);
+    zero_draws_begin_submit(g_cb);
     uint64_t t0 = plat::monotonic_ns();
     Targets st;
     for (auto& l : lists) replay(g_cb, st, *l, 0);
@@ -681,6 +682,7 @@ void gpu_submit(CPU&, const std::vector<std::shared_ptr<CmdList>>& lists) {
     end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);
     draw_end_submit();
     gpu_profile_collect();
+    zero_draws_collect();
     if (uint64_t n = draw_take_dump_request(); n && dump_every() && n % dump_every() == 0) debug_dump_textures(n);
 }
 
@@ -692,6 +694,7 @@ void present_headless(uint64_t texture) {
     presents++;
     if (presents % (presents < 300 ? 60 : 300) == 0) draw_log_stats();
     if (presents % 60 == 0) log_timing(60), gpu_profile_log(60);
+    if (presents % 300 == 0) zero_draws_log();
     bool dump = false;
     if (src && src->layout != VK_IMAGE_LAYOUT_UNDEFINED && dump_every() && presents % dump_every() == 0) {
         transition(g_cb, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -744,6 +747,7 @@ void gpu_present(uint64_t texture) {
     presents++;
     if (presents % (presents < 300 ? 60 : 300) == 0) draw_log_stats();
     if (presents % 60 == 0) log_timing(60), gpu_profile_log(60);
+    if (presents % 300 == 0) zero_draws_log();
     bool dump = src && dump_every() && presents % dump_every() == 0 && readback_record(*src);
     end_and_wait(g_acquired, g_rendered);
     if (dump) readback_write(*src, presents);

@@ -327,4 +327,72 @@ void debug_snapshots_write() {  // after the submit's fence
     g_snaps.clear();
 }
 
+// ---- draws that produce no pixels (NX_ZERO_DRAWS=1) ------------------------------------------------------------------
+// Every draw runs inside an occlusion query; after each submit the samples passed are added up per (vertex, fragment)
+// shader pair. Every 300 presents the pairs whose draws never produced a pixel are logged, most drawn first: what the
+// scene tries to show and we lose (culled, depth-failed, off screen, or broken vertex data).
+
+namespace {
+
+constexpr uint32_t kZeroQueries = 8192;
+VkQueryPool g_zero_pool = VK_NULL_HANDLE;
+std::vector<std::string> g_zero_labels;  // this submit's queries
+struct ZeroStat {
+    uint64_t draws = 0, samples = 0;
+};
+std::map<std::string, ZeroStat> g_zero_stats;
+
+}  // namespace
+
+bool zero_draws_on() {
+    static const bool on = std::getenv("NX_ZERO_DRAWS") != nullptr;
+    return on;
+}
+
+void zero_draws_begin_submit(VkCommandBuffer cb) {
+    if (!zero_draws_on()) return;
+    if (!g_zero_pool) {
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_OCCLUSION;
+        qi.queryCount = kZeroQueries;
+        p_vkCreateQueryPool(vk_device(), &qi, nullptr, &g_zero_pool);
+    }
+    p_vkCmdResetQueryPool(cb, g_zero_pool, 0, kZeroQueries);
+    g_zero_labels.clear();
+}
+
+// Around one draw call (inside the render pass). Returns false when this submit's queries are used up.
+bool zero_draws_begin(VkCommandBuffer cb, const std::string& label) {
+    if (!zero_draws_on() || !g_zero_pool || g_zero_labels.size() >= kZeroQueries) return false;
+    p_vkCmdBeginQuery(cb, g_zero_pool, uint32_t(g_zero_labels.size()), 0);
+    g_zero_labels.push_back(label);
+    return true;
+}
+
+void zero_draws_end(VkCommandBuffer cb) { p_vkCmdEndQuery(cb, g_zero_pool, uint32_t(g_zero_labels.size() - 1)); }
+
+void zero_draws_collect() {  // after the submit's fence
+    if (!zero_draws_on() || g_zero_labels.empty()) return;
+    std::vector<uint64_t> r(g_zero_labels.size());
+    if (p_vkGetQueryPoolResults(vk_device(), g_zero_pool, 0, uint32_t(r.size()), r.size() * 8, r.data(), 8,
+                                VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+        return;
+    for (size_t k = 0; k < r.size(); k++) {
+        ZeroStat& z = g_zero_stats[g_zero_labels[k]];
+        z.draws++, z.samples += r[k];
+    }
+}
+
+void zero_draws_log() {
+    if (!zero_draws_on()) return;
+    std::vector<std::pair<uint64_t, std::string>> zero;
+    for (auto& [label, z] : g_zero_stats)
+        if (z.samples == 0) zero.push_back({z.draws, label});
+    std::sort(zero.rbegin(), zero.rend());
+    log("zero draws: %zu of %zu shader pairs produced no pixel", zero.size(), g_zero_stats.size());
+    for (size_t k = 0; k < zero.size() && k < 25; k++)
+        log("zero draws: %6llu x %s", (unsigned long long)zero[k].first, zero[k].second.c_str());
+    g_zero_stats.clear();
+}
+
 }  // namespace nx::nvn
