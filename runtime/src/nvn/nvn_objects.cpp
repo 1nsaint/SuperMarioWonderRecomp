@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 
 #include "nvn.h"
 #include "platform.h"
@@ -145,8 +146,27 @@ void MemoryPoolMapVirtual(CPU& c) {
     c.x[0] = 1;
 }
 
-// Guest memory is host memory and the GPU side is coherent with it (imported host memory): nothing to flush.
-void MemoryPoolFlushMappedRange(CPU&) {}
+// Textures by memory pool, to find the ones a flushed range covers.
+std::map<uint64_t, std::set<uint64_t>>& pool_textures() {
+    static std::map<uint64_t, std::set<uint64_t>> m;
+    return m;
+}
+
+// Guest memory is host memory, so buffers need nothing. Textures are copies on the GPU (untiled at first use): a
+// flush over one means the CPU wrote it (a glyph cache rasterises text this way), so it is uploaded again.
+// (NVNmemoryPool*, ptrdiff_t offset, size_t size)
+void MemoryPoolFlushMappedRange(CPU& c) {
+    uint64_t pool = c.x[0], off = c.x[1], size = c.x[2];
+    std::lock_guard lk(objects_lock());
+    auto it = pool_textures().find(pool);
+    if (it == pool_textures().end()) return;
+    for (uint64_t guest : it->second) {
+        auto o = objects().find(guest);
+        auto* t = o == objects().end() ? nullptr : dynamic_cast<Texture*>(o->second.get());
+        if (!t || t->offset >= off + size || t->offset + t->storage_size <= off) continue;
+        if (t->image) t->dirty = true;  // rendered images ignore it (nvn_pipeline.cpp)
+    }
+}
 void MemoryPoolInvalidateMappedRange(CPU&) {}
 
 // ---- buffers ----------------------------------------------------------------------------------------------------
@@ -218,6 +238,10 @@ void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBu
     t.pool = driver(c, "nvnTextureBuilderGetMemoryPool", {builder});
     t.offset = driver(c, "nvnTextureBuilderGetMemoryOffset", {builder});
     t.storage_size = texture_storage_size(c, builder);
+    {
+        std::lock_guard lk(objects_lock());
+        pool_textures()[t.pool].insert(guest);
+    }
     // Packaged (BNTX) textures were tiled offline with a block height often one step below the default
     // (docs/nvn/TILING.md). The layout the builder returns does not carry it (it reads 1 for every texture in
     // Wonder), so it only says "packaged", and the block height is the fit that matches every BNTX texture in the
@@ -252,7 +276,49 @@ void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBu
     c.x[0] = 1;
 }
 
-void TextureFinalize(CPU& c) { destroy(c.x[0]); }
+void TextureFinalize(CPU& c) {
+    {
+        std::lock_guard lk(objects_lock());
+        for (auto& [pool, set] : pool_textures()) set.erase(c.x[0]);
+    }
+    destroy(c.x[0]);
+}
+
+// nvnTextureWriteTexels(const NVNtexture*, const NVNtextureView*, const NVNcopyRegion*, const void* data) and the
+// Strided form (+ ptrdiff_t rowStride, ptrdiff_t imageStride). NVNcopyRegion: {int x, y, z, width, height, depth}.
+// The driver would swizzle the texels into the texture's memory; we keep them for the GPU image instead.
+void write_texels(CPU& c, uint64_t row_stride, uint64_t image_stride) {
+    auto* t = get<Texture>(c.x[0]);
+    uint64_t region = c.x[2], data = c.x[3];
+    if (!t || !region || !data) return;
+    ViewInfo v = read_view(c, c.x[1]);
+    Texture::TexelWrite w;
+    w.level = v.base_level;
+    w.x = ld<uint32_t>(region), w.y = ld<uint32_t>(region + 4), w.z = ld<uint32_t>(region + 8);
+    w.w = ld<uint32_t>(region + 12), w.h = ld<uint32_t>(region + 16), w.d = std::max(1u, ld<uint32_t>(region + 20));
+    uint32_t bw = 1, bh = 1, bytes = 4;
+    format_block(t->format, bw, bh, bytes);
+    uint64_t row = uint64_t((w.w + bw - 1) / bw) * bytes, rows = (w.h + bh - 1) / bh;
+    if (!row_stride) row_stride = row;
+    if (!image_stride) image_stride = row_stride * rows;
+    if (row * rows * w.d > (256ull << 20)) return;
+    w.data.resize(row * rows * w.d);
+    for (uint32_t z = 0; z < w.d; z++)
+        for (uint64_t r = 0; r < rows; r++)
+            std::memcpy(w.data.data() + (z * rows + r) * row,
+                        reinterpret_cast<const void*>(data + z * image_stride + r * row_stride), row);
+    static std::map<uint64_t, uint64_t> counts;
+    std::lock_guard lk(objects_lock());
+    uint64_t n = ++counts[c.x[0]];
+    if (n == 1 || n == 100 || n == 1000)
+        log("nvn: WriteTexels #%llu into %llx (%ux%u fmt %#x): %ux%ux%u at %u,%u,%u level %u", (unsigned long long)n,
+            (unsigned long long)c.x[0], t->width, t->height, t->format, w.w, w.h, w.d, w.x, w.y, w.z, w.level);
+    t->writes.push_back(std::move(w));
+}
+
+void TextureWriteTexels(CPU& c) { write_texels(c, 0, 0); }
+void TextureWriteTexelsStrided(CPU& c) { write_texels(c, c.x[4], c.x[5]); }
+void TextureFlushTexels(CPU&) {}  // coherent: the writes above are what matters
 
 #define NX_TEXTURE_GETTER(fn, field)          \
     void fn(CPU& c) {                         \
@@ -292,6 +358,10 @@ void TexturePoolRegister(CPU& c) {
     // The view may pick levels or layers (a bloom chain samples one mip of its target) and override the swizzle
     // (a font atlas in R8 is registered with alpha = R).
     ViewInfo v = read_view(c, c.x[3]);
+    if (std::getenv("NX_TRACE_TEXTURES"))
+        log("nvn: pool %llx id %#x = texture %llx view %llx: levels %u+%u layers %u+%u swizzle %08x",
+            (unsigned long long)c.x[0], uint32_t(c.x[1]), (unsigned long long)c.x[2], (unsigned long long)c.x[3],
+            v.base_level, v.levels, v.min_layer, v.layers, v.swizzle);
     if (auto* d = get<DescriptorPool>(c.x[0])) {
         std::lock_guard lk(objects_lock());
         d->textures[uint32_t(c.x[1])] = c.x[2];
@@ -329,6 +399,9 @@ NX_HLE("nvnMemoryPoolInitialize", MemoryPoolInitialize);
 NX_HLE("nvnMemoryPoolFinalize", MemoryPoolFinalize);
 NX_HLE("nvnMemoryPoolMap", MemoryPoolMap);
 NX_HLE("nvnMemoryPoolMapVirtual", MemoryPoolMapVirtual);
+NX_HLE("nvnTextureWriteTexels", TextureWriteTexels);
+NX_HLE("nvnTextureWriteTexelsStrided", TextureWriteTexelsStrided);
+NX_HLE("nvnTextureFlushTexels", TextureFlushTexels);
 NX_HLE("nvnMemoryPoolGetBufferAddress", MemoryPoolGetBufferAddress);
 NX_HLE("nvnMemoryPoolGetSize", MemoryPoolGetSize);
 NX_HLE("nvnMemoryPoolGetFlags", MemoryPoolGetFlags);

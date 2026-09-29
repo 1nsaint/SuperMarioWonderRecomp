@@ -139,6 +139,13 @@ VkImageView view_of(GpuImage& img, VkImageViewType type, const ViewInfo& view) {
 void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
     img.uploaded = true;
     if (!t.memory || !t.storage_size) return;
+    if (std::getenv("NX_TRACE_UPLOADS") && t.storage_size >= (1u << 20)) {
+        const uint8_t* m = reinterpret_cast<const uint8_t*>(t.memory);
+        size_t nz = 0;
+        for (uint64_t k = 0; k < t.storage_size; k += 64) nz += m[k] != 0;
+        log("nvn: upload %ux%u fmt %#x stride %u: %zu of %llu sampled bytes non-zero", t.width, t.height, t.format,
+            t.stride, nz, (unsigned long long)(t.storage_size / 64));
+    }
     uint32_t bw = 1, bh = 1, bytes = 4;
     format_block(t.format, bw, bh, bytes);
     std::vector<uint8_t> linear;
@@ -378,9 +385,62 @@ VkSampler sampler_for(const SamplerInfo& s, bool shadow) {
 
 // ---- sampled textures -------------------------------------------------------------------------------------------------
 
+// Pending nvnTextureWriteTexels regions go to the image (a transfer: outside render passes).
+void apply_texel_writes(VkCommandBuffer cb, Texture& t, GpuImage& img) {
+    std::vector<Texture::TexelWrite> writes;
+    {
+        std::lock_guard lk(objects_lock());
+        writes.swap(t.writes);
+    }
+    if (writes.empty()) return;
+    VkImageLayout back = img.layout;
+    transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    bool is3d = img.view_type == VK_IMAGE_VIEW_TYPE_3D;
+    for (const auto& w : writes) {
+        if (w.level >= img.levels) continue;
+        Upload u = upload(w.data.data(), w.data.size(), 16);
+        VkBufferImageCopy r{};
+        r.bufferOffset = u.offset;
+        r.imageSubresource = {img.aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                                  ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT)
+                                  : img.aspect,
+                              w.level, is3d ? 0 : std::min(w.z, img.layers - 1), is3d ? 1 : std::min(w.d, img.layers)};
+        r.imageOffset = {int32_t(w.x), int32_t(w.y), is3d ? int32_t(w.z) : 0};
+        r.imageExtent = {w.w, w.h, is3d ? w.d : 1};
+        p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+    }
+    if (back != VK_IMAGE_LAYOUT_UNDEFINED) transition(cb, img, back);
+}
+
+uint64_t g_submit_serial = 0;
+
+uint64_t hash_memory(const uint8_t* p, uint64_t size) {
+    uint64_t h = 0x9E3779B97F4A7C15ull, n = size / 8;
+    const uint64_t* w = reinterpret_cast<const uint64_t*>(p);
+    for (uint64_t k = 0; k < n; k++) h = (h ^ w[k]) * 0x100000001B3ull + (h >> 29);
+    return h;
+}
+
+// A pitch-linear texture the GPU does not write: did the CPU change it since the last upload?
+void check_linear_content(Texture& t) {
+    if (!t.stride || !t.memory || !t.image || t.image->rendered || t.hashed_submit == g_submit_serial) return;
+    t.hashed_submit = g_submit_serial;
+    uint64_t h = hash_memory(reinterpret_cast<const uint8_t*>(t.memory), t.storage_size);
+    if (t.content_hash && h != t.content_hash) t.dirty = true;
+    t.content_hash = h;
+}
+
+void pipeline_begin_submit() { g_submit_serial++; }
+
 bool sampled_ready(uint64_t texture) {
     Texture* t = get<Texture>(texture);
     if (!t || !t->image) return false;
+    check_linear_content(*t);
+    if (t->dirty && !t->image->rendered) return false;
+    {
+        std::lock_guard lk(objects_lock());
+        if (!t->writes.empty()) return false;
+    }
     const GpuImage& img = *t->image;
     return img.rendered ? img.layout == VK_IMAGE_LAYOUT_GENERAL
                         : img.uploaded && img.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -411,7 +471,9 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
     GpuImage* img = t ? image_of(texture) : nullptr;
     *layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     if (!img) return dummy_view(cb, shape);
-    if (!img->rendered && !img->uploaded) upload_texture(cb, *t, *img);
+    bool dirty = t->dirty.exchange(false);
+    if (!img->rendered && (!img->uploaded || dirty)) upload_texture(cb, *t, *img);
+    apply_texel_writes(cb, *t, *img);
     if (img->layout == VK_IMAGE_LAYOUT_UNDEFINED) {  // never written: black, not garbage
         transition(cb, *img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkImageSubresourceRange r{img->aspect, 0, img->levels, 0, img->layers};

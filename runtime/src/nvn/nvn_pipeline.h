@@ -51,6 +51,7 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
 VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer);
 // True when sampled_view() would need no transfer or layout change (it can then be called inside a render pass).
 bool sampled_ready(uint64_t texture);
+void pipeline_begin_submit();  // per-submit state (the content checks of pitch-linear textures)
 bool dummy_ready(const ImageShape& shape);
 // A 1x1 black texture of the shape, for bindings with nothing behind them.
 VkImageView dummy_view(VkCommandBuffer cb, const ImageShape& shape);

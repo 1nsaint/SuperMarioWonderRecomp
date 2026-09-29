@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -101,6 +102,17 @@ struct Texture : Object {
     uint64_t memory = 0, gpu = 0;
     uint32_t block_height_gobs = 0;  // packaged (BNTX) textures carry their own; 0: the layout's default
     uint8_t swizzle[4] = {2, 3, 4, 5};  // NVNtextureSwizzle per channel (0 zero, 1 one, 2 R, 3 G, 4 B, 5 A)
+    // nvnTextureWriteTexels data not yet on the GPU (a glyph cache is filled this way): applied before the next use.
+    struct TexelWrite {
+        uint32_t level = 0, x = 0, y = 0, z = 0, w = 0, h = 0, d = 0;
+        std::vector<uint8_t> data;  // rows of whole blocks, tightly packed
+    };
+    std::vector<TexelWrite> writes;  // under objects_lock()
+    // The CPU wrote the texture's memory (nvnMemoryPoolFlushMappedRange over it, e.g. a glyph cache): upload again.
+    std::atomic<bool> dirty{false};
+    // Pitch-linear textures the CPU keeps writing without a flush (Wonder's glyph cache: 2048x8192 R8): their memory
+    // is hashed at most once per submit that samples them, and a change means an upload.
+    uint64_t content_hash = 0, hashed_submit = 0;
     std::shared_ptr<GpuImage> image;  // made on first use by the GPU
 };
 

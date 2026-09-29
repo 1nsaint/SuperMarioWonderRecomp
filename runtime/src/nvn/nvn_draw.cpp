@@ -105,8 +105,8 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
 }
 
 // The buffer a descriptor points to: `bytes` copied into the upload buffer (at least 16 bytes, zero padded).
-VkDescriptorBufferInfo buffer_of(const void* bytes, uint64_t size) {
-    uint64_t n = std::max<uint64_t>((size + 15) & ~15ull, 16);
+VkDescriptorBufferInfo buffer_of(const void* bytes, uint64_t size, uint64_t min_size = 16) {
+    uint64_t n = std::max<uint64_t>((size + 15) & ~15ull, min_size);
     Upload u = upload_alloc(n, 256);
     std::memset(u.ptr, 0, n);
     if (bytes && size) std::memcpy(u.ptr, bytes, size);
@@ -221,7 +221,9 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                 case NvnSource::UniformAsStorage: {
                     const Range& r = b.nvn.index >= 0 && b.nvn.index < 18 ? g_state.uniforms[st][b.nvn.index] : Range{};
                     const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
-                    info = buffer_of(p, p ? std::min<uint64_t>(r.size, 0x10000) : 0);
+                    // Reads past the bound size return 0 on Maxwell and garbage on Metal (a UI shader read c3[10]
+                    // of a 0x90-byte block and wrote Inf): the bound data goes in a zero-padded 4 KB at least.
+                    info = buffer_of(p, p ? std::min<uint64_t>(r.size, 0x10000) : 0, 0x1000);
                     break;
                 }
                 case NvnSource::StorageBuffer: {
@@ -367,7 +369,10 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     static const char* target_env = std::getenv("NX_TRACE_TARGET");
     static const uint64_t trace_target = target_env ? std::strtoull(target_env, nullptr, 16) : 0;
     static uint64_t traced = 0;
-    if (trace_env && g_stats.done >= trace_from && traced < 80 && (!trace_target || t.colors[0] == trace_target)) {
+    // NX_TRACE_FS_HASH=<hash>: only draws with that fragment shader.
+    static const char* fs_env = std::getenv("NX_TRACE_FS_HASH");
+    if (trace_env && g_stats.done >= trace_from && traced < 80 && (!trace_target || t.colors[0] == trace_target) &&
+        (!fs_env || (fs && fs->hash == fs_env))) {
         traced++;
         std::string tex;
         for (size_t k = 0; k < tex_bindings.size(); k++) {
@@ -383,8 +388,22 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         }
         if (const Range& u = g_state.uniforms[1][0]; u.address)
             if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
-                log("  fs c3 @%llx+%llx: %g %g %g %g | %g %g %g %g", (unsigned long long)u.address,
-                    (unsigned long long)u.size, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+                for (uint64_t k = 0; k < std::min<uint64_t>(u.size / 16, 8); k++)
+                    log("  fs c3[%llu] @%llx: %g %g %g %g", (unsigned long long)k, (unsigned long long)u.address,
+                        f[4 * k], f[4 * k + 1], f[4 * k + 2], f[4 * k + 3]);
+        for (int k = 0; k < 2; k++)
+            if (const Range& r = g_state.storage[0][k]; r.address) {
+                auto* f = reinterpret_cast<const float*>(guest_bytes(r.address));
+                log("  vs s%d @%llx+%llx: %g %g %g %g %g %g %g %g", k, (unsigned long long)r.address,
+                    (unsigned long long)r.size, f ? f[0] : -1, f ? f[1] : -1, f ? f[2] : -1, f ? f[3] : -1,
+                    f ? f[4] : -1, f ? f[5] : -1, f ? f[6] : -1, f ? f[7] : -1);
+            }
+        if (fs) {
+            const auto& k = fs->constants;
+            const float* f = reinterpret_cast<const float*>(k.data());
+            log("  fs constants %zu bytes: %g %g %g %g", k.size(), k.size() >= 4 ? f[0] : -1, k.size() >= 8 ? f[1] : -1,
+                k.size() >= 12 ? f[2] : -1, k.size() >= 16 ? f[3] : -1);
+        }
         const BlendTarget& b0 = g_state.blend[0];
         log("  blend %u (%u %u %u %u eq %u %u) mask %x logic %x alpha %x fmt %d", g_state.color.blend_enable[0], b0.src_rgb,
             b0.dst_rgb, b0.src_a, b0.dst_a, b0.eq_rgb, b0.eq_a, g_state.mask.mask[0], g_state.color.logic_op,
@@ -393,16 +412,19 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             g_state.viewport[1], g_state.viewport[2], g_state.viewport[3], g_state.has_viewport, g_state.scissor[0],
             g_state.scissor[1], g_state.scissor[2], g_state.scissor[3], g_state.has_scissor, g_state.polygon.cull,
             g_state.polygon.front, g_state.depth_near, g_state.depth_far, g_state.depth.depth_test);
-        log("draw %llu: vs %s fs %s mode %u %s count %d targets %u:%llx depth %llx%s", (unsigned long long)g_stats.done,
+        log("draw %llu: vs %s fs %s mode %u %s count %d x%d targets %u:%llx depth %llx%s", (unsigned long long)g_stats.done,
             vs->hash.c_str(), fs ? fs->hash.c_str() : "-", mode, indexed ? "indexed" : "arrays",
-            indexed ? c.i[0] : c.i[1], t.color_count, (unsigned long long)t.colors[0], (unsigned long long)t.depth, tex.c_str());
+            indexed ? c.i[0] : c.i[1], c.i[3], t.color_count, (unsigned long long)t.colors[0], (unsigned long long)t.depth, tex.c_str());
     }
     return true;
 }
 
 }  // namespace
 
-void draw_begin_submit() { g_rendering = false; }
+void draw_begin_submit() {
+    g_rendering = false;
+    pipeline_begin_submit();
+}
 
 uint64_t recorded_draws();
 
