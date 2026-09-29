@@ -78,6 +78,23 @@ bool identity(const VkComponentMapping& m) {
            id(m.a, VK_COMPONENT_SWIZZLE_A);
 }
 
+// Views Metal accepts of an image: cubes only of cube images with 6 layers per cube, 3D only of 3D images (a 2D
+// view of a 3D image is for rendering a slice), 1D of 1D. A shader declaring another shape than the texture it gets
+// (a samplerCube given a 2D texture) reads the dummy instead: Metal aborts on the view.
+bool view_compatible(const GpuImage& img, VkImageViewType type, uint32_t layers) {
+    bool cube_img = img.view_type == VK_IMAGE_VIEW_TYPE_CUBE || img.view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+    bool img3d = img.view_type == VK_IMAGE_VIEW_TYPE_3D;
+    bool img1d = img.view_type == VK_IMAGE_VIEW_TYPE_1D || img.view_type == VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+    switch (type) {
+        case VK_IMAGE_VIEW_TYPE_CUBE:
+        case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY: return cube_img && layers >= 6;
+        case VK_IMAGE_VIEW_TYPE_3D: return img3d;
+        case VK_IMAGE_VIEW_TYPE_1D:
+        case VK_IMAGE_VIEW_TYPE_1D_ARRAY: return img1d;
+        default: return !img3d && !img1d;
+    }
+}
+
 // A view for sampling: the image's own when it fits, else one of the view type with the texture's swizzle.
 VkImageView view_of(GpuImage& img, VkImageViewType type, const ViewInfo& view) {
     uint32_t swizzle = view.swizzle;
@@ -104,13 +121,15 @@ VkImageView view_of(GpuImage& img, VkImageViewType type, const ViewInfo& view) {
         ci.viewType = type;
         ci.format = img.format;
         ci.components = m;
-        uint32_t layers = view.layers ? view.layers : img.layers - min_layer;
+        uint32_t layers = std::min(view.layers ? view.layers : img.layers - min_layer, img.layers - min_layer);
         if (type == VK_IMAGE_VIEW_TYPE_2D || type == VK_IMAGE_VIEW_TYPE_1D) layers = 1;
         if (type == VK_IMAGE_VIEW_TYPE_CUBE) layers = 6;
+        if (type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) layers -= layers % 6;
+        if (!view_compatible(img, type, layers)) return VK_NULL_HANDLE;
         ci.subresourceRange = {img.aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
                                    ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT)
                                    : img.aspect,
-                               base, levels, min_layer, std::min(layers, img.layers - min_layer)};
+                               base, levels, min_layer, layers};
         if (p_vkCreateImageView(vk_device(), &ci, nullptr, &v) != VK_SUCCESS) v = img.view;
     }
     return v;
@@ -403,7 +422,12 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
     }
     *layout = img->rendered ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     transition(cb, *img, *layout);
-    return view_of(*img, view_type(shape), view ? *view : ViewInfo{});
+    VkImageView v = view_of(*img, view_type(shape), view ? *view : ViewInfo{});
+    if (!v) {
+        *layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        return dummy_view(cb, shape);
+    }
+    return v;
 }
 
 std::map<VkImageViewType, GpuImage>& dummies() {

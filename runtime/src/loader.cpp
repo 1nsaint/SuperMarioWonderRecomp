@@ -150,6 +150,8 @@ std::string describe(uint64_t addr) {
     return buf;
 }
 
+void backtrace(CPU& c);
+
 // Indirect calls (every blr of the game) look the target up here: the modules' text ranges in a small flat array.
 struct FastModule {
     uint64_t base, text_size;
@@ -164,8 +166,14 @@ void call(CPU& c, uint64_t t) {
         uint64_t off = t - m.base;
         if (off < m.text_size) [[likely]] {
             Fn fn = m.table[off >> 2];
-            if (!fn) [[unlikely]]
+            if (!fn) [[unlikely]] {
+                for (int k = 0; k < 31; k += 4)
+                    log("  x%-2d %016llx %016llx %016llx %016llx", k, (unsigned long long)c.x[k],
+                        (unsigned long long)c.x[k + 1], (unsigned long long)c.x[k + 2],
+                        (unsigned long long)(k + 3 < 31 ? c.x[k + 3] : c.x[31]));
+                backtrace(c);
                 fatal("call into the middle of a function: %s (lr %s)", describe(t).c_str(), describe(c.x[30]).c_str());
+            }
             fn(c);
             return;
         }
@@ -182,8 +190,6 @@ void call(CPU& c, uint64_t t) {
     }
     fatal("call to %llx (%s), lr %s", (unsigned long long)t, describe(t).c_str(), describe(c.x[30]).c_str());
 }
-
-void backtrace(CPU& c);
 
 void trace_sp(CPU& c, uint64_t pc) {
     log("sp %llx x19 %llx at %s", (unsigned long long)c.x[31], (unsigned long long)c.x[19], describe(pc).c_str());

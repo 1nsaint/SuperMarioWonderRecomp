@@ -2,9 +2,11 @@
 // NX_DUMP_FRAMES dumps, each listed texture's level 0 / layer 0 to <data root>/frames/NNNNN_<texture>.ppm. The image
 // is blitted to RGBA8 first, so float and packed formats come out as the GPU would display them (clamped to 0..1).
 // Runs under the GPU lock, after the frame's work completed, on its own command buffer.
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -189,6 +191,71 @@ void debug_dump_textures(uint64_t frame) {
         }
         s.destroy(d);
     }
+}
+
+// ---- GPU profile (NX_GPU_PROFILE=1) --------------------------------------------------------------------------------
+// A timestamp at the start of every render pass and at the end of each submit; the time between two marks goes to
+// the first one's label ("<target WxH> fs <hash>"). Totals per label are logged every 60 presents, largest first.
+// Apple GPUs sample timestamps at encoder boundaries, which is what render passes are here.
+
+namespace {
+
+constexpr uint32_t kMarks = 1024;
+VkQueryPool g_queries = VK_NULL_HANDLE;
+std::vector<std::string> g_labels;
+std::map<std::string, std::pair<double, uint64_t>> g_totals;  // label -> (ms, passes)
+double g_period_ns = 1.0;
+
+}  // namespace
+
+bool gpu_profile_on() {
+    static const bool on = std::getenv("NX_GPU_PROFILE") != nullptr;
+    return on;
+}
+
+void gpu_profile_begin(VkCommandBuffer cb) {
+    if (!gpu_profile_on()) return;
+    if (!g_queries) {
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = kMarks;
+        p_vkCreateQueryPool(vk_device(), &qi, nullptr, &g_queries);
+        VkPhysicalDeviceProperties props{};
+        p_vkGetPhysicalDeviceProperties(vk_physical(), &props);
+        g_period_ns = props.limits.timestampPeriod;
+    }
+    p_vkCmdResetQueryPool(cb, g_queries, 0, kMarks);
+    g_labels.clear();
+}
+
+void gpu_profile_mark(VkCommandBuffer cb, const std::string& label) {
+    if (!gpu_profile_on() || !g_queries || g_labels.size() >= kMarks) return;
+    p_vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_queries, uint32_t(g_labels.size()));
+    g_labels.push_back(label);
+}
+
+void gpu_profile_collect() {  // after the submit's fence
+    if (!gpu_profile_on() || g_labels.size() < 2) return;
+    std::vector<uint64_t> t(g_labels.size());
+    if (p_vkGetQueryPoolResults(vk_device(), g_queries, 0, uint32_t(t.size()), t.size() * 8, t.data(), 8,
+                                VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+        return;
+    for (size_t k = 0; k + 1 < t.size(); k++) {
+        auto& e = g_totals[g_labels[k]];
+        e.first += double(t[k + 1] - t[k]) * g_period_ns / 1e6;
+        e.second++;
+    }
+}
+
+void gpu_profile_log(uint64_t frames) {
+    if (!gpu_profile_on()) return;
+    std::vector<std::pair<double, std::string>> v;
+    for (auto& [label, e] : g_totals) v.push_back({e.first, label});
+    std::sort(v.rbegin(), v.rend());
+    for (size_t k = 0; k < v.size() && k < 10; k++)
+        log("gpu profile: %8.2f ms/frame  %s (%llu passes)", v[k].first / double(frames), v[k].second.c_str(),
+            (unsigned long long)g_totals[v[k].second].second);
+    g_totals.clear();
 }
 
 }  // namespace nx::nvn

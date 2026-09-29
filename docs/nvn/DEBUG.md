@@ -19,6 +19,14 @@ Everything below is switched on with environment variables on the normal build: 
 | `NX_NVN_STATES=1` | decoded state objects and samplers as they are bound | nvn_state.cpp, nvn_sampler.cpp |
 | `NX_DUMP_SHADER_MISSES=1` | writes shader blocks that have no SPIR-V yet (to translate offline) | nvn_shaders.cpp |
 | `NX_NVN_REAL=1` | records every proc's real driver address in `nvn_trace.txt` | nvn_trace.cpp |
+| `NX_GPU_PROFILE=1` | GPU time per render pass (timestamps at pass starts), top 10 labels every 60 frames: `ms/frame WxH L<level> fs <hash>` | nvn_debug.cpp |
+| `NX_SKIP_FS=<hash>,<hash>` | drops draws with those fragment shaders (measure what they cost, or hide a broken one) | nvn_draw.cpp |
+| `NX_INPUT_SCRIPT="<s>:<button>:<hold s>;..."` | presses buttons at times after the first pad read (A B X Y L R ZL ZR PLUS MINUS LEFT RIGHT UP DOWN; directions also push the stick) | input_script.cpp |
+| `NX_INPUT="<frame>:<button>,..."` | older, per presented frame, 8-frame presses | hle_hid.cpp |
+| `NX_TRACE_FS=1` | every file the game opens or looks for | hle_fs.cpp |
+
+Always on: every 60 presents `nvn/vk: per frame over 60: submits, replay ms (host), GPU wait ms, present wait ms,
+upload MB`.
 
 Clear colors are logged under `NX_TRACE_DRAWS` too (`clear <texture> (WxH) to r g b a`, each pair once).
 
@@ -60,3 +68,20 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
    `VK_IMAGE_LAYOUT_GENERAL` (sampled and rendered at once). 3D images are created 2D-array compatible, since a
    colour-grading LUT is rendered slice by slice and Metal refuses a 2D view of a plain 3D texture (it aborted with
    `_mtlValidateArgumentsForTextureViewOnDevice`). Result: `05-title-screen.png`, correct colours.
+7. **2-3 fps, the GPU busy ~550 ms per frame** on a title screen. Sampling the process: every thread waited on the
+   submit thread, which waited on MoltenVK's fence. `NX_GPU_PROFILE` showed ~10 ms per render pass whatever its size
+   (a 32x18 pass: 44 ms); dropping the draw calls only (everything else kept) brought the GPU to 9 ms, while
+   `rasterizerDiscardEnable` left it at 525 ms, so the cost was before the fragment stage. Cause: **8-bit index buffers**. Metal has none and MoltenVK converts them on the GPU at every draw.
+   Widening them to 16 bits on the host: GPU ~10 ms per frame, the title at the game's 30 fps.
+8. **After the title, a crash: "call into the middle of a function" main+22e810.** Not a function pointer: a
+   `switch` jump table (`adr x10, anchor; ldrh w11, [x9, x8, lsl #1]; add x10, x10, x11, lsl #2; br x10`) whose
+   index is a byte with no bounds check. The recompiler's `_bound` walked back to an older `cmp w8, #2` / `b.ne`
+   guarding another value and capped the table at 3 entries; case 3 was missing. Fix (recomp/analysis.py): the
+   search stops when the index register is redefined, and only a `cmp` followed by `b.hi`/`b.hs` is a bound. The
+   recompiler now writes only changed files, so the rebuild after regenerating took 25 s instead of ~15 min.
+9. **Metal abort on a cube view with 1 layer**: a shader declaring `samplerCube` given a 2D texture. Views Metal
+   cannot make (cube of a non-cube image, 3D of 2D, 1D of 2D) now read the dummy texture.
+10. **Input**: the pad reached the game (`hid: first buttons 1`) and A works: after it the game loads the file
+    select (`NX_TRACE_FS`). `GetNpadStates` now keeps a 16-sample history like hid (Wonder ignores the count and reads
+    all 16 entries), and `BindNpadStyleSetUpdateEvent` signals its event once (the controller is connected).
+    Screenshot: `06-file-select.png` (text still missing).

@@ -317,6 +317,7 @@ void read_pad(PadState& p) {
     if (g_pad.ly) p.ly = g_pad.ly;
     if (g_pad.rx) p.rx = g_pad.rx;
     if (g_pad.ry) p.ry = g_pad.ry;
+    input_script(p);
 }
 
 // ---- audio: SDL3 stream, s16 stereo 48 kHz, fed from the queue of submitted buffers ----------------------------

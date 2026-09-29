@@ -62,6 +62,7 @@ set(NX_RUNTIME_SOURCES
     runtime/src/hle_net.cpp
     runtime/src/hle_audio.cpp
     runtime/src/hle_pl.cpp
+    runtime/src/input_script.cpp
     runtime/src/nvn/nvn_trace.cpp
     runtime/src/nvn/nvn_device.cpp
     runtime/src/nvn/nvn_objects.cpp

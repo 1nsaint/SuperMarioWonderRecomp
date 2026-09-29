@@ -1,6 +1,11 @@
 // nn::hid at the API level: player 1's Npad state comes from the platform (XInput + keyboard on Windows, game
 // controllers + touch on Android). Vibration is accepted and dropped.
+#include <array>
+#include <deque>
+#include <algorithm>
 #include <cstring>
+#include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -73,8 +78,16 @@ void GetNpadState(CPU& c) {
     uint32_t id = ld<uint32_t>(c.x[1]);
     std::memset(reinterpret_cast<void*>(out), 0, 0x28);
     st<int64_t>(out, int64_t(++g_sampling));
+    {
+        static std::set<std::pair<uint32_t, std::string>> seen;
+        static std::mutex m;
+        std::lock_guard lk(m);
+        if (seen.insert({id, hle_current_name()}).second) log("hid: reads id %#x via %s", id, hle_current_name());
+    }
     if (id != 0) return;  // only player 1 is connected
     PadState p = read();
+    static bool pressed = false;
+    if (p.buttons && !pressed) log("hid: first buttons %llx", (unsigned long long)p.buttons), pressed = true;
     st<uint64_t>(out + 8, p.buttons);
     st<int32_t>(out + 16, p.lx);
     st<int32_t>(out + 20, p.ly);
@@ -85,19 +98,43 @@ void GetNpadState(CPU& c) {
 
 // GetNpadStates(State* out, int count, const u32& id) -> number written: the newest first. One sample: the current
 // one for player 1's full-key style, a not-connected one otherwise.
+// GetNpadStates(State* out, int count, const u32& id) -> number written, newest first. Like the real hid, a history:
+// Wonder ignores the return value and reads all 16 entries it asks for, telling new samples by their sampling
+// numbers, so every call adds a sample and returns up to 16 of the latest (older entries stay as they were).
 void GetNpadStatesFullKey(CPU& c) {
     uint64_t out = c.x[0], id_ref = c.x[2];
-    if (int(c.x[1]) < 1) {
+    int n = int(c.x[1]);
+    if (n < 1) {
         c.x[0] = 0;
         return;
     }
+    static std::mutex m;
+    static std::deque<std::array<uint8_t, 0x28>> history;
+    std::lock_guard lk(m);
     c.x[0] = out;
     c.x[1] = id_ref;
-    GetNpadState(c);
-    c.x[0] = 1;
+    GetNpadState(c);  // the new sample, into out[0]
+    if (ld<uint32_t>(id_ref) != 0) {
+        c.x[0] = 1;
+        return;
+    }
+    std::array<uint8_t, 0x28> now;
+    std::memcpy(now.data(), reinterpret_cast<const void*>(out), now.size());
+    history.push_front(now);
+    if (history.size() > 16) history.pop_back();
+    int count = std::min<int>(n, int(history.size()));
+    for (int k = 1; k < count; k++) std::memcpy(reinterpret_cast<void*>(out + 0x28ull * k), history[k].data(), 0x28);
+    c.x[0] = uint64_t(count);
 }
 
 void GetNpadStatesOther(CPU& c) {
+    {
+        static std::set<std::pair<uint32_t, std::string>> seen;
+        static std::mutex m;
+        std::lock_guard lk(m);
+        uint32_t id = ld<uint32_t>(c.x[2]);
+        if (seen.insert({id, hle_current_name()}).second) log("hid: reads id %#x via %s (not connected)", id, hle_current_name());
+    }
     if (int(c.x[1]) < 1) {
         c.x[0] = 0;
         return;
@@ -127,15 +164,28 @@ void GetKeyboardState(CPU& c) {
 void zero(CPU& c) { c.x[0] = 0; }
 void one(CPU& c) { c.x[0] = 1; }
 
-void GetNpadStyleSet(CPU& c) { c.x[0] = ld<uint32_t>(c.x[0]) == 0 ? kStyleFullKey : 0; }
+void GetNpadStyleSet(CPU& c) {
+    static int logged = 0;
+    if (logged++ < 4) log("hid: GetNpadStyleSet id %#x", ld<uint32_t>(c.x[0]));
+    c.x[0] = ld<uint32_t>(c.x[0]) == 0 ? kStyleFullKey : 0;
+}
 
 void BindNpadStyleSetUpdateEvent(CPU& c) {  // (const u32& id, SystemEventType*, EventClearMode)
     uint64_t create = find_symbol("_ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb");
     uint64_t ev = c.x[1], mode = c.x[2];
+    uint32_t id = ld<uint32_t>(c.x[0]);
     c.x[0] = ev;
     c.x[1] = mode;
     c.x[2] = 0;
     call(c, create);
+    // Player 1's controller is there from the start: the style set "changed" (connected) once, and games wait for
+    // this event before they look at the npad.
+    static uint64_t signal = find_symbol("_ZN2nn2os17SignalSystemEventEPNS0_15SystemEventTypeE");
+    if (signal) {
+        c.x[0] = ev;
+        call(c, signal);
+    }
+    log("hid: style set event bound for id %#x, signalled", id);
 }
 
 void GetVibrationDeviceHandles(CPU& c) { c.x[0] = 0; }  // no vibration devices

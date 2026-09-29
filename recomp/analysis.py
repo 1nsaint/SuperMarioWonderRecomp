@@ -295,23 +295,29 @@ def _bound(an, f, before, idx):
     while a >= max(f.start, before - 4 * 40):
         mn, op = an.insns.get(a, ("", ""))
         ops = _ops(op)
-        if len(ops) >= 2 and _regno(ops[0]) in regs and ops[1][0] in "xw":
-            copy = (mn in ("mov", "uxtw", "sxtw") or
-                    (mn == "and" and len(ops) == 3 and ops[2] in ("#0xffffffff", "#4294967295")))
-            if copy:
-                regs.add(_regno(ops[1]))
+        copy = (len(ops) >= 2 and ops[1][0] in "xw" and
+                (mn in ("mov", "uxtw", "sxtw") or
+                 (mn == "and" and len(ops) == 3 and ops[2] in ("#0xffffffff", "#4294967295"))))
+        if copy and _regno(ops[0]) in regs:
+            # Before this point the index lives in the source register.
+            regs.discard(_regno(ops[0]))
+            regs.add(_regno(ops[1]))
+            a -= 4
+            continue
         if mn == "cmp" and len(ops) == 2 and _regno(ops[0]) in regs and ops[1].startswith("#"):
             n = _imm(ops[1][1:])
-            # Find the branch that uses these flags.
+            # Find the branch that uses these flags; a cmp guarding anything else (b.ne, ...) is no bound.
             for k in range(1, 6):
                 bm = an.insns.get(a + 4 * k, ("", ""))[0]
                 if bm == "b.hi":
                     return n + 1
                 if bm == "b.hs":
                     return n
-            return n + 1
-        if mn and mn not in NO_DEST and ops and _regno(ops[0]) == idx and mn not in ("ldrb", "ldrh", "ldr", "ldrsw"):
-            # idx redefined (e.g. sub w9, w9, #10 before the cmp is fine; anything after means we lost track).
-            pass
+            return None
+        if mn and mn not in NO_DEST and ops and _regno(ops[0]) in regs:
+            # The index was produced here (e.g. ldrb w8, [x27, #3]) with no bounds check after it: an older cmp of
+            # the same register guards another value. Wonder's main+22e5f8 lost a case to exactly that (the cmp
+            # w8, #2 of a previous branch capped the table at 3 entries).
+            return None
         a -= 4
     return None

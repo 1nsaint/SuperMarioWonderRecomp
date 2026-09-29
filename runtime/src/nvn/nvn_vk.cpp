@@ -481,7 +481,14 @@ bool begin() {
     return check(p_vkBeginCommandBuffer(g_cb, &bi), "vkBeginCommandBuffer");
 }
 
+// Where GPU time goes, logged with the draw stats: submits, host time replaying them, time waiting for the GPU,
+// bytes through the upload buffer.
+struct Timing {
+    uint64_t submits = 0, replay_ns = 0, wait_ns = 0, present_wait_ns = 0, upload_bytes = 0;
+} g_timing;
+
 void end_and_wait(VkSemaphore wait, VkSemaphore signal) {
+    uint64_t t0 = plat::monotonic_ns();
     p_vkEndCommandBuffer(g_cb);
     VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -499,6 +506,16 @@ void end_and_wait(VkSemaphore wait, VkSemaphore signal) {
     p_vkResetFences(g_device, 1, &g_fence);
     if (check(p_vkQueueSubmit(g_queue, 1, &si, g_fence), "vkQueueSubmit"))
         p_vkWaitForFences(g_device, 1, &g_fence, VK_TRUE, UINT64_MAX);
+    (signal ? g_timing.present_wait_ns : g_timing.wait_ns) += plat::monotonic_ns() - t0;
+}
+
+void log_timing(uint64_t frames) {
+    auto ms = [&](uint64_t ns) { return double(ns) / 1e6 / double(frames); };
+    log("nvn/vk: per frame over %llu: %.1f submits, replay %.2f ms, GPU wait %.2f ms, present wait %.2f ms, "
+        "upload %.2f MB",
+        (unsigned long long)frames, double(g_timing.submits) / double(frames), ms(g_timing.replay_ns),
+        ms(g_timing.wait_ns), ms(g_timing.present_wait_ns), double(g_timing.upload_bytes) / 1e6 / double(frames));
+    g_timing = {};
 }
 
 // NX_DUMP_FRAMES=N: every Nth presented texture is read back and written to <data root>/frames/NNNNN.ppm
@@ -586,10 +603,15 @@ void gpu_submit(CPU&, const std::vector<std::shared_ptr<CmdList>>& lists) {
     g_upload_used = 0;
     if (!begin()) return;
     draw_begin_submit();
+    gpu_profile_begin(g_cb);
+    uint64_t t0 = plat::monotonic_ns();
     Targets st;
     for (auto& l : lists) replay(g_cb, st, *l, 0);
     draw_end_rendering(g_cb);
+    g_timing.submits++, g_timing.replay_ns += plat::monotonic_ns() - t0, g_timing.upload_bytes += g_upload_used;
+    gpu_profile_mark(g_cb, "end");
     end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);
+    gpu_profile_collect();
     if (uint64_t n = draw_take_dump_request(); n && dump_every() && n % dump_every() == 0) debug_dump_textures(n);
 }
 
@@ -632,6 +654,7 @@ void gpu_present(uint64_t texture) {
     static uint64_t presents = 0;
     presents++;
     if (presents % (presents < 300 ? 60 : 300) == 0) draw_log_stats();
+    if (presents % 60 == 0) log_timing(60), gpu_profile_log(60);
     bool dump = src && dump_every() && presents % dump_every() == 0 && readback_record(*src);
     end_and_wait(g_acquired, g_rendered);
     if (dump) readback_write(*src, presents);

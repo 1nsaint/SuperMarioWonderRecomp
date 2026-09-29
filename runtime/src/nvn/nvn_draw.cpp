@@ -166,6 +166,9 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         g_stats.no_vertex++;
         return false;
     }
+    // NX_SKIP_FS=<hash>,<hash>: draws with those fragment shaders are dropped (to measure what they cost).
+    static const std::string skip = std::getenv("NX_SKIP_FS") ? std::getenv("NX_SKIP_FS") : "";
+    if (!skip.empty() && fs && skip.find(fs->hash) != std::string::npos) return false;
     const ProgramLayout& layout = program_layout(*shaders);
 
     // Textures first: an upload or a layout change cannot happen inside the render pass.
@@ -258,7 +261,16 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         w.pImageInfo = &images.back();
         writes.push_back(w);
     }
-    if (!g_rendering) begin_rendering(cb, t);
+    if (!g_rendering) {
+        if (gpu_profile_on()) {
+            GpuImage* img = t.color_count && t.colors[0] ? image_of(t.colors[0]) : nullptr;
+            char label[128];
+            std::snprintf(label, sizeof label, "%ux%u L%u fs %s", img ? img->width : 0, img ? img->height : 0,
+                          t.views.level[0], fs ? fs->hash.c_str() : "-");
+            gpu_profile_mark(cb, label);
+        }
+        begin_rendering(cb, t);
+    }
 
     // Pipeline.
     PipelineKey key;
@@ -325,8 +337,19 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             g_stats.no_indices++;
             return false;
         }
-        Upload u = upload(p, uint64_t(count) * index_size(c.mask), 16);
-        p_vkCmdBindIndexBuffer(cb, u.buffer, u.offset, vk_index_type(c.mask));
+        // 8-bit indices: Metal has none, and MoltenVK converts them on the GPU at every draw (that was most of the
+        // frame's GPU time), so they are widened here.
+        Upload u;
+        VkIndexType type = vk_index_type(c.mask);
+        if (type == VK_INDEX_TYPE_UINT8_EXT) {
+            u = upload_alloc(uint64_t(count) * 2, 16);
+            auto* d = reinterpret_cast<uint16_t*>(u.ptr);
+            for (uint32_t k = 0; k < uint32_t(count); k++) d[k] = p[k];
+            type = VK_INDEX_TYPE_UINT16;
+        } else {
+            u = upload(p, uint64_t(count) * index_size(c.mask), 16);
+        }
+        p_vkCmdBindIndexBuffer(cb, u.buffer, u.offset, type);
         p_vkCmdDrawIndexed(cb, count, uint32_t(std::max(1, c.i[3])), 0, c.i[1], uint32_t(c.i[2]));
     } else {
         p_vkCmdDraw(cb, uint32_t(c.i[1]), uint32_t(std::max(1, c.i[3])), uint32_t(c.i[0]), uint32_t(c.i[2]));
@@ -395,6 +418,7 @@ void draw_end_rendering(VkCommandBuffer cb) {
     if (!g_rendering) return;
     p_vkCmdEndRendering(cb);
     g_rendering = false;
+    gpu_profile_mark(cb, "outside passes (clears, uploads, copies)");
 }
 
 void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const Targets& targets) {

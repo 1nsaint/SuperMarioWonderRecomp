@@ -23,6 +23,20 @@ NVN implemented over Vulkan (MoltenVK).
 
 ## Log
 
+### 2026-09-29 (early morning): 30 fps, past the title to the file select
+
+![File select](docs/media/wonder/06-file-select.png)
+
+- **Performance: from 2-3 fps to the game's 30 fps.** 8-bit index buffers were converted by MoltenVK on the GPU at
+  every draw (~10 ms each, ~550 ms per frame); they are widened on the host now. GPU ~10 ms per frame on the title.
+  Found with a process sample (all threads waiting on the GPU fence), a per-pass GPU profiler (`NX_GPU_PROFILE`) and
+  elimination (no draw calls: fast; no rasterization: still slow). docs/nvn/DEBUG.md #7.
+- **Recompiler bug fixed**: a jump table bounded by an unrelated `cmp` lost a case (crash after the title, "call into
+  the middle of a function"). Regenerating now rewrites only the files that change: rebuild in 25 s. DEBUG.md #8.
+- **A works: the file select opens** (save card, new-file card, cursor). Text rendering is still broken (green
+  specks where text should be). Scripted input for unattended runs: `NX_INPUT_SCRIPT="25:A:0.3;30:A:0.3"`.
+- Metal-incompatible texture views (a cube view of a 2D texture) fall back to the dummy instead of aborting.
+
 ### 2026-09-28 (night, latest): the title screen, correct colours
 
 ![Super Mario Bros. Wonder title screen rendered natively through NVN → Vulkan on an M1](docs/media/wonder/05-title-screen.png)
@@ -179,9 +193,10 @@ layouts (`Layout/*.blarc`).
 
 ## Next
 
-1. Performance (N7): stop waiting for the GPU at every submit, cache descriptor sets, keep uploaded textures.
-2. Input: past the title to the file select and World 1-1.
-3. Audio to the Mac speakers; c[0] driver constants for compute; `docs/nvn/API.md`.
-4. Split `nvn_shaders.cpp` (815 lines, over the 700-line cap).
+1. Text rendering (the file select and every menu have none): the SDF font path.
+2. Past the file select: the opening and World 1-1 (then input to play).
+3. Performance beyond 30 fps headroom: stop waiting for the GPU at every submit, cache descriptor sets.
+4. Audio to the Mac speakers; c[0] driver constants for compute; `docs/nvn/API.md`.
+5. Split `nvn_shaders.cpp` (815 lines, over the 700-line cap).
 
 Branch: `feat/nvn-n1-wonder-cpu`, stacked on `feat/nvn-n0-core-split`.

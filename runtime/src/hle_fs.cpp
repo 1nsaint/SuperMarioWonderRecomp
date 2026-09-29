@@ -26,6 +26,12 @@ namespace nx {
 
 namespace {
 
+// NX_TRACE_FS=1: every file the game opens (and the ones it looks for and does not find).
+bool trace_fs() {
+    static const bool on = g_trace || std::getenv("NX_TRACE_FS") != nullptr;
+    return on;
+}
+
 constexpr uint32_t kOk = 0;
 constexpr uint32_t kPathNotFound = 0x202;       // fs 1
 constexpr uint32_t kPathAlreadyExists = 0x402;  // fs 2
@@ -211,13 +217,13 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
         uint64_t h = g_next++;
         g_files[h] = std::make_shared<File>(f, guest);
         st<uint64_t>(c.x[0], h);
-        if (g_trace) log("fs: OpenFile(%s) -> virtual, %zu bytes", guest.c_str(), v->size());
+        if (trace_fs()) log("fs: OpenFile(%s) -> virtual, %zu bytes", guest.c_str(), v->size());
         c.x[0] = kOk;
         return;
     }
     std::error_code ec;
     if (p.empty() || !fs::is_regular_file(p, ec)) {
-        if (g_trace) log("fs: OpenFile(%s) not found", guest.c_str());
+        if (trace_fs()) log("fs: OpenFile(%s) not found", guest.c_str());
         c.x[0] = kPathNotFound;
         return;
     }
@@ -229,7 +235,7 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
     uint64_t h = g_next++;
     g_files[h] = std::make_shared<File>(f, guest);
     st<uint64_t>(c.x[0], h);
-    if (g_trace) log("fs: OpenFile(%s, %d) -> %llu", guest.c_str(), mode, (unsigned long long)h);
+    if (trace_fs()) log("fs: OpenFile(%s, %d) -> %llu", guest.c_str(), mode, (unsigned long long)h);
     c.x[0] = kOk;
 }
 

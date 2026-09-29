@@ -2,6 +2,8 @@
 // resources, draws). Everything here runs under the GPU lock taken by gpu_submit / gpu_present.
 #pragma once
 
+#include <string>
+
 #include "nvn.h"
 #include "vk_gen.h"
 
@@ -54,5 +56,12 @@ void draw_begin_submit();
 void draw_log_stats();
 void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const Targets& targets);
 void draw_end_rendering(VkCommandBuffer cb);  // before transfers (clears, copies, present) and at the end
+
+// nvn_debug.cpp: GPU time per render pass (NX_GPU_PROFILE=1).
+bool gpu_profile_on();
+void gpu_profile_begin(VkCommandBuffer cb);
+void gpu_profile_mark(VkCommandBuffer cb, const std::string& label);
+void gpu_profile_collect();
+void gpu_profile_log(uint64_t frames);
 
 }  // namespace nx::nvn
