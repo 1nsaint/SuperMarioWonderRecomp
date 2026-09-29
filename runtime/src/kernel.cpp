@@ -493,12 +493,36 @@ uint32_t create_main_thread(uint64_t stack_size) {
 
 // Stalls: while no frame comes for more than 60 ms, sample where every guest thread is (its lr, every 5 ms); a
 // stall over 100 ms is logged with each thread's most frequent place, to tell what the frame waited for.
+// NX_THREAD_DUMP_AT=<seconds>: once, every guest thread's call chain (frame-pointer walk), to see what a stuck game
+// waits for.
+static void dump_threads() {
+    std::lock_guard al(g_all_lock);
+    for (auto& w : g_all) {
+        auto t = w.lock();
+        if (!t || !t->started || t->exited) continue;
+        std::string chain = describe(t->ctx.x[30]);
+        uint64_t fp = t->ctx.x[29];
+        for (int k = 0; k < 12 && fp && (fp & 7) == 0 && fp >= kModuleBase; k++) {
+            uint64_t lr = ld<uint64_t>(fp + 8);
+            if (!lr) break;
+            chain += " < " + describe(lr);
+            uint64_t next = ld<uint64_t>(fp);
+            if (next <= fp) break;
+            fp = next;
+        }
+        log("threads: %llx %s", (unsigned long long)t->id, chain.c_str());
+    }
+}
+
 static void stall_sampler(void*) {
+    static const char* dump_env = std::getenv("NX_THREAD_DUMP_AT");
+    uint64_t dump_at = dump_env ? plat::monotonic_ns() + uint64_t(std::atof(dump_env) * 1e9) : 0;
     uint64_t last_frame = 0, since = plat::monotonic_ns();
     std::map<std::pair<uint64_t, uint64_t>, uint32_t> hits;  // (thread id, guest lr) -> samples
     for (;;) {
         plat::sleep_ns(5'000'000);
         uint64_t f = g_frame, now = plat::monotonic_ns();
+        if (dump_at && now >= dump_at) dump_threads(), dump_at = 0;
         if (f != last_frame || plat::window_minimized()) {
             uint64_t ms = (now - since) / 1'000'000;
             if (last_frame && ms > 100 && !hits.empty()) {

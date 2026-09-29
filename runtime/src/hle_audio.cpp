@@ -207,13 +207,20 @@ void audio_render_thread(CPU& c) {
             std::lock_guard lk(g_renderers_lock);
             list = g_renderers;
         }
+        static uint64_t frames = 0, busy_ns = 0, last_rc = 0;
+        uint64_t t0 = plat::monotonic_ns();
         for (uint64_t impl : list) {
             uint64_t saved[31];
             std::memcpy(saved, c.x, sizeof saved);
             c.x[0] = impl;
             call(c, sdk_base() + kExecuteRendering);
+            last_rc = c.x[0];
             std::memcpy(c.x, saved, sizeof saved);
         }
+        busy_ns += plat::monotonic_ns() - t0;
+        if (++frames % 2000 == 0)
+            log("audio: %llu frames rendered, %.1f us each, last result %llx", (unsigned long long)frames,
+                double(busy_ns) / 1000.0 / 2000.0, (unsigned long long)last_rc), busy_ns = 0;
         g_audio_frame->signaled = true;
         notify_all();
     }
@@ -255,6 +262,15 @@ void OpenAudioRenderer(CPU& c) {
     uint64_t impl = rc == 0 ? find_renderer(handle) : 0;
     log("audio: renderer opened (result %llx), impl %llx", (unsigned long long)rc, (unsigned long long)impl);
     if (!impl) return;
+    // ExecuteAudioRendererRendering only renders in the manual execution mode on the CPU rendering device
+    // (AudioRenderSystem::GetExecutionMode / GetRenderingDevice == 1, at render system + 0x2d0 / + 0x2d4); the game
+    // opens the renderer in the automatic mode, where the ADSP renders on its own. Our 5 ms thread is that ADSP, so
+    // the renderer is switched to manual/CPU; otherwise every call failed with 0x40299 and nothing was ever rendered
+    // (streamed music never advanced, and the opening cutscene waited for it forever).
+    uint64_t system = impl + 0x60;
+    log("audio: execution mode %u, rendering device %u -> 1, 1", ld<uint32_t>(system + 0x2d0), ld<uint32_t>(system + 0x2d4));
+    st<uint32_t>(system + 0x2d0, 1);
+    st<uint32_t>(system + 0x2d4, 1);
     {
         std::lock_guard lk(g_renderers_lock);
         g_renderers.push_back(impl);

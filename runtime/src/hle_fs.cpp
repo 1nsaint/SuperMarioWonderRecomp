@@ -272,6 +272,13 @@ uint64_t read_at(const File& file, int64_t off, uint64_t buf, uint64_t size) {
     uint64_t ms = (plat::monotonic_ns() - t0) / 1'000'000;
     if (g_trace) log("fs: read %s at %lld size %llu -> %llu", file.path.c_str(), (long long)off, (unsigned long long)size,
                      (unsigned long long)n);
+    if (trace_fs() && file.path.find(".bwav") != std::string::npos) {  // streamed audio: is it being consumed?
+        static std::mutex m;
+        static std::map<std::string, uint64_t> reads;
+        std::lock_guard lk(m);
+        uint64_t k = ++reads[file.path];
+        if (k <= 3 || k % 50 == 0) log("fs: stream read #%llu %s at %lld", (unsigned long long)k, file.path.c_str(), (long long)off);
+    }
     if (ms >= 30)
         log("fs: slow read %s: %llu bytes at %lld took %llu ms", file.path.c_str(), (unsigned long long)size,
             (long long)off, (unsigned long long)ms);
