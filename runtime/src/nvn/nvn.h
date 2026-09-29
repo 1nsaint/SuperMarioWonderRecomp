@@ -169,7 +169,7 @@ struct Cmd {
         SetDepthRange, BindProgram, BindUniformBuffer, BindStorageBuffer, BindTexture, BindVertexBuffer,
         BindVertexAttribs, BindVertexStreams, BindBlendState, BindColorState, BindChannelMaskState,
         BindDepthStencilState, BindPolygonState, SetBlendColor, UpdateUniformBuffer, SetTexturePool, SetSamplerPool,
-        DrawArrays, DrawElements, ReportCounter,
+        DrawArrays, DrawElements, ReportCounter, SetRasterizerDiscard, SetRenderEnable,
     } op;
     uint32_t n = 0, mask = 0;
     uint64_t a[9] = {};  // textures (render targets: colors then depth), handles, GPU addresses, sizes, ...

@@ -38,6 +38,7 @@ struct State {
     PolygonInfo polygon;
     float blend_color[4] = {};
     int32_t viewport[4] = {}, scissor[4] = {};
+    bool rasterizer_discard = false, render_enable = true;  // SetRasterizerDiscard / SetRenderEnable: draws skipped
     bool has_viewport = false, has_scissor = false;
     float depth_near = 0, depth_far = 1;
 };
@@ -151,6 +152,7 @@ uint64_t g_dump_draws = 0, g_dump_request = 0;
 
 bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, const Cmd& c) {
     g_stats.total++;
+    if (g_state.rasterizer_discard || !g_state.render_enable) return false;  // nothing reaches the targets
     const auto* shaders = program_shaders(g_state.program);
     if (!shaders || shaders->empty()) {
         g_stats.no_program++;
@@ -452,6 +454,8 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
         case Cmd::SetViewport:
             std::memcpy(s.viewport, c.i, sizeof s.viewport), s.has_viewport = true;
             break;
+        case Cmd::SetRasterizerDiscard: s.rasterizer_discard = c.n != 0; break;
+        case Cmd::SetRenderEnable: s.render_enable = c.n != 0; break;
         case Cmd::SetScissor:
             std::memcpy(s.scissor, c.i, sizeof s.scissor), s.has_scissor = true;
             break;

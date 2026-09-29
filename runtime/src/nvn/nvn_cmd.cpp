@@ -37,10 +37,18 @@ uint64_t used(uint64_t size, uint64_t base, size_t cmds, uint64_t per) {
     return std::min(base + cmds * per, size > 64 ? size - 64 : 0);
 }
 
+// Handles live until kKeepHandles newer ones exist, unless they were used (submitted or called) since they were last
+// queued: engines record some lists once at startup and call them every frame for the whole game (Wonder's file
+// select called handles 0x77a/0x77b, recorded ~100k lists earlier).
+struct HandleEntry {
+    std::shared_ptr<CmdList> list;
+    uint64_t queued = 0, used = 0;  // g_handle_clock values
+};
 std::mutex g_handles_lock;
-std::map<uint64_t, std::shared_ptr<CmdList>> g_handles;
-std::deque<uint64_t> g_handle_order;  // oldest first: handles are dropped after kKeepHandles newer ones
+std::map<uint64_t, HandleEntry> g_handles;
+std::deque<std::pair<uint64_t, uint64_t>> g_handle_order;  // (handle, queued at), oldest first
 constexpr size_t kKeepHandles = 1 << 16;
+uint64_t g_handle_clock = 0;
 std::atomic<uint64_t> g_next_handle{1};
 
 
@@ -118,11 +126,20 @@ void CommandBufferEndRecording(CPU& c) {  // NVNcommandHandle
     }
     {
         std::lock_guard lk(g_handles_lock);
-        g_handles[h] = list;
-        g_handle_order.push_back(h);
+        uint64_t now = ++g_handle_clock;
+        g_handles[h] = {list, now, 0};
+        g_handle_order.push_back({h, now});
         while (g_handle_order.size() > kKeepHandles) {
-            g_handles.erase(g_handle_order.front());
+            auto [old, queued] = g_handle_order.front();
             g_handle_order.pop_front();
+            auto it = g_handles.find(old);
+            if (it == g_handles.end()) continue;
+            if (it->second.used > queued) {  // still in use: queue it again
+                it->second.queued = ++g_handle_clock;
+                g_handle_order.push_back({old, it->second.queued});
+            } else {
+                g_handles.erase(it);
+            }
         }
     }
     c.x[0] = h;
@@ -203,7 +220,9 @@ void record(uint64_t guest, Cmd cmd, const void* blob, size_t size) {
 std::shared_ptr<CmdList> command_list(uint64_t handle) {
     std::lock_guard lk(g_handles_lock);
     auto it = g_handles.find(handle);
-    return it == g_handles.end() ? nullptr : it->second;
+    if (it == g_handles.end()) return nullptr;
+    it->second.used = ++g_handle_clock;
+    return it->second.list;
 }
 
 NX_HLE("nvnCommandBufferInitialize", CommandBufferInitialize);
