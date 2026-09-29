@@ -4,10 +4,12 @@
 // what the GPU would have read. Render targets become a dynamic-rendering pass, begun at the first draw and ended
 // before any transfer.
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <cstring>
+#include <set>
 
 #include "nvn_pipeline.h"
 #include "platform.h"
@@ -28,6 +30,7 @@ struct State {
     uint64_t program = 0;
     Range uniforms[kStages][18], storage[kStages][16], vertex_buffers[16];
     uint64_t textures[kStages][32] = {};  // NVN texture handles by sampler binding
+    uint64_t images[kStages][16] = {};    // NVN image handles by image binding (BindImage)
     uint64_t texture_pool = 0, sampler_pool = 0;
     std::vector<VertexAttrib> attribs;
     std::vector<VertexStream> streams;
@@ -106,11 +109,22 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
 }
 
 // The buffer a descriptor points to: `bytes` copied into the upload buffer (at least 16 bytes, zero padded).
-VkDescriptorBufferInfo buffer_of(const void* bytes, uint64_t size, uint64_t min_size = 16) {
+// Storage buffers written by compute shaders go back to guest memory after the submit (the GPU's writes are what the
+// game and later work read): (upload copy, guest address, size).
+struct WriteBack {
+    uint8_t* from;
+    uint8_t* to;
+    uint64_t size;
+};
+std::vector<WriteBack> g_write_backs;
+
+VkDescriptorBufferInfo buffer_of(const void* bytes, uint64_t size, uint64_t min_size = 16, bool write_back = false) {
     uint64_t n = std::max<uint64_t>((size + 15) & ~15ull, min_size);
     Upload u = upload_alloc(n, 256);
     std::memset(u.ptr, 0, n);
     if (bytes && size) std::memcpy(u.ptr, bytes, size);
+    if (write_back && bytes && size)
+        g_write_backs.push_back({u.ptr, const_cast<uint8_t*>(static_cast<const uint8_t*>(bytes)), size});
     return {u.buffer, u.offset, n};
 }
 
@@ -146,72 +160,58 @@ void texture_for(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, ViewI
 
 struct Stats {
     uint64_t total = 0, no_program = 0, no_vertex = 0, no_pipeline = 0, no_indices = 0, done = 0, to_window = 0;
+    uint64_t dispatches = 0;
 } g_stats;
 
 uint64_t g_dump_draws = 0, g_dump_request = 0;
 
-bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, const Cmd& c) {
-    g_stats.total++;
-    if (g_state.rasterizer_discard || !g_state.render_enable) return false;  // nothing reaches the targets
-    const auto* shaders = program_shaders(g_state.program);
-    if (!shaders || shaders->empty()) {
-        g_stats.no_program++;
-        return false;
+// c[0], the NVN driver's constants, as far as shaders read them (docs/nvn/TRANSLATOR.md): buffer descriptors
+// {u64 GPU address; u32 size} of what is bound, which compute shaders search to find the buffer an address falls in
+// (they wrote garbage with a zero table), and the maximum point size.
+std::array<uint8_t, 0x1000> driver_constants(ShaderStage stage, int st) {
+    std::array<uint8_t, 0x1000> c0{};
+    auto put = [&](uint32_t at, const Range& r) {
+        if (at + 12 > c0.size()) return;
+        std::memcpy(c0.data() + at, &r.address, 8);
+        uint32_t size = uint32_t(std::min<uint64_t>(r.size, 0xFFFFFFFFu));
+        std::memcpy(c0.data() + at + 8, &size, 4);
+    };
+    if (stage == ShaderStage::Compute) {
+        for (int n = 0; n < 16; n++) put(0x210 + 0x10 * n, g_state.uniforms[st][n]);
+        for (int n = 0; n < 16; n++) put(0x310 + 0x10 * n, g_state.storage[st][n]);
+    } else {
+        int hw = stage == ShaderStage::Fragment ? 4 : 0;  // Maxwell stage numbers: vertex 0, fragment 4
+        for (int n = 0; n < 16; n++) put(0x110 + 0x100 * hw + 0x10 * n, g_state.storage[st][n]);
+        float max_point = 64.0f;
+        std::memcpy(c0.data() + 0x610, &max_point, 4);
     }
-    const ShaderInfo* vs = nullptr;
-    const ShaderInfo* fs = nullptr;
-    for (const ShaderInfo* s : *shaders) {
-        if (s->stage == ShaderStage::Vertex) vs = s;
-        if (s->stage == ShaderStage::Fragment) fs = s;
-    }
-    if (!vs) {
-        g_stats.no_vertex++;
-        return false;
-    }
-    // NX_SKIP_FS=<hash>,<hash>: draws with those fragment shaders are dropped (to measure what they cost).
-    static const std::string skip = std::getenv("NX_SKIP_FS") ? std::getenv("NX_SKIP_FS") : "";
-    if (!skip.empty() && fs && skip.find(fs->hash) != std::string::npos) return false;
-    const ProgramLayout& layout = program_layout(*shaders);
+    return c0;
+}
 
-    // Textures first: an upload or a layout change cannot happen inside the render pass.
-    std::vector<std::pair<const ShaderInfo*, const DescriptorBinding*>> tex_bindings;
-    for (const ShaderInfo* s : *shaders)
-        for (const DescriptorBinding& b : s->refl.bindings)
-            if (b.set == 2) tex_bindings.push_back({s, &b});
-    std::vector<uint64_t> handles(tex_bindings.size());
-    bool need_break = false;
-    for (size_t k = 0; k < tex_bindings.size(); k++) {
-        auto [s, b] = tex_bindings[k];
-        int st = api_stage(s->stage);
-        uint64_t handle = 0;
-        if (b->nvn.source == NvnSource::SamplerBinding && b->nvn.index >= 0 && b->nvn.index < 32)
-            handle = g_state.textures[st][b->nvn.index];
-        else if (b->nvn.source == NvnSource::HandleInUniform && b->nvn.bank >= 3) {
-            const Range& r = g_state.uniforms[st][b->nvn.bank - 3];
-            const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
-            if (p && uint64_t(b->nvn.word) * 4 + 4 <= r.size) handle = *reinterpret_cast<const uint32_t*>(p + b->nvn.word * 4);
-        }
-        handles[k] = handle;
-        uint64_t texture = 0;
-        SamplerInfo si;
-        texture_for(handle, texture, si);
-        if (texture ? !sampled_ready(texture) : !dummy_ready(b->image)) need_break = true;
-    }
-    bool targets_changed = !g_rendering || std::memcmp(&g_pass, &t, sizeof t) != 0;
-    if (g_rendering && (need_break || targets_changed)) draw_end_rendering(cb);
-
-    // Descriptor sets.
-    VkDescriptorSet sets[4];
-    for (int k = 0; k < 4; k++) sets[k] = descriptor_set(layout.sets[k]);
+// Descriptor sets for a program's stages from the bound state: buffers (sets 0/1), textures (set 2, the bindings
+// `tex_bindings` with their resolved `handles`), storage images (set 3). Records uploads and layout changes, so it
+// runs outside render passes when textures or images need them.
+struct Descriptors {
+    VkDescriptorSet sets[4] = {};
     std::vector<VkWriteDescriptorSet> writes;
     std::vector<VkDescriptorBufferInfo> buffers;
     std::vector<VkDescriptorImageInfo> images;
-    buffers.reserve(256), images.reserve(256), writes.reserve(512);
+};
+
+void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shaders, const ProgramLayout& layout,
+                const std::vector<std::pair<const ShaderInfo*, const DescriptorBinding*>>& tex_bindings,
+                const std::vector<uint64_t>& handles, Descriptors& d) {
+    for (int k = 0; k < 4; k++) d.sets[k] = descriptor_set(layout.sets[k]);
+    auto& writes = d.writes;
+    auto& buffers = d.buffers;
+    auto& images = d.images;
+    buffers.reserve(1024), images.reserve(1024), writes.reserve(2048);  // pointers into them are kept
+    VkDescriptorSet* sets = d.sets;
     SupportBuffer sb = support_buffer_defaults();
     float vw = g_state.has_viewport ? float(g_state.viewport[2]) : 1280.0f;
     float vh = g_state.has_viewport ? float(g_state.viewport[3]) : 720.0f;
     support_buffer_set_viewport(sb, vw, vh);
-    for (const ShaderInfo* s : *shaders) {
+    for (const ShaderInfo* s : shaders) {
         int st = api_stage(s->stage);
         for (const DescriptorBinding& b : s->refl.bindings) {
             if (b.set >= 2) continue;
@@ -231,10 +231,18 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                 case NvnSource::StorageBuffer: {
                     const Range& r = b.nvn.index >= 0 && b.nvn.index < 16 ? g_state.storage[st][b.nvn.index] : Range{};
                     const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
-                    info = buffer_of(p, p ? std::min<uint64_t>(r.size, 16ull << 20) : 0);
+                    // At least 64 KB: Metal does not bound-check, and a shader writing past a small or missing
+                    // buffer overwrote the next data in the upload buffer (garbage everywhere after a compute).
+                    info = buffer_of(p, p ? std::min<uint64_t>(r.size, 16ull << 20) : 0, 0x10000,
+                                     s->stage == ShaderStage::Compute);
                     break;
                 }
-                default: info = buffer_of(nullptr, 0x1000); break;  // c[0] driver constants: not filled yet
+                case NvnSource::DriverConstants: {
+                    auto c0 = driver_constants(s->stage, st);
+                    info = buffer_of(c0.data(), c0.size());
+                    break;
+                }
+                default: info = buffer_of(nullptr, 0x1000); break;
             }
             buffers.push_back(info);
             VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -265,6 +273,156 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         w.pImageInfo = &images.back();
         writes.push_back(w);
     }
+    for (const ShaderInfo* s : shaders) {
+        int st = api_stage(s->stage);
+        for (const DescriptorBinding& b : s->refl.bindings) {
+            if (b.set != 3) continue;
+            uint64_t handle = b.nvn.source == NvnSource::ImageBinding && b.nvn.index >= 0 && b.nvn.index < 16
+                                  ? g_state.images[st][b.nvn.index]
+                                  : 0;
+            uint64_t texture = 0;
+            SamplerInfo si;
+            ViewInfo view;
+            if (handle) texture_for(handle & 0xFFFFF, texture, si, &view);
+            VkDescriptorImageInfo ii{};
+            ii.imageView = storage_view(cb, texture, b.image, texture ? &view : nullptr);
+            ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            images.push_back(ii);
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = sets[3];
+            w.dstBinding = b.binding;
+            w.descriptorCount = 1;
+            w.descriptorType = VkDescriptorType(b.type);
+            w.pImageInfo = &images.back();
+            writes.push_back(w);
+        }
+    }
+}
+
+// Texture bindings of a program's stages and their handles; true when one needs a transfer or a layout change (so
+// no render pass may be open while the sets are built).
+bool gather_textures(const std::vector<const ShaderInfo*>& shaders,
+                     std::vector<std::pair<const ShaderInfo*, const DescriptorBinding*>>& tex_bindings,
+                     std::vector<uint64_t>& handles) {
+    bool need_break = false;
+    for (const ShaderInfo* s : shaders)
+        for (const DescriptorBinding& b : s->refl.bindings) {
+            if (b.set == 2) tex_bindings.push_back({s, &b});
+            if (b.set == 3) need_break = true;  // storage images change layout
+        }
+    handles.assign(tex_bindings.size(), 0);
+    for (size_t k = 0; k < tex_bindings.size(); k++) {
+        auto [s, b] = tex_bindings[k];
+        int st = api_stage(s->stage);
+        uint64_t handle = 0;
+        if (b->nvn.source == NvnSource::SamplerBinding && b->nvn.index >= 0 && b->nvn.index < 32)
+            handle = g_state.textures[st][b->nvn.index];
+        else if (b->nvn.source == NvnSource::HandleInUniform && b->nvn.bank >= 3) {
+            const Range& r = g_state.uniforms[st][b->nvn.bank - 3];
+            const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
+            if (p && uint64_t(b->nvn.word) * 4 + 4 <= r.size) handle = *reinterpret_cast<const uint32_t*>(p + b->nvn.word * 4);
+        }
+        handles[k] = handle;
+        uint64_t texture = 0;
+        SamplerInfo si;
+        texture_for(handle, texture, si);
+        if (texture ? !sampled_ready(texture) : !dummy_ready(b->image)) need_break = true;
+    }
+    return need_break;
+}
+
+// DispatchCompute: the bound program's compute stage over (x, y, z) groups, outside render passes, then a barrier
+// so what it wrote is visible to what follows.
+void dispatch(VkCommandBuffer cb, const Cmd& c) {
+    static const bool off = std::getenv("NX_NO_COMPUTE") != nullptr;  // debug: skip compute dispatches
+    if (off) return;
+    const auto* shaders = program_shaders(g_state.program);
+    const ShaderInfo* cs = nullptr;
+    if (shaders)
+        for (const ShaderInfo* s : *shaders)
+            if (s->stage == ShaderStage::Compute) cs = s;
+    if (!cs) return;
+    uint32_t x = uint32_t(c.i[0]), y = uint32_t(c.i[1]), z = uint32_t(c.i[2]);
+    if (c.n == 1) {  // indirect
+        const uint8_t* p = guest_bytes(c.a[0]);
+        if (!p) return;
+        std::memcpy(&x, p, 4), std::memcpy(&y, p + 4, 4), std::memcpy(&z, p + 8, 4);
+    }
+    if (!x || !y || !z) return;
+    {
+        static std::set<std::string> seen;
+        if (seen.insert(cs->hash).second) {
+            std::string res;
+            for (const DescriptorBinding& b : cs->refl.bindings)
+                res += " " + b.name + "(s" + std::to_string(b.set) + ")";
+            log("nvn: compute %s groups %ux%ux%u local %ux%ux%u:%s", cs->hash.c_str(), x, y, z, cs->local_size[0],
+                cs->local_size[1], cs->local_size[2], res.c_str());
+            for (const DescriptorBinding& b : cs->refl.bindings) {
+                const Range* r = b.nvn.source == NvnSource::StorageBuffer && b.nvn.index >= 0 && b.nvn.index < 16
+                                     ? &g_state.storage[5][b.nvn.index]
+                                 : (b.nvn.source == NvnSource::UniformBlock || b.nvn.source == NvnSource::UniformAsStorage) &&
+                                         b.nvn.index >= 0 && b.nvn.index < 18
+                                     ? &g_state.uniforms[5][b.nvn.index]
+                                     : nullptr;
+                log("  %s: %s %d -> %llx+%llx", b.name.c_str(), source_name(b.nvn.source), b.nvn.index,
+                    (unsigned long long)(r ? r->address : 0), (unsigned long long)(r ? r->size : 0));
+            }
+        }
+    }
+    std::vector<const ShaderInfo*> stages{cs};
+    const ProgramLayout& layout = program_layout(stages);
+    VkPipeline pipeline = compute_pipeline(cs, layout);
+    if (!pipeline) return;
+    draw_end_rendering(cb);
+    std::vector<std::pair<const ShaderInfo*, const DescriptorBinding*>> tex_bindings;
+    std::vector<uint64_t> handles;
+    gather_textures(stages, tex_bindings, handles);
+    Descriptors d;
+    build_sets(cb, stages, layout, tex_bindings, handles, d);
+    p_vkUpdateDescriptorSets(vk_device(), uint32_t(d.writes.size()), d.writes.data(), 0, nullptr);
+    p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout.layout, 0, 4, d.sets, 0, nullptr);
+    p_vkCmdDispatch(cb, x, y, z);
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+                           nullptr, 0, nullptr);
+    g_stats.dispatches++;
+}
+
+bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, const Cmd& c) {
+    g_stats.total++;
+    if (g_state.rasterizer_discard || !g_state.render_enable) return false;  // nothing reaches the targets
+    const auto* shaders = program_shaders(g_state.program);
+    if (!shaders || shaders->empty()) {
+        g_stats.no_program++;
+        return false;
+    }
+    const ShaderInfo* vs = nullptr;
+    const ShaderInfo* fs = nullptr;
+    for (const ShaderInfo* s : *shaders) {
+        if (s->stage == ShaderStage::Vertex) vs = s;
+        if (s->stage == ShaderStage::Fragment) fs = s;
+    }
+    if (!vs) {
+        g_stats.no_vertex++;
+        return false;
+    }
+    // NX_SKIP_FS=<hash>,<hash>: draws with those fragment shaders are dropped (to measure what they cost).
+    static const std::string skip = std::getenv("NX_SKIP_FS") ? std::getenv("NX_SKIP_FS") : "";
+    if (!skip.empty() && fs && skip.find(fs->hash) != std::string::npos) return false;
+    const ProgramLayout& layout = program_layout(*shaders);
+
+    // Textures first: an upload or a layout change cannot happen inside the render pass.
+    std::vector<std::pair<const ShaderInfo*, const DescriptorBinding*>> tex_bindings;
+    std::vector<uint64_t> handles;
+    bool need_break = gather_textures(*shaders, tex_bindings, handles);
+    bool targets_changed = !g_rendering || std::memcmp(&g_pass, &t, sizeof t) != 0;
+    if (g_rendering && (need_break || targets_changed)) draw_end_rendering(cb);
+
+    Descriptors d;
+    build_sets(cb, *shaders, layout, tex_bindings, handles, d);
     if (!g_rendering) {
         if (gpu_profile_on()) {
             GpuImage* img = t.color_count && t.colors[0] ? image_of(t.colors[0]) : nullptr;
@@ -300,9 +458,9 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         return false;
     }
 
-    p_vkUpdateDescriptorSets(vk_device(), uint32_t(writes.size()), writes.data(), 0, nullptr);
+    p_vkUpdateDescriptorSets(vk_device(), uint32_t(d.writes.size()), d.writes.data(), 0, nullptr);
     p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.layout, 0, 4, sets, 0, nullptr);
+    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.layout, 0, 4, d.sets, 0, nullptr);
 
     // Vertex buffers: the bound ranges of the streams in use, plus the zero stream (binding 15).
     uint32_t max_vertex = 0;
@@ -423,6 +581,11 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
 
 }  // namespace
 
+void draw_end_submit() {  // after the submit's fence: compute results to guest memory
+    for (const WriteBack& w : g_write_backs) std::memcpy(w.to, w.from, w.size);
+    g_write_backs.clear();
+}
+
 void draw_begin_submit() {
     g_rendering = false;
     pipeline_begin_submit();
@@ -455,6 +618,10 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
             std::memcpy(s.viewport, c.i, sizeof s.viewport), s.has_viewport = true;
             break;
         case Cmd::SetRasterizerDiscard: s.rasterizer_discard = c.n != 0; break;
+        case Cmd::BindImage:
+            if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 16) s.images[c.i[0]][c.i[1]] = c.a[0];
+            break;
+        case Cmd::DispatchCompute: dispatch(cb, c); break;
         case Cmd::SetRenderEnable: s.render_enable = c.n != 0; break;
         case Cmd::SetScissor:
             std::memcpy(s.scissor, c.i, sizeof s.scissor), s.has_scissor = true;

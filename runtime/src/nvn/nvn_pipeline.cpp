@@ -423,7 +423,10 @@ uint64_t hash_memory(const uint8_t* p, uint64_t size) {
 
 // A pitch-linear texture the GPU does not write: did the CPU change it since the last upload?
 void check_linear_content(Texture& t) {
-    if (!t.stride || !t.memory || !t.image || t.image->rendered || t.hashed_submit == g_submit_serial) return;
+    // Every 4th submit at most: hashing Wonder's 16 MB glyph cache every frame cost ~20% of the GPU thread; a new
+    // glyph shows up to 3 frames late.
+    if (!t.stride || !t.memory || !t.image || t.image->rendered || (t.hashed_submit && t.hashed_submit + 4 > g_submit_serial))
+        return;
     t.hashed_submit = g_submit_serial;
     uint64_t h = hash_memory(reinterpret_cast<const uint8_t*>(t.memory), t.storage_size);
     if (t.content_hash && h != t.content_hash) t.dirty = true;
@@ -465,12 +468,10 @@ VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer) {
     return v;
 }
 
-VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape& shape, const ViewInfo* view,
-                         VkImageLayout* layout) {
+GpuImage* ensure_contents(VkCommandBuffer cb, uint64_t texture) {
     Texture* t = get<Texture>(texture);
     GpuImage* img = t ? image_of(texture) : nullptr;
-    *layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    if (!img) return dummy_view(cb, shape);
+    if (!img) return nullptr;
     bool dirty = t->dirty.exchange(false);
     if (!img->rendered && (!img->uploaded || dirty)) upload_texture(cb, *t, *img);
     apply_texel_writes(cb, *t, *img);
@@ -482,6 +483,14 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
             p_vkCmdClearColorImage(cb, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
         }
     }
+    return img;
+}
+
+VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape& shape, const ViewInfo* view,
+                         VkImageLayout* layout) {
+    *layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    GpuImage* img = ensure_contents(cb, texture);
+    if (!img) return dummy_view(cb, shape);
     *layout = img->rendered ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     transition(cb, *img, *layout);
     VkImageView v = view_of(*img, view_type(shape), view ? *view : ViewInfo{});
@@ -545,6 +554,67 @@ VkImageView dummy_view(VkCommandBuffer cb, const ImageShape& shape) {
         p_vkCmdClearColorImage(cb, d.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
     }
     transition(cb, d, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    return d.view;
+}
+
+VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgramLayout& layout) {
+    static std::map<std::pair<const ShaderInfo*, VkPipelineLayout>, VkPipeline> cache;
+    auto& p = cache[{cs, layout.layout}];
+    if (!p) {
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = module_of(cs);
+        ci.stage.pName = "main";
+        ci.layout = layout.layout;
+        if (p_vkCreateComputePipelines(vk_device(), VK_NULL_HANDLE, 1, &ci, nullptr, &p) != VK_SUCCESS) {
+            log("nvn/vk: compute pipeline for %s failed", cs->hash.c_str());
+            p = VK_NULL_HANDLE;
+        }
+    }
+    return p;
+}
+
+VkImageView storage_view(VkCommandBuffer cb, uint64_t texture, const ImageShape& shape, const ViewInfo* view) {
+    GpuImage* img = texture ? ensure_contents(cb, texture) : nullptr;
+    if (img && img->storage) {
+        transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);
+        img->rendered = true;  // the shader may write it
+        ViewInfo v = view ? *view : ViewInfo{};
+        v.levels = 1, v.swizzle = 0;  // storage views: one level, identity
+        if (VkImageView iv = view_of(*img, view_type(shape), v)) return iv;
+    }
+    static std::map<VkImageViewType, GpuImage> dummies;
+    VkImageViewType type = view_type(shape);
+    auto& d = dummies[type];
+    if (!d.image) {
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.imageType = type == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+        ci.format = VK_FORMAT_R32_UINT;
+        ci.extent = {1, 1, 1};
+        ci.mipLevels = 1;
+        ci.arrayLayers = 1;
+        ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+        p_vkCreateImage(vk_device(), &ci, nullptr, &d.image);
+        VkMemoryRequirements req{};
+        p_vkGetImageMemoryRequirements(vk_device(), d.image, &req);
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        p_vkAllocateMemory(vk_device(), &ai, nullptr, &d.memory);
+        p_vkBindImageMemory(vk_device(), d.image, d.memory, 0);
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = d.image;
+        vi.viewType = type == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D
+                      : (type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D);
+        vi.format = ci.format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        p_vkCreateImageView(vk_device(), &vi, nullptr, &d.view);
+        d.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        d.format = ci.format;
+    }
+    transition(cb, d, VK_IMAGE_LAYOUT_GENERAL);
     return d.view;
 }
 

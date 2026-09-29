@@ -84,8 +84,46 @@ void SetRenderEnable(CPU& c) {
     record(c.x[0], cmd);
 }
 
+// BindImage(cmd, stage, index, NVNimageHandle), BindImages[Deferred](cmd, stage, first, count, const NVNimageHandle*)
+void BindImage(CPU& c) {
+    Cmd cmd{Cmd::BindImage};
+    cmd.i[0] = int32_t(c.x[1]), cmd.i[1] = int32_t(c.x[2]);
+    cmd.a[0] = c.x[3];
+    record(c.x[0], cmd);
+}
+
+void BindImages(CPU& c) {
+    int32_t stage = int32_t(c.x[1]), first = int32_t(c.x[2]), count = int32_t(c.x[3]);
+    for (int32_t k = 0; k < count && c.x[4]; k++) {
+        Cmd cmd{Cmd::BindImage};
+        cmd.i[0] = stage, cmd.i[1] = first + k;
+        cmd.a[0] = ld<uint64_t>(c.x[4] + 8ull * k);
+        record(c.x[0], cmd);
+    }
+}
+
+// DispatchCompute(cmd, int x, int y, int z); DispatchComputeIndirect(cmd, NVNbufferAddress of {u32 x, y, z}),
+// read at replay (the GPU may have written it).
+void DispatchCompute(CPU& c) {
+    Cmd cmd{Cmd::DispatchCompute};
+    cmd.i[0] = int32_t(c.x[1]), cmd.i[1] = int32_t(c.x[2]), cmd.i[2] = int32_t(c.x[3]);
+    record(c.x[0], cmd);
+}
+
+void DispatchComputeIndirect(CPU& c) {
+    Cmd cmd{Cmd::DispatchCompute};
+    cmd.n = 1;
+    cmd.a[0] = c.x[1];
+    record(c.x[0], cmd);
+}
+
 }  // namespace
 
+NX_HLE("nvnCommandBufferBindImage", BindImage);
+NX_HLE("nvnCommandBufferBindImages", BindImages);
+NX_HLE("nvnCommandBufferBindImagesDeferred", BindImages);
+NX_HLE("nvnCommandBufferDispatchCompute", DispatchCompute);
+NX_HLE("nvnCommandBufferDispatchComputeIndirect", DispatchComputeIndirect);
 NX_HLE("nvnCommandBufferBindUniformBuffers", BindUniformBuffers);
 NX_HLE("nvnCommandBufferBindUniformBuffersDeferred", BindUniformBuffers);
 NX_HLE("nvnCommandBufferBindStorageBuffers", BindStorageBuffers);

@@ -39,7 +39,11 @@ struct PipelineKey {
 };
 VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout);
 
+VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgramLayout& layout);
+
 VkSampler sampler_for(const SamplerInfo& info, bool shadow);
+// A storage-image view of the texture (single level of the pool view), or the dummy storage image. Layout GENERAL.
+VkImageView storage_view(VkCommandBuffer cb, uint64_t texture, const ImageShape& shape, const ViewInfo* view);
 
 // A sampled texture ready for the shaders (uploaded from guest memory the first time, unless the GPU renders it),
 // and a view of it matching what the shader declares. Transitions the image to SHADER_READ_ONLY on cb.
@@ -47,6 +51,9 @@ VkSampler sampler_for(const SamplerInfo& info, bool shadow);
 // images the GPU renders stay GENERAL (a bloom chain samples one level while rendering another).
 VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape& shape, const ViewInfo* view,
                          VkImageLayout* layout);
+// The image behind a texture with its contents in place (uploaded, CPU writes applied, never-written ones cleared);
+// null for an unknown texture. Records transfers: outside render passes.
+GpuImage* ensure_contents(VkCommandBuffer cb, uint64_t texture);
 // A single level and layer of an image, for rendering to.
 VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer);
 // True when sampled_view() would need no transfer or layout change (it can then be called inside a render pass).

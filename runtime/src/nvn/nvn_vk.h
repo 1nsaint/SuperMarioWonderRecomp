@@ -21,6 +21,7 @@ struct GpuImage {
     bool rendered = false;  // written by the GPU: never re-uploaded from guest memory
     bool uploaded = false;  // filled from the texture's pool memory
     VkComponentMapping swizzle{};  // for sampling (attachment views stay identity)
+    bool storage = false;          // created with VK_IMAGE_USAGE_STORAGE_BIT (compute shaders write it)
 };
 
 VkDevice vk_device();
@@ -53,9 +54,12 @@ struct Targets {
     TargetViews views;  // level and layer of each (index 8: depth)
 };
 void draw_begin_submit();
+void draw_end_submit();  // after the GPU finished the submit
 void draw_log_stats();
 void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const Targets& targets);
 void draw_end_rendering(VkCommandBuffer cb);  // before transfers (clears, copies, present) and at the end
+
+void replay_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list);  // nvn_copy.cpp: texture copies
 
 // nvn_debug.cpp: GPU time per render pass (NX_GPU_PROFILE=1).
 bool gpu_profile_on();

@@ -79,6 +79,7 @@ set(NX_RUNTIME_SOURCES
     runtime/src/nvn/nvn_vk.cpp
     runtime/src/nvn/nvn_debug.cpp
     runtime/src/nvn/nvn_binds.cpp
+    runtime/src/nvn/nvn_copy.cpp
     runtime/src/nvn/nvn_pipeline.cpp
     runtime/src/nvn/nvn_draw.cpp
     runtime/src/vk_bridge.cpp

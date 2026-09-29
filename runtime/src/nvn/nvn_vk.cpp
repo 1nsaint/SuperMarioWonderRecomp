@@ -323,6 +323,12 @@ GpuImage* image_of(uint64_t guest) {
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     if (!compressed) ci.usage |= aspect ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    {
+        VkFormatProperties fp{};
+        p_vkGetPhysicalDeviceFormatProperties(g_physical, ci.format, &fp);
+        img->storage = !compressed && !aspect && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+        if (img->storage) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    }
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (!check(p_vkCreateImage(g_device, &ci, nullptr, &img->image), "vkCreateImage")) return nullptr;
     VkMemoryRequirements req{};
@@ -469,6 +475,10 @@ void replay(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth) {
                     }
                 }
                 break;
+            case Cmd::CopyTextureToTexture:
+                draw_end_rendering(cb);
+                replay_copy(cb, c, list);
+                break;
             default: draw_command(cb, c, list, st); break;
         }
     }
@@ -611,6 +621,7 @@ void gpu_submit(CPU&, const std::vector<std::shared_ptr<CmdList>>& lists) {
     g_timing.submits++, g_timing.replay_ns += plat::monotonic_ns() - t0, g_timing.upload_bytes += g_upload_used;
     gpu_profile_mark(g_cb, "end");
     end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);
+    draw_end_submit();
     gpu_profile_collect();
     if (uint64_t n = draw_take_dump_request(); n && dump_every() && n % dump_every() == 0) debug_dump_textures(n);
 }
