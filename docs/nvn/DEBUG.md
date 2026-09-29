@@ -163,3 +163,8 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
     390 s in the prologue course, then a run from that save through the world map into the first course (Course001)
     until the 5 GB memory guard stopped it. Another process that hangs the GPU makes ours fail as well
     (`kIOGPUCommandBufferCallbackErrorInnocentVictim`): one game run at a time.
+22. **The Mac restarted (WindowServer watchdog) during a test run.** The run used a build without #21: a shader hung
+    the GPU, WindowServer (which draws the whole desktop) waited in Metal/IOGPU, its watchdog fired twice and macOS
+    restarted. Safeguards: a lost device (`VK_ERROR_DEVICE_LOST`) or a submit not finishing within 2 s ends the
+    process at once (nvn_vk.cpp), so a hang cannot keep the GPU busy. Test runs must use a build with the current
+    fixes, one game process at a time.
