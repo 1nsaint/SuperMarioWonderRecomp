@@ -1,6 +1,7 @@
 // Pipelines and sampled resources (nvn_pipeline.h). Everything is cached for the life of the process: layouts by
 // their bindings, pipelines by their full state, samplers by their state, views by (image, type).
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -101,7 +102,7 @@ bool view_compatible(const GpuImage& img, VkImageViewType type, uint32_t layers)
 
 // A view for sampling: the image's own when it fits, else one of the view type with the texture's swizzle.
 VkImageView view_of(GpuImage& img, VkImageViewType type, const ViewInfo& view) {
-    uint32_t swizzle = view.swizzle;
+    uint32_t swizzle = img.alpha_from_r ? 0 : view.swizzle;  // materialized at upload
     VkComponentMapping m = img.swizzle;
     if (swizzle) {
         constexpr VkComponentSwizzle kSwizzle[] = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE,
@@ -155,6 +156,24 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
     std::vector<uint8_t> linear;
     std::vector<VkBufferImageCopy> copies;
     uint32_t layers = img.view_type == VK_IMAGE_VIEW_TYPE_3D ? std::max(1u, t.depth) : img.layers;
+    if (img.alpha_from_r && t.stride) {  // R8 pitch-linear -> RGBA8 (255, 255, 255, R), level 0
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(t.memory);
+        uint64_t rows = uint64_t(img.height) * layers;
+        if (uint64_t(t.stride) * rows > t.storage_size) rows = t.storage_size / t.stride;
+        Upload u = upload_alloc(rows * img.width * 4, 16);
+        for (uint64_t y = 0; y < rows; y++) {
+            const uint8_t* s = src + y * t.stride;
+            uint32_t* d = reinterpret_cast<uint32_t*>(u.ptr + y * img.width * 4);
+            for (uint32_t x = 0; x < img.width; x++) d[x] = 0x00FFFFFFu | (uint32_t(s[x]) << 24);
+        }
+        VkBufferImageCopy r{};
+        r.bufferOffset = u.offset;
+        r.imageSubresource = {img.aspect, 0, 0, img.layers};
+        r.imageExtent = {img.width, uint32_t(std::min<uint64_t>(rows, img.height)), 1};
+        transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+        return;
+    }
     if (t.stride) {  // pitch-linear: rows as they are
         uint64_t rows = (img.height + bh - 1) / bh;
         Upload u = upload(reinterpret_cast<const void*>(t.memory), uint64_t(t.stride) * rows * layers, 16);
@@ -373,8 +392,10 @@ VkSampler sampler_for(const SamplerInfo& s, bool shadow) {
     ci.addressModeV = vk_wrap(s.wrap[1]);
     ci.addressModeW = vk_wrap(s.wrap[2]);
     ci.mipLodBias = s.lod_bias;
-    ci.minLod = m <= 1 ? 0.0f : s.lod_min;
-    ci.maxLod = m <= 1 ? 0.25f : s.lod_max;  // no mipmapping: level 0 only
+    // Games pass lod_min -1000 ("no limit"); Metal wants lodMinClamp >= 0, and a negative one made the glyph
+    // sampler return 0 (all text invisible).
+    ci.minLod = m <= 1 ? 0.0f : std::max(0.0f, s.lod_min);
+    ci.maxLod = m <= 1 ? 0.25f : std::max(ci.minLod, s.lod_max);  // no mipmapping: level 0 only
     ci.anisotropyEnable = s.max_anisotropy > 1.0f;
     ci.maxAnisotropy = std::min(s.max_anisotropy, 16.0f);
     ci.compareEnable = shadow;

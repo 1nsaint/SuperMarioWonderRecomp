@@ -1,6 +1,7 @@
 // nn::hid at the API level: player 1's Npad state comes from the platform (XInput + keyboard on Windows, game
 // controllers + touch on Android). Vibration is accepted and dropped.
 #include <array>
+#include <atomic>
 #include <deque>
 #include <algorithm>
 #include <cstring>
@@ -102,6 +103,11 @@ void GetNpadState(CPU& c) {
 // Wonder ignores the return value and reads all 16 entries it asks for, telling new samples by their sampling
 // numbers, so every call adds a sample and returns up to 16 of the latest (older entries stay as they were).
 void GetNpadStatesFullKey(CPU& c) {
+    {
+        static std::atomic<uint64_t> calls{0};
+        uint64_t n = ++calls;
+        if (n % 3000 == 0) log("hid: %llu full-key reads (lr %s)", (unsigned long long)n, describe(c.x[30]).c_str());
+    }
     uint64_t out = c.x[0], id_ref = c.x[2];
     int n = int(c.x[1]);
     if (n < 1) {

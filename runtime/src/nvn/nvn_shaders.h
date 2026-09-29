@@ -230,6 +230,7 @@ const char* source_name(NvnSource s);
 // <data root>/spirv/<hash>.spv once; the pointer stays valid until exit. Null if there is no such file (logged once
 // per hash). Hashing costs a pass over the block: call it when the program is set, not per draw.
 const ShaderInfo* shader_for(uint64_t code_host, uint64_t control);
+const ShaderInfo* shader_by_hash(const std::string& hash);  // one already loaded, or null
 #endif
 
 }  // namespace nx::nvn

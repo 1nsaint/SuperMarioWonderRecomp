@@ -110,6 +110,8 @@ struct Texture : Object {
     std::vector<TexelWrite> writes;  // under objects_lock()
     // The CPU wrote the texture's memory (nvnMemoryPoolFlushMappedRange over it, e.g. a glyph cache): upload again.
     std::atomic<bool> dirty{false};
+    // The swizzle of the texture-pool view it is registered with (4 NVNtextureSwizzle bytes, 0: none).
+    std::atomic<uint32_t> pool_swizzle{0};
     // Pitch-linear textures the CPU keeps writing without a flush (Wonder's glyph cache: 2048x8192 R8): their memory
     // is hashed at most once per submit that samples them, and a change means an upload.
     uint64_t content_hash = 0, hashed_submit = 0;

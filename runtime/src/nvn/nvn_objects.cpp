@@ -362,6 +362,8 @@ void TexturePoolRegister(CPU& c) {
         log("nvn: pool %llx id %#x = texture %llx view %llx: levels %u+%u layers %u+%u swizzle %08x",
             (unsigned long long)c.x[0], uint32_t(c.x[1]), (unsigned long long)c.x[2], (unsigned long long)c.x[3],
             v.base_level, v.levels, v.min_layer, v.layers, v.swizzle);
+    if (v.swizzle)
+        if (auto* t = get<Texture>(c.x[2])) t->pool_swizzle = v.swizzle;
     if (auto* d = get<DescriptorPool>(c.x[0])) {
         std::lock_guard lk(objects_lock());
         d->textures[uint32_t(c.x[1])] = c.x[2];

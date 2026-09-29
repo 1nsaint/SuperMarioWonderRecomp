@@ -22,6 +22,9 @@ struct GpuImage {
     bool uploaded = false;  // filled from the texture's pool memory
     VkComponentMapping swizzle{};  // for sampling (attachment views stay identity)
     bool storage = false;          // created with VK_IMAGE_USAGE_STORAGE_BIT (compute shaders write it)
+    // An R8 texture always read as (1, 1, 1, R) (a glyph cache): stored as RGBA8 (255, 255, 255, R) and sampled
+    // without swizzle. MoltenVK returned alpha 0 for that view swizzle on a 2D-array view, so all text was invisible.
+    bool alpha_from_r = false;
 };
 
 VkDevice vk_device();

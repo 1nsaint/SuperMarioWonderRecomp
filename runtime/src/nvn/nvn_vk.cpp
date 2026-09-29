@@ -170,6 +170,7 @@ bool init() {
     }
     p_vkGetPhysicalDeviceFeatures2(g_physical, &features);
     g_depth_clip_control = fclip.depthClipControl;
+    log("nvn/vk: portability: format reinterpretation %u, format swizzle %u", fport.fields[2], fport.fields[3]);
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = g_family;
@@ -277,6 +278,10 @@ GpuImage* image_of(uint64_t guest) {
     if (t->image) return t->image.get();
     auto img = std::make_shared<GpuImage>();
     img->format = vk_format(t->format);
+    if (t->format == 0x1 && t->pool_swizzle == 0x02010101u) {
+        img->format = VK_FORMAT_R8G8B8A8_UNORM;
+        img->alpha_from_r = true;
+    }
     uint32_t aspect = format_aspect(t->format);
     img->aspect = aspect == 0 ? VK_IMAGE_ASPECT_COLOR_BIT
                   : aspect == 1 ? VK_IMAGE_ASPECT_DEPTH_BIT

@@ -749,6 +749,13 @@ Cache& cache() {
 
 }  // namespace
 
+const ShaderInfo* shader_by_hash(const std::string& hash) {
+    Cache& k = cache();
+    std::lock_guard lk(k.lock);
+    auto it = k.by_hash.find(hash);
+    return it == k.by_hash.end() ? nullptr : it->second.get();
+}
+
 const ShaderInfo* shader_for(uint64_t code_host, uint64_t control) {
     if (!code_host || !control) return nullptr;
     auto* ctrl = reinterpret_cast<const uint8_t*>(control);

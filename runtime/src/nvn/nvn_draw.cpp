@@ -409,6 +409,17 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         g_stats.no_vertex++;
         return false;
     }
+    // NX_SWAP_FS=<from>:<to>: draws with fragment shader <from> use <to> instead (loaded already), to see what a
+    // shader's geometry covers or what its textures hold.
+    static const std::string swap = std::getenv("NX_SWAP_FS") ? std::getenv("NX_SWAP_FS") : "";
+    std::vector<const ShaderInfo*> swapped;
+    if (!swap.empty() && fs && swap.compare(0, 16, fs->hash) == 0 && swap.size() > 17)
+        if (const ShaderInfo* to = shader_by_hash(swap.substr(17))) {
+            swapped = *shaders;
+            std::replace(swapped.begin(), swapped.end(), fs, to);
+            shaders = &swapped;
+            fs = to;
+        }
     // NX_SKIP_FS=<hash>,<hash>: draws with those fragment shaders are dropped (to measure what they cost).
     static const std::string skip = std::getenv("NX_SKIP_FS") ? std::getenv("NX_SKIP_FS") : "";
     if (!skip.empty() && fs && skip.find(fs->hash) != std::string::npos) return false;
@@ -542,6 +553,10 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             texture_for(handles[k], texture, si);
             Texture* tx = texture ? get<Texture>(texture) : nullptr;
             char b[96];
+            if (std::getenv("NX_TRACE_GLYPHS"))
+                log("  sampler for t%zu: min %u mag %u wrap %u/%u/%u compare %u/%u reduction %u lod %g..%g bias %g aniso %g",
+                    k, si.min_filter, si.mag_filter, si.wrap[0], si.wrap[1], si.wrap[2], si.compare_mode, si.compare_func,
+                    si.reduction, si.lod_min, si.lod_max, si.lod_bias, si.max_anisotropy);
             std::snprintf(b, sizeof b, " t%zu=%llx:%llx(%ux%u f%x%s)", k, (unsigned long long)handles[k],
                           (unsigned long long)texture, tx ? tx->width : 0, tx ? tx->height : 0, tx ? tx->format : 0,
                           tx && tx->image && tx->image->rendered ? " rt" : "");
@@ -552,6 +567,27 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                 for (uint64_t k = 0; k < std::min<uint64_t>(u.size / 16, 8); k++)
                     log("  fs c3[%llu] @%llx: %g %g %g %g", (unsigned long long)k, (unsigned long long)u.address,
                         f[4 * k], f[4 * k + 1], f[4 * k + 2], f[4 * k + 3]);
+        if (const Range& r = g_state.storage[0][0]; r.address && std::getenv("NX_TRACE_GLYPHS"))
+            if (auto* g = guest_bytes(r.address))
+                for (uint64_t k = 0; k < std::min<uint64_t>(r.size / 64, 3); k++) {
+                    const uint32_t* w = reinterpret_cast<const uint32_t*>(g + 64 * k);
+                    if (Texture* at = get<Texture>(0x4383061d8ull); at && at->memory && at->stride) {
+                        float u0, v0, u1, v1;
+                        std::memcpy(&u0, w + 4, 4), std::memcpy(&v0, w + 5, 4), std::memcpy(&u1, w + 6, 4), std::memcpy(&v1, w + 7, 4);
+                        uint32_t x = uint32_t((u0 + u1) * 0.5f * at->width), y = uint32_t((v0 + v1) * 0.5f * at->height);
+                        const uint8_t* m = reinterpret_cast<const uint8_t*>(at->memory);
+                        uint32_t nz = 0, mx = 0;
+                        for (int dy = -20; dy <= 20; dy++)
+                            for (int dx = -20; dx <= 20; dx++) {
+                                uint8_t v = m[uint64_t(y + dy) * at->stride + x + dx];
+                                nz += v != 0, mx = std::max<uint32_t>(mx, v);
+                            }
+                        log("  glyph %llu atlas memory at %u,%u: %u of 1681 non-zero, max %u", (unsigned long long)k, x, y, nz, mx);
+                    }
+                    log("  glyph %llu: %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x",
+                        (unsigned long long)k, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11],
+                        w[12], w[13], w[14], w[15]);
+                }
         for (int k = 0; k < 2; k++)
             if (const Range& r = g_state.storage[0][k]; r.address) {
                 auto* f = reinterpret_cast<const float*>(guest_bytes(r.address));
@@ -559,6 +595,18 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                     (unsigned long long)r.size, f ? f[0] : -1, f ? f[1] : -1, f ? f[2] : -1, f ? f[3] : -1,
                     f ? f[4] : -1, f ? f[5] : -1, f ? f[6] : -1, f ? f[7] : -1);
             }
+        {
+            const auto& k = vs->constants;
+            std::string w;
+            for (size_t i = 0; i + 4 <= std::min<size_t>(k.size(), 256); i += 4) {
+                char t[16];
+                uint32_t v;
+                std::memcpy(&v, k.data() + i, 4);
+                std::snprintf(t, sizeof t, " %x", v);
+                w += t;
+            }
+            log("  vs constants %zu bytes:%s", k.size(), w.c_str());
+        }
         if (fs) {
             const auto& k = fs->constants;
             const float* f = reinterpret_cast<const float*>(k.data());
