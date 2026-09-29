@@ -199,7 +199,7 @@ bool init() {
     p_vkCreateSemaphore(g_device, &sci, nullptr, &g_acquired);
     p_vkCreateSemaphore(g_device, &sci, nullptr, &g_rendered);
 
-    make_upload_buffer(64ull << 20);
+    make_upload_buffer(256ull << 20);  // a busy submit reached 67 MB (uniforms padded to 4 KB, storage to 64 KB)
     VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 65536}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16384},
                                     {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 65536}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4096},
                                     {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024}};
