@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -23,14 +24,25 @@ VkShaderStageFlags stage_bit(ShaderStage s) {
                                         : VK_SHADER_STAGE_COMPUTE_BIT;
 }
 
-VkShaderModule module_of(const ShaderInfo* s) {
-    static std::unordered_map<const ShaderInfo*, VkShaderModule> cache;
-    auto& m = cache[s];
+// `kinds`: per vertex input location, 0 float or the integer kind of its attribute format (vertex_int_kind).
+VkShaderModule module_of(const ShaderInfo* s, const uint8_t* kinds = nullptr) {
+    static std::map<std::pair<const ShaderInfo*, std::string>, VkShaderModule> cache;
+    static const bool off = std::getenv("NX_NO_INT_ATTRIBS") != nullptr;
+    std::string k = kinds && !off ? std::string(reinterpret_cast<const char*>(kinds), 16) : std::string(16, '\0');
+    auto& m = cache[{s, k}];
     if (!m) {
+        std::vector<uint32_t> patched;
+        bool is_patched = k != std::string(16, '\0') &&
+                          patch_int_inputs(s->spirv, reinterpret_cast<const uint8_t*>(k.data()), patched);
+        std::vector<uint32_t> clamped;
+        bool is_clamped = clamp_uniform_indices(is_patched ? patched : s->spirv, clamped, nullptr);
+        const std::vector<uint32_t>& code = is_clamped ? clamped : is_patched ? patched : s->spirv;
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        ci.codeSize = s->spirv.size() * 4;
-        ci.pCode = s->spirv.data();
+        ci.codeSize = code.size() * 4;
+        ci.pCode = code.data();
         if (p_vkCreateShaderModule(vk_device(), &ci, nullptr, &m) != VK_SUCCESS) log("nvn/vk: shader %s rejected", s->hash.c_str());
+        static int logged = 0;
+        if (is_patched && logged++ < 20) log("nvn/vk: shader %s: integer vertex inputs", s->hash.c_str());
     }
     return m;
 }
@@ -247,12 +259,29 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     uint32_t nstages = 0;
+    uint8_t int_kinds[16] = {};
+    for (uint32_t a = 0; a < key.attrib_count && a < 16; a++) int_kinds[a] = uint8_t(vertex_int_kind(key.attribs[a].format));
+    // NX_TRACE_PIPELINES=1: every new pipeline's shaders, and each vertex shader's inputs once.
+    static std::set<const ShaderInfo*> logged_vs;
+    static const bool trace = std::getenv("NX_TRACE_PIPELINES") != nullptr;
+    if (trace) log("nvn/vk: new pipeline vs %s fs %s", key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
+    if (trace && key.vs && logged_vs.insert(key.vs).second) {
+        std::string line;
+        for (const ShaderIo& in : key.vs->refl.inputs) {
+            char b[64];
+            const VertexAttrib* va = in.location < key.attrib_count ? &key.attribs[in.location] : nullptr;
+            std::snprintf(b, sizeof b, " %u:%x/s%u+%u", in.location, va ? va->format : 0, va ? va->stream : 0,
+                          va ? va->offset : 0);
+            line += b;
+        }
+        log("nvn/vk: vs %s inputs (location:format/stream+offset)%s", key.vs->hash.c_str(), line.c_str());
+    }
     for (const ShaderInfo* s : {key.vs, key.fs}) {
         if (!s) continue;
         auto& st = stages[nstages++];
         st.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         st.stage = VkShaderStageFlagBits(stage_bit(s->stage));
-        st.module = module_of(s);
+        st.module = module_of(s, s == key.vs ? int_kinds : nullptr);
         st.pName = "main";
     }
 

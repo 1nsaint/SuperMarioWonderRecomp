@@ -140,3 +140,26 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
 19. **EQUAL depth after a pre-pass** — relaxed to LESS_OR_EQUAL when the pass does not write depth (Metal compiles the
     pre-pass and colour-pass vertex shaders separately; bit-identical depth is not guaranteed). Kept as a safety net;
     it was not the cause of #17.
+21. **The picture froze at the first talking-flower balloon of the prologue course; the sound played on.** (#20 is
+    the integer vertex inputs.) The game was not stuck: guest threads kept running, frames kept being presented and
+    scripted input kept driving the logic (walking right, it even finished the prologue course and reached the world
+    map). The GPU was gone: `vkQueueSubmit failed (-4)` on every submit from then on, and with
+    `MVK_CONFIG_LOG_LEVEL=1` MoltenVK said why: `Caused GPU Hang Error (kIOGPUCommandBufferCallbackErrorHang)`, a
+    command buffer that ran too long. Found in three steps. (1) Not the 793 regenerated shaders: the same hang with
+    the pre-fix `.spv.orig` files (a spirv folder of symlinks under `NX_DATA_ROOT`). (2) A bisection over the 2,330
+    shaders that contain a loop, leaving half of them out of that folder per run (a missing shader skips its draws),
+    12 runs: fragment shader `b2f3dc2ff54d1ba4` (uber). (3) Its loop walks a tiled light list: the tile is
+    `floor(gl_FragCoord * c[6][62].zw * (16, 9))`, the count is `c[8]` at byte 8196 + 256 * tile, and the loop runs
+    that many times. A local trace of the bound banks: `c[8]` bound with 0xb000 bytes (144 tiles) and `c[6][62].zw`
+    = 1/384, 1/216, but the same materials also draw into 1920x1080 targets, where the tile reaches ~800 and the count
+    is read up to 213 KB into the bank. On Maxwell a constant read past the bound size returns 0 (no lights). Here the
+    bank was the bound bytes zero-padded to 4 KB in the upload buffer, the translator declares every bank as
+    vec4[4096] and Metal checks nothing: the count came from whatever followed, up to 4 billion iterations. 2,071 of
+    the loop shaders read the same light list; which draw hung first depended on what lay in the upload buffer.
+    Fix (`clamp_uniform_indices`, nvn_spirv_patch.cpp): when a shader module is created, every uniform access chain
+    whose array index is computed gets `UMin(index, 4095)` (a negative index clamps too), and the set 0 bindings read
+    that way are bound zero-padded to the full 64 KB (`dynamic_uniform_bindings`, `build_sets`), so every read past
+    the data returns 0 as on Maxwell. 5,159 of the 12,751 modules change; all pass `spirv-val`. With it, no GPU hang:
+    390 s in the prologue course, then a run from that save through the world map into the first course (Course001)
+    until the 5 GB memory guard stopped it. Another process that hangs the GPU makes ours fail as well
+    (`kIOGPUCommandBufferCallbackErrorInnocentVictim`): one game run at a time.

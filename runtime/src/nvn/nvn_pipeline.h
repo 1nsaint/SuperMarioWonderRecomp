@@ -39,6 +39,15 @@ struct PipelineKey {
 };
 VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout);
 
+// Integer vertex inputs (nvn_spirv_patch.cpp): the kind of an NVN attribute format (0 float, 1 unsigned bits,
+// 2 signed bits), and a copy of a module with those locations declared as integers and bitcast to float on load.
+uint32_t vertex_int_kind(uint32_t nvn_format);
+bool patch_int_inputs(const std::vector<uint32_t>& in, const uint8_t kinds[16], std::vector<uint32_t>& out);
+// Constant buffer reads with a computed index (c[k][index]) are clamped to the 64 KB a bank can hold, and the
+// set 0 bindings read that way are returned: those are bound zero-padded to 64 KB (nvn_spirv_patch.cpp).
+bool clamp_uniform_indices(const std::vector<uint32_t>& in, std::vector<uint32_t>& out, uint64_t* bindings);
+uint64_t dynamic_uniform_bindings(const ShaderInfo* s);
+
 VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgramLayout& layout);
 
 VkSampler sampler_for(const SamplerInfo& info, bool shadow);

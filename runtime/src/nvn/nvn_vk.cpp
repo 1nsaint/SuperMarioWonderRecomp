@@ -4,6 +4,8 @@
 // First version: every submit is recorded into one Vulkan command buffer and waited for; image layouts are tracked
 // per image; clears and render targets only (draws come with shaders, N5/N6). On macOS this is MoltenVK: the
 // instance enumerates portability drivers and the device enables VK_KHR_portability_subset.
+#include <unistd.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -57,9 +59,18 @@ PFN_vkCreateInstance p_create_instance = nullptr;
 PFN_vkEnumeratePhysicalDevices p_enum_physical = nullptr;
 PFN_vkCreateDevice p_create_device = nullptr;
 
+// A lost device means the GPU hung (a shader looping for ever): the process ends at once. Submitting more work, or
+// waiting, keeps the GPU stuck, and on macOS that froze WindowServer and restarted the machine.
+[[noreturn]] void gpu_hung(const char* why) {
+    log("nvn/vk: GPU hang (%s): stopping", why);
+    std::fprintf(stderr, "nvn/vk: GPU hang (%s): stopping\n", why);
+    _exit(4);
+}
+
 bool check(VkResult r, const char* what) {
     if (r >= 0) return true;
     log("nvn/vk: %s failed (%d)", what, int(r));
+    if (r == VK_ERROR_DEVICE_LOST) gpu_hung(what);
     return false;
 }
 
@@ -524,8 +535,12 @@ void end_and_wait(VkSemaphore wait, VkSemaphore signal) {
         si.pSignalSemaphores = &signal;
     }
     p_vkResetFences(g_device, 1, &g_fence);
-    if (check(p_vkQueueSubmit(g_queue, 1, &si, g_fence), "vkQueueSubmit"))
-        p_vkWaitForFences(g_device, 1, &g_fence, VK_TRUE, UINT64_MAX);
+    // 2 s at most: a frame's work takes milliseconds; longer is a shader that does not end.
+    if (check(p_vkQueueSubmit(g_queue, 1, &si, g_fence), "vkQueueSubmit")) {
+        VkResult w = p_vkWaitForFences(g_device, 1, &g_fence, VK_TRUE, 2'000'000'000ull);
+        if (w == VK_TIMEOUT) gpu_hung("a submit did not finish in 2 s");
+        check(w, "vkWaitForFences");
+    }
     (signal ? g_timing.present_wait_ns : g_timing.wait_ns) += plat::monotonic_ns() - t0;
 }
 

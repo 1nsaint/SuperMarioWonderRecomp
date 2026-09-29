@@ -81,7 +81,9 @@ set(NX_RUNTIME_SOURCES
     runtime/src/nvn/nvn_binds.cpp
     runtime/src/nvn/nvn_copy.cpp
     runtime/src/nvn/nvn_pipeline.cpp
+    runtime/src/nvn/nvn_spirv_patch.cpp
     runtime/src/nvn/nvn_draw.cpp
+    runtime/src/nvn/nvn_draw_trace.cpp
     runtime/src/vk_bridge.cpp
     runtime/src/vk_gen.cpp
     runtime/src/vk_present.cpp
