@@ -77,7 +77,7 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
         transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);  // rendered images stay GENERAL (sampled while rendered)
         img->rendered = true;
         uint32_t level = std::min<uint32_t>(t.views.level[k], img->levels - 1);
-        colors[k].imageView = attachment_view(*img, level, t.views.layer[k]);
+        colors[k].imageView = attachment_view(*img, level, t.views.layer[k], view_format(*img, t.views.format[k]));
         colors[k].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         colors[k].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         colors[k].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -458,7 +458,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     key.color_count = t.color_count;
     for (uint32_t k = 0; k < t.color_count; k++) {
         GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
-        key.color_formats[k] = img ? img->format : VK_FORMAT_R8G8B8A8_UNORM;
+        key.color_formats[k] = img ? view_format(*img, t.views.format[k]) : VK_FORMAT_R8G8B8A8_UNORM;
     }
     GpuImage* dimg = t.depth ? image_of(t.depth) : nullptr;
     key.depth_format = dimg && dimg->aspect != VK_IMAGE_ASPECT_COLOR_BIT ? dimg->format : VK_FORMAT_UNDEFINED;

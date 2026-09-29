@@ -289,6 +289,7 @@ GpuImage* image_of(uint64_t guest) {
     if (t->image) return t->image.get();
     auto img = std::make_shared<GpuImage>();
     img->format = vk_format(t->format);
+    img->nvn_format = t->format;
     if (t->format == 0x1 && t->pool_swizzle == 0x02010101u) {
         img->format = VK_FORMAT_R8G8B8A8_UNORM;
         img->alpha_from_r = true;
@@ -307,7 +308,11 @@ GpuImage* image_of(uint64_t guest) {
     img->layers = is3d ? 1 : (array || cube) ? depth : 1;
     img->depth = is3d ? depth : 1;
     if (cube && img->layers < 6) img->layers = 6;
-    img->view_type = is3d                              ? VK_IMAGE_VIEW_TYPE_3D
+    // NVN takes more levels than the size allows (a 1x1 texture with 5), Metal aborts on it (DEBUG.md #27).
+    uint32_t largest = std::max({img->width, img->height, img->depth}), fit = 1;
+    while (largest >>= 1) fit++;
+    img->levels = std::min(img->levels, fit);
+    img->view_type = is3d                             ? VK_IMAGE_VIEW_TYPE_3D
                      : t->target == 9                  ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
                      : cube                            ? VK_IMAGE_VIEW_TYPE_CUBE
                      : t->target == 0                  ? VK_IMAGE_VIEW_TYPE_1D
@@ -330,6 +335,8 @@ GpuImage* image_of(uint64_t guest) {
     // 3D textures are rendered one slice at a time (a colour-grading LUT): 2D views of a slice need this flag
     // (Metal otherwise refuses a 2D view of a 3D texture).
     ci.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : is3d ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0;
+    // Colour images may be viewed in another format of the same size (an sRGB view of RGBA8, docs/nvn/DEBUG.md #29).
+    if (aspect == 0 && !img->alpha_from_r) ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     ci.imageType = is3d ? VK_IMAGE_TYPE_3D : t->target == 0 || t->target == 3 ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
     ci.format = img->format;
     ci.extent = {img->width, ci.imageType == VK_IMAGE_TYPE_1D ? 1 : img->height, is3d ? depth : 1};

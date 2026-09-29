@@ -23,6 +23,19 @@ NVN implemented over Vulkan (MoltenVK).
 
 ## Log
 
+### 2026-09-29 (night): real colours, two crashes fixed
+
+![Before / after](docs/media/wonder/26-colours-before-after.png)
+![Course](docs/media/wonder/23-colours-fixed-course.png)
+![Bowser's castle](docs/media/wonder/25-bowser-castle-transformation.png)
+
+- Milestones W1 (stability), W2 (colour), W3 (60 fps) and W4 (glitches) on GitHub, issues #15-#25, from the study
+  docs/nvn/STUDY-colour-speed-glitches.md.
+- **Colours match the real game** (DEBUG.md #29): NVN sRGB texture views are now honoured. Mean luma 0.756 against
+  0.748 on the same shot.
+- **Crashes**: texture mip levels clamped (#27, a Metal abort after Bowser arrives), and audio updates paced to renders
+  (#28, a LightLimiter never initialized). Runs now reach Bowser's castle transformation.
+
 ### 2026-09-29 (evening): Mario and every character appear
 
 ![Mario in the course](docs/media/wonder/19-mario-appears-course.png)

@@ -61,6 +61,7 @@ ViewInfo read_view(CPU& c, uint64_t view) {
     for (int k = 0; k < 4; k++) st<uint32_t>(tmp + 4 * k, 2u + k);
     if (driver(c, "nvnTextureViewGetSwizzle", {view, tmp, tmp + 4, tmp + 8, tmp + 12}) & 1)
         for (int k = 0; k < 4; k++) v.swizzle |= std::min<uint32_t>(ld<uint32_t>(tmp + 4 * k), 5) << (8 * k);
+    if (driver(c, "nvnTextureViewGetFormat", {view, tmp}) & 1) v.format = ld<uint32_t>(tmp);
     return v;
 }
 

@@ -16,6 +16,22 @@ namespace nx::nvn {
 
 using namespace nx::vk;
 
+// NVN views carry a format: the game renders into RGBA8 textures through sRGB views (the GPU encodes on write and
+// blends in linear) and samples them the same way. Ignoring it lost one conversion per draw: far too much contrast
+// and saturation (docs/nvn/DEBUG.md #29).
+VkFormat view_format(const GpuImage& img, uint32_t nvn) {
+    if (!nvn || nvn == img.nvn_format || img.alpha_from_r || img.aspect != VK_IMAGE_ASPECT_COLOR_BIT) return img.format;
+    VkFormat f = vk_format(nvn);
+    uint32_t bw = 1, bh = 1, bytes = 0, iw = 1, ih = 1, ibytes = 0;
+    format_block(nvn, bw, bh, bytes);
+    format_block(img.nvn_format, iw, ih, ibytes);
+    bool ok = f != VK_FORMAT_UNDEFINED && format_aspect(nvn) == 0 && bw == iw && bh == ih && bytes == ibytes;
+    static std::set<std::pair<uint32_t, uint32_t>> logged;
+    if (logged.insert({img.nvn_format, nvn}).second && logged.size() <= 40)
+        log("nvn/vk: texture format %#x viewed as %#x%s", img.nvn_format, nvn, ok ? "" : " (not compatible: ignored)");
+    return ok ? f : img.format;
+}
+
 namespace {
 
 VkShaderStageFlags stage_bit(ShaderStage s) {
@@ -88,7 +104,7 @@ VkImageViewType view_type(const ImageShape& s) {  // SPIR-V Dim: 0 1D, 1 2D, 2 3
 
 // Views made for sampling and for rendering, by image; forget_image_views() drops an image's before it is freed.
 std::map<std::tuple<VkImage, VkImageViewType, uint32_t, uint64_t, uint64_t>, VkImageView> g_sampled_views;
-std::map<std::tuple<VkImage, uint32_t, uint32_t>, VkImageView> g_attachment_views;
+std::map<std::tuple<VkImage, uint32_t, uint32_t, VkFormat>, VkImageView> g_attachment_views;
 
 bool identity(const VkComponentMapping& m) {
     auto id = [](VkComponentSwizzle s, VkComponentSwizzle own) { return s == VK_COMPONENT_SWIZZLE_IDENTITY || s == own; };
@@ -128,16 +144,17 @@ VkImageView view_of(GpuImage& img, VkImageViewType type, const ViewInfo& view) {
     uint32_t levels = view.levels ? std::min(view.levels, img.levels - base) : img.levels - base;
     uint32_t min_layer = std::min(view.min_layer, img.layers - 1);
     bool whole = base == 0 && levels == img.levels && min_layer == 0 && (!view.layers || view.layers == img.layers);
-    if (type == img.view_type && identity(m) && whole) return img.view;
+    VkFormat format = view_format(img, view.format);
+    if (type == img.view_type && identity(m) && whole && format == img.format) return img.view;
     auto& cache = g_sampled_views;
     uint64_t range = uint64_t(base) | uint64_t(levels) << 16 | uint64_t(min_layer) << 32 | uint64_t(view.layers) << 48;
     auto& v = cache[{img.image, type, uint32_t(m.r) | uint32_t(m.g) << 8 | uint32_t(m.b) << 16 | uint32_t(m.a) << 24,
-                     range, 0}];
+                     range, uint64_t(format)}];
     if (!v) {
         VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         ci.image = img.image;
         ci.viewType = type;
-        ci.format = img.format;
+        ci.format = format;
         ci.components = m;
         uint32_t layers = std::min(view.layers ? view.layers : img.layers - min_layer, img.layers - min_layer);
         if (type == VK_IMAGE_VIEW_TYPE_2D || type == VK_IMAGE_VIEW_TYPE_1D) layers = 1;
@@ -508,19 +525,21 @@ bool sampled_ready(uint64_t texture) {
                         : img.uploaded && img.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
-VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer) {
+VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer, VkFormat format) {
+    if (format == VK_FORMAT_UNDEFINED) format = img.format;
     level = std::min(level, img.levels - 1);
     // A 3D image's slice is a layer of its 2D-array-compatible views, counted at this level.
     layer = std::min(layer, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? std::max(1u, img.depth >> level) - 1 : img.layers - 1);
-    if (level == 0 && layer == 0 && img.levels == 1 && img.layers == 1 && img.view_type == VK_IMAGE_VIEW_TYPE_2D)
+    if (level == 0 && layer == 0 && img.levels == 1 && img.layers == 1 && img.view_type == VK_IMAGE_VIEW_TYPE_2D &&
+        format == img.format)
         return img.view;
     auto& cache = g_attachment_views;
-    auto& v = cache[{img.image, level, layer}];
+    auto& v = cache[{img.image, level, layer, format}];
     if (!v) {
         VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         ci.image = img.image;
         ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        ci.format = img.format;
+        ci.format = format;
         ci.subresourceRange = {img.aspect, level, 1, layer, 1};
         if (p_vkCreateImageView(vk_device(), &ci, nullptr, &v) != VK_SUCCESS) v = img.view;
     }

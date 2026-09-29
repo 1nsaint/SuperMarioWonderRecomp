@@ -229,4 +229,37 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
       at 3.2 GB (peak 3.5) through the course. The integer input patch is on by default (`NX_INT_ATTRIBS=0` turns it
       off). Result: Mario, Luigi, Peach, Daisy, the Toads, Yoshi, Nabbit, Prince Florian, Bowser and Kamek all render
       (docs/media/wonder/19-21).
-
+27. **Metal abort: "MTLTextureDescriptor requests 5 mipmap levels, but the dimensions (1, 1, 1) can only support a
+    maximum of 1 levels".** The game creates a 1x1 texture with 5 levels, which NVN accepts. Two runs ended right
+    after Bowser arrives (a Metal assertion, not a Vulkan error). Fix (nvn_vk.cpp, image creation): levels are clamped
+    to floor(log2(largest dimension)) + 1. Issue #15.
+28. **Intermittent crash at startup in `nn::audio::ApplyLightLimiterEffect`** (signal 11, data address 0; 2 of 4
+    headless runs). The limiter's DSP state was all zero, so it was never initialized.
+    - A new effect's "initialize" status travels in exactly one `RequestUpdate`: the server copies the client's status
+      at every update, and the client sets it to "updated" right after sending it.
+    - Our audio render thread signalled the game's audio event every 5 ms whether or not it had rendered since the
+      last update. A sound thread that fell behind updated twice in a row, the second update overwrote the status,
+      and the next render applied a limiter whose state was null.
+    - Fix (hle_audio.cpp): an update waits (outside the render lock, at most 50 ms) until a render ran since the
+      previous one, the console's rhythm.
+    - Result: `audio: update waits for a render` fires in every run (the race is real). 4 of 4 startup runs had no
+      crash, against 2 of 4 before. Issue #16.
+29. **Far too much contrast and saturation everywhere.**
+    - Measured on the Florian ceremony shot against the same shot from the real game (mariowiki,
+      `Flower_Kingdom_SMBW.jpg`):
+      - real game: mean luma 0.748, 5th percentile 0.380, saturation 0.314;
+      - ours: mean luma 0.592, 5th percentile 0.122, saturation 0.517;
+      - ours with one sRGB encode applied offline: 0.755 / 0.363 / 0.337.
+    - The engine renders into RGBA8 (0x25) textures through **sRGB views** (0x38): the GPU encodes on write, blends
+      in linear, and decodes on sampling. The runtime ignored the view format: `read_view` never called
+      `nvnTextureViewGetFormat`, and every view and attachment was made in the image's format. So each draw lost a
+      conversion.
+    - Fix:
+      - `ViewInfo` and the `SetRenderTargets` blob carry the view's NVN format.
+      - `view_format()` (nvn_pipeline.cpp) turns it into the Vulkan format when it is a same-size colour format.
+      - Sampled views, attachment views and the pipelines' colour formats use it.
+      - Colour images are created with `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT`.
+      - The log names each pair once (`texture format 0x25 viewed as 0x38`).
+    - Result: ceremony mean luma 0.756, 5th percentile 0.366, saturation 0.332 (the real game: 0.748 / 0.380 /
+      0.314). See docs/media/wonder/26-colours-before-after.png and 22-25.
+    - Left: the disc behind the Wonder emblem is still dark red (study G4). Issue #17.

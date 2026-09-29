@@ -210,10 +210,10 @@ void SetRenderTargets(CPU& c) {
     TargetViews tv;
     for (uint32_t k = 0; k < n && c.x[3]; k++) {
         ViewInfo v = read_view(c, ld<uint64_t>(c.x[3] + 8 * k));
-        tv.level[k] = uint8_t(v.base_level), tv.layer[k] = uint16_t(v.min_layer);
+        tv.level[k] = uint8_t(v.base_level), tv.layer[k] = uint16_t(v.min_layer), tv.format[k] = uint16_t(v.format);
     }
     ViewInfo dv = read_view(c, c.x[5]);
-    tv.level[8] = uint8_t(dv.base_level), tv.layer[8] = uint16_t(dv.min_layer);
+    tv.level[8] = uint8_t(dv.base_level), tv.layer[8] = uint16_t(dv.min_layer), tv.format[8] = uint16_t(dv.format);
     record(c.x[0], cmd, &tv, sizeof tv);
 }
 

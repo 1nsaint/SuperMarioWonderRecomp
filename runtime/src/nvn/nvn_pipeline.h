@@ -74,7 +74,10 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
 // null for an unknown texture. Records transfers: outside render passes.
 GpuImage* ensure_contents(VkCommandBuffer cb, uint64_t texture);
 // A single level and layer of an image, for rendering to.
-VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer);
+VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer, VkFormat format = VK_FORMAT_UNDEFINED);
+// The Vulkan format of a view with NVN format `nvn` (0: the image's own) of `img`: the image's when the view's is not
+// a same-size colour format it can be viewed as.
+VkFormat view_format(const GpuImage& img, uint32_t nvn);
 // Destroys the cached views of an image about to be freed.
 void forget_image_views(const GpuImage& img);
 // True when sampled_view() would need no transfer or layout change (it can then be called inside a render pass).

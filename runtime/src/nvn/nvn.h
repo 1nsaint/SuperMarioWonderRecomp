@@ -135,6 +135,7 @@ struct SamplerInfo {  // NVN enums (nvn_sampler.cpp)
 // texture's own (else 4 NVNtextureSwizzle bytes, R in the low byte).
 struct ViewInfo {
     uint32_t base_level = 0, levels = 0, min_layer = 0, layers = 0, swizzle = 0;
+    uint32_t format = 0;  // NVN format the view reads/writes the texture as (an sRGB view of RGBA8); 0: the texture's
 };
 ViewInfo read_view(CPU& c, uint64_t view);  // nvn_objects.cpp; a null view gives the defaults
 
@@ -221,6 +222,7 @@ struct PolygonInfo {
 struct TargetViews {  // SetRenderTargets' blob: level and layer per color target (0..7) and depth (8)
     uint8_t level[9] = {};
     uint16_t layer[9] = {};
+    uint16_t format[9] = {};  // the views' NVN formats (0: the texture's own)
 };
 
 std::shared_ptr<CmdList> command_list(uint64_t handle);  // a recorded handle's commands (nvn_cmd.cpp)
