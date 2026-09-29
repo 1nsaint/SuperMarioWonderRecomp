@@ -606,9 +606,42 @@ void readback_write(const GpuImage& img, uint64_t frame) {
 void debug_dump_textures(uint64_t frame);  // nvn_debug.cpp
 uint64_t draw_take_dump_request();          // nvn_draw.cpp
 
+namespace {
+
+// Images of destroyed textures. Freed at the next submit or present, under the GPU lock and after the previous one
+// waited for its fence, so no recorded work can still use them. Before this, no image was ever freed: the opening
+// creates textures continuously and the process reached 85 GB (the machine froze).
+std::mutex g_grave_lock;
+std::vector<std::shared_ptr<GpuImage>> g_grave;
+
+void free_retired_images() {
+    std::vector<std::shared_ptr<GpuImage>> dead;
+    {
+        std::lock_guard lk(g_grave_lock);
+        dead.swap(g_grave);
+    }
+    for (auto& img : dead) {
+        if (!img || !img->image) continue;
+        forget_image_views(*img);
+        if (img->view) p_vkDestroyImageView(g_device, img->view, nullptr);
+        p_vkDestroyImage(g_device, img->image, nullptr);
+        if (img->memory) p_vkFreeMemory(g_device, img->memory, nullptr);
+        img->image = VK_NULL_HANDLE, img->memory = VK_NULL_HANDLE, img->view = VK_NULL_HANDLE;
+    }
+}
+
+}  // namespace
+
+Texture::~Texture() {
+    if (!image) return;
+    std::lock_guard lk(g_grave_lock);
+    g_grave.push_back(std::move(image));
+}
+
 void gpu_submit(CPU&, const std::vector<std::shared_ptr<CmdList>>& lists) {
     std::lock_guard lk(g_gpu);
     if (!init()) return;
+    free_retired_images();
     p_vkResetDescriptorPool(g_device, g_descriptors, 0);
     g_upload_used = 0;
     if (!begin()) return;
@@ -647,6 +680,7 @@ void present_headless(uint64_t texture) {
 void gpu_present(uint64_t texture) {
     std::lock_guard lk(g_gpu);
     if (!init()) return;
+    free_retired_images();
     if (plat::headless()) return present_headless(texture);
     if (plat::window_minimized()) return;
     if (!g_swapchain && !make_swapchain()) return;

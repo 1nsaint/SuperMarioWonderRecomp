@@ -72,6 +72,10 @@ VkImageViewType view_type(const ImageShape& s) {  // SPIR-V Dim: 0 1D, 1 2D, 2 3
     }
 }
 
+// Views made for sampling and for rendering, by image; forget_image_views() drops an image's before it is freed.
+std::map<std::tuple<VkImage, VkImageViewType, uint32_t, uint64_t, uint64_t>, VkImageView> g_sampled_views;
+std::map<std::tuple<VkImage, uint32_t, uint32_t>, VkImageView> g_attachment_views;
+
 bool identity(const VkComponentMapping& m) {
     auto id = [](VkComponentSwizzle s, VkComponentSwizzle own) { return s == VK_COMPONENT_SWIZZLE_IDENTITY || s == own; };
     return id(m.r, VK_COMPONENT_SWIZZLE_R) && id(m.g, VK_COMPONENT_SWIZZLE_G) && id(m.b, VK_COMPONENT_SWIZZLE_B) &&
@@ -111,7 +115,7 @@ VkImageView view_of(GpuImage& img, VkImageViewType type, const ViewInfo& view) {
     uint32_t min_layer = std::min(view.min_layer, img.layers - 1);
     bool whole = base == 0 && levels == img.levels && min_layer == 0 && (!view.layers || view.layers == img.layers);
     if (type == img.view_type && identity(m) && whole) return img.view;
-    static std::map<std::tuple<VkImage, VkImageViewType, uint32_t, uint64_t, uint64_t>, VkImageView> cache;
+    auto& cache = g_sampled_views;
     uint64_t range = uint64_t(base) | uint64_t(levels) << 16 | uint64_t(min_layer) << 32 | uint64_t(view.layers) << 48;
     auto& v = cache[{img.image, type, uint32_t(m.r) | uint32_t(m.g) << 8 | uint32_t(m.b) << 16 | uint32_t(m.a) << 24,
                      range, 0}];
@@ -455,7 +459,7 @@ VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer) {
     layer = std::min(layer, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? std::max(1u, img.depth >> level) - 1 : img.layers - 1);
     if (level == 0 && layer == 0 && img.levels == 1 && img.layers == 1 && img.view_type == VK_IMAGE_VIEW_TYPE_2D)
         return img.view;
-    static std::map<std::tuple<VkImage, uint32_t, uint32_t>, VkImageView> cache;
+    auto& cache = g_attachment_views;
     auto& v = cache[{img.image, level, layer}];
     if (!v) {
         VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -616,6 +620,21 @@ VkImageView storage_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
     }
     transition(cb, d, VK_IMAGE_LAYOUT_GENERAL);
     return d.view;
+}
+
+void forget_image_views(const GpuImage& img) {
+    auto drop = [&](auto& cache) {
+        for (auto it = cache.begin(); it != cache.end();) {
+            if (std::get<0>(it->first) == img.image) {
+                if (it->second && it->second != img.view) p_vkDestroyImageView(vk_device(), it->second, nullptr);
+                it = cache.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
+    drop(g_sampled_views);
+    drop(g_attachment_views);
 }
 
 }  // namespace nx::nvn

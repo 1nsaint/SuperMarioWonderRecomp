@@ -60,6 +60,7 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
 void draw_end_rendering(VkCommandBuffer cb);  // before transfers (clears, copies, present) and at the end
 
 void replay_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list);  // nvn_copy.cpp: texture copies
+void forget_image_views(const GpuImage& img);  // nvn_pipeline.cpp: before an image is freed
 
 // nvn_debug.cpp: GPU time per render pass (NX_GPU_PROFILE=1).
 bool gpu_profile_on();

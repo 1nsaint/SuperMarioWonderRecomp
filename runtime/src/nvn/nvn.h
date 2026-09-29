@@ -114,6 +114,7 @@ struct Texture : Object {
     // is hashed at most once per submit that samples them, and a change means an upload.
     uint64_t content_hash = 0, hashed_submit = 0;
     std::shared_ptr<GpuImage> image;  // made on first use by the GPU
+    ~Texture();  // nvn_vk.cpp: the image is freed once the GPU is done with it
 };
 
 struct Window : Object {

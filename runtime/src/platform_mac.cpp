@@ -472,6 +472,8 @@ int main() {
         return 1;
     }
 
+    nx::plat::start_memory_guard();  // before anything can grow: a leak must never freeze the machine
+
     // The game on its own thread, with a big stack (recompiled calls nest deeply); the main thread keeps Cocoa's
     // event loop.
     nx::plat::start_thread([](void*) { game_thread(); nx::plat::exit_process(0); }, nullptr, 64ull << 20);
