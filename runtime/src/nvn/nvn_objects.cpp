@@ -48,6 +48,21 @@ MemoryPool* pool_at_gpu(uint64_t gpu, uint64_t* offset) {
     return p;
 }
 
+ViewInfo read_view(CPU& c, uint64_t view) {
+    ViewInfo v;
+    if (!view) return v;
+    uint64_t tmp = scratch(c, 16);
+    // Each getter returns whether the view sets that property.
+    if (driver(c, "nvnTextureViewGetLevels", {view, tmp, tmp + 4}) & 1)
+        v.base_level = ld<uint32_t>(tmp), v.levels = ld<uint32_t>(tmp + 4);
+    if (driver(c, "nvnTextureViewGetLayers", {view, tmp, tmp + 4}) & 1)
+        v.min_layer = ld<uint32_t>(tmp), v.layers = ld<uint32_t>(tmp + 4);
+    for (int k = 0; k < 4; k++) st<uint32_t>(tmp + 4 * k, 2u + k);
+    if (driver(c, "nvnTextureViewGetSwizzle", {view, tmp, tmp + 4, tmp + 8, tmp + 12}) & 1)
+        for (int k = 0; k < 4; k++) v.swizzle |= std::min<uint32_t>(ld<uint32_t>(tmp + 4 * k), 5) << (8 * k);
+    return v;
+}
+
 uint64_t pool_host(const MemoryPool& pool, uint64_t offset) {
     if (pool.memory) return pool.memory + offset;
     std::lock_guard lk(objects_lock());
@@ -274,21 +289,16 @@ void DescriptorPoolFinalize(CPU& c) { destroy(c.x[0]); }
 
 // nvnTexturePoolRegisterTexture / RegisterImage(pool, int id, const NVNtexture*, const NVNtextureView*)
 void TexturePoolRegister(CPU& c) {
-    // The view may override the texture's swizzle (a font atlas in R8 is registered with alpha = R).
-    uint32_t swizzle = 0;
-    if (c.x[3]) {
-        uint64_t tmp = scratch(c, 16);
-        for (int k = 0; k < 4; k++) st<uint32_t>(tmp + 4 * k, 2u + k);
-        if (driver(c, "nvnTextureViewGetSwizzle", {c.x[3], tmp, tmp + 4, tmp + 8, tmp + 12}) & 1)
-            for (int k = 0; k < 4; k++) swizzle |= std::min<uint32_t>(ld<uint32_t>(tmp + 4 * k), 5) << (8 * k);
-    }
+    // The view may pick levels or layers (a bloom chain samples one mip of its target) and override the swizzle
+    // (a font atlas in R8 is registered with alpha = R).
+    ViewInfo v = read_view(c, c.x[3]);
     if (auto* d = get<DescriptorPool>(c.x[0])) {
         std::lock_guard lk(objects_lock());
         d->textures[uint32_t(c.x[1])] = c.x[2];
-        if (swizzle)
-            d->swizzles[uint32_t(c.x[1])] = swizzle;
+        if (v.levels || v.layers || v.swizzle)
+            d->views[uint32_t(c.x[1])] = v;
         else
-            d->swizzles.erase(uint32_t(c.x[1]));
+            d->views.erase(uint32_t(c.x[1]));
     }
 }
 

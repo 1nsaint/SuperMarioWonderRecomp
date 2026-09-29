@@ -43,8 +43,12 @@ VkSampler sampler_for(const SamplerInfo& info, bool shadow);
 
 // A sampled texture ready for the shaders (uploaded from guest memory the first time, unless the GPU renders it),
 // and a view of it matching what the shader declares. Transitions the image to SHADER_READ_ONLY on cb.
-// `swizzle`: the texture view's, when the pool entry has one (4 NVNtextureSwizzle bytes, 0: the texture's own).
-VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape& shape, uint32_t swizzle = 0);
+// `view`: the texture pool entry's view (levels, layers, swizzle), if any. `layout` gets the layout to sample in:
+// images the GPU renders stay GENERAL (a bloom chain samples one level while rendering another).
+VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape& shape, const ViewInfo* view,
+                         VkImageLayout* layout);
+// A single level and layer of an image, for rendering to.
+VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer);
 // True when sampled_view() would need no transfer or layout change (it can then be called inside a render pass).
 bool sampled_ready(uint64_t texture);
 bool dummy_ready(const ImageShape& shape);

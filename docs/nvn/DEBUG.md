@@ -54,5 +54,9 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
    R11G11B10F changed nothing), not Metal fast math. `NX_DUMP_RAW` showed R and B are **NaN/Inf in the scene**, G
    valid; RGBA8 turns NaN into 0. The NaN comes from the bloom chain, whose passes render into one mip level of a
    texture while sampling another: NVN selects the level with the `NVNtextureView` given to `SetRenderTargets` and
-   to the texture pool, which we ignore (everything goes to level 0, the sampled levels are uninitialised). Fix in
-   progress: render-target and pool views (levels, layers).
+   to the texture pool, which we ignored (everything went to level 0, the sampled levels were uninitialised). Fix:
+   `nvnTextureViewGetLevels/GetLayers/GetSwizzle` read for render targets (recorded as a `TargetViews` blob) and pool
+   entries; attachments are single-level/layer views with that mip's extent; images the GPU renders stay in
+   `VK_IMAGE_LAYOUT_GENERAL` (sampled and rendered at once). 3D images are created 2D-array compatible, since a
+   colour-grading LUT is rendered slice by slice and Metal refuses a 2D view of a plain 3D texture (it aborted with
+   `_mtlValidateArgumentsForTextureViewOnDevice`). Result: `05-title-screen.png`, correct colours.

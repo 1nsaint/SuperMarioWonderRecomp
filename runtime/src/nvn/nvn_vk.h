@@ -13,7 +13,7 @@ struct GpuImage {
     VkImageView view = VK_NULL_HANDLE;  // every level and layer
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-    uint32_t width = 0, height = 0, levels = 1, layers = 1;
+    uint32_t width = 0, height = 0, levels = 1, layers = 1, depth = 1;  // depth: 3D images only
     VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     bool rendered = false;  // written by the GPU: never re-uploaded from guest memory
@@ -48,6 +48,7 @@ struct Targets {
     uint64_t colors[8] = {};
     uint32_t color_count = 0;
     uint64_t depth = 0;
+    TargetViews views;  // level and layer of each (index 8: depth)
 };
 void draw_begin_submit();
 void draw_log_stats();

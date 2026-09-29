@@ -64,23 +64,27 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
         colors[k].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
         if (!img) continue;
-        transition(cb, *img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);  // rendered images stay GENERAL (sampled while rendered)
         img->rendered = true;
-        colors[k].imageView = img->view;
-        colors[k].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        uint32_t level = std::min<uint32_t>(t.views.level[k], img->levels - 1);
+        colors[k].imageView = attachment_view(*img, level, t.views.layer[k]);
+        colors[k].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         colors[k].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         colors[k].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        extent = {std::min(extent.width, img->width), std::min(extent.height, img->height)};
+        extent = {std::min(extent.width, std::max(1u, img->width >> level)),
+                  std::min(extent.height, std::max(1u, img->height >> level))};
     }
     GpuImage* dimg = t.depth ? image_of(t.depth) : nullptr;
     if (dimg && dimg->aspect != VK_IMAGE_ASPECT_COLOR_BIT) {
-        transition(cb, *dimg, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        transition(cb, *dimg, VK_IMAGE_LAYOUT_GENERAL);
         dimg->rendered = true;
-        depth.imageView = dimg->view;
-        depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        uint32_t level = std::min<uint32_t>(t.views.level[8], dimg->levels - 1);
+        depth.imageView = attachment_view(*dimg, level, t.views.layer[8]);
+        depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        extent = {std::min(extent.width, dimg->width), std::min(extent.height, dimg->height)};
+        extent = {std::min(extent.width, std::max(1u, dimg->width >> level)),
+                  std::min(extent.height, std::max(1u, dimg->height >> level))};
     } else {
         dimg = nullptr;
     }
@@ -122,16 +126,16 @@ struct Resolved {
 };
 
 // The texture and sampler a handle names in the bound pools.
-void texture_for(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, uint32_t* swizzle = nullptr) {
+void texture_for(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, ViewInfo* view = nullptr) {
     uint32_t sid = 0;
     uint32_t tid = handle_texture(handle, &sid);
     texture = 0;
-    if (swizzle) *swizzle = 0;
+    if (view) *view = {};
     if (auto* tp = get<DescriptorPool>(g_state.texture_pool)) {
         auto it = tp->textures.find(tid);
         if (it != tp->textures.end()) texture = it->second;
-        auto sw = tp->swizzles.find(tid);
-        if (swizzle && sw != tp->swizzles.end()) *swizzle = sw->second;
+        auto v = tp->views.find(tid);
+        if (view && v != tp->views.end()) *view = v->second;
     }
     if (auto* sp = get<DescriptorPool>(g_state.sampler_pool)) {
         auto it = sp->samplers.find(sid);
@@ -239,12 +243,12 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         auto [s, b] = tex_bindings[k];
         uint64_t texture = 0;
         SamplerInfo si;
-        uint32_t swizzle = 0;
-        texture_for(handles[k], texture, si, &swizzle);
+        ViewInfo view;
+        texture_for(handles[k], texture, si, &view);
         VkDescriptorImageInfo ii{};
-        ii.imageView = texture ? sampled_view(cb, texture, b->image, swizzle) : dummy_view(cb, b->image);
-        ii.sampler = sampler_for(si, b->image.depth);
         ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        ii.imageView = texture ? sampled_view(cb, texture, b->image, &view, &ii.imageLayout) : dummy_view(cb, b->image);
+        ii.sampler = sampler_for(si, b->image.depth);
         images.push_back(ii);
         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w.dstSet = sets[2];

@@ -79,7 +79,8 @@ bool identity(const VkComponentMapping& m) {
 }
 
 // A view for sampling: the image's own when it fits, else one of the view type with the texture's swizzle.
-VkImageView view_of(GpuImage& img, VkImageViewType type, uint32_t swizzle) {
+VkImageView view_of(GpuImage& img, VkImageViewType type, const ViewInfo& view) {
+    uint32_t swizzle = view.swizzle;
     VkComponentMapping m = img.swizzle;
     if (swizzle) {
         constexpr VkComponentSwizzle kSwizzle[] = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE,
@@ -88,22 +89,28 @@ VkImageView view_of(GpuImage& img, VkImageViewType type, uint32_t swizzle) {
         m = {kSwizzle[swizzle & 0xFF], kSwizzle[(swizzle >> 8) & 0xFF], kSwizzle[(swizzle >> 16) & 0xFF],
              kSwizzle[swizzle >> 24]};
     }
-    if (type == img.view_type && identity(m)) return img.view;
-    static std::map<std::tuple<VkImage, VkImageViewType, uint32_t, uint32_t, uint32_t, uint32_t>, VkImageView> cache;
-    auto& v = cache[{img.image, type, uint32_t(m.r), uint32_t(m.g), uint32_t(m.b), uint32_t(m.a)}];
+    uint32_t base = std::min(view.base_level, img.levels - 1);
+    uint32_t levels = view.levels ? std::min(view.levels, img.levels - base) : img.levels - base;
+    uint32_t min_layer = std::min(view.min_layer, img.layers - 1);
+    bool whole = base == 0 && levels == img.levels && min_layer == 0 && (!view.layers || view.layers == img.layers);
+    if (type == img.view_type && identity(m) && whole) return img.view;
+    static std::map<std::tuple<VkImage, VkImageViewType, uint32_t, uint64_t, uint64_t>, VkImageView> cache;
+    uint64_t range = uint64_t(base) | uint64_t(levels) << 16 | uint64_t(min_layer) << 32 | uint64_t(view.layers) << 48;
+    auto& v = cache[{img.image, type, uint32_t(m.r) | uint32_t(m.g) << 8 | uint32_t(m.b) << 16 | uint32_t(m.a) << 24,
+                     range, 0}];
     if (!v) {
         VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         ci.image = img.image;
         ci.viewType = type;
         ci.format = img.format;
         ci.components = m;
-        uint32_t layers = img.layers;
+        uint32_t layers = view.layers ? view.layers : img.layers - min_layer;
         if (type == VK_IMAGE_VIEW_TYPE_2D || type == VK_IMAGE_VIEW_TYPE_1D) layers = 1;
         if (type == VK_IMAGE_VIEW_TYPE_CUBE) layers = 6;
         ci.subresourceRange = {img.aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
                                    ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT)
                                    : img.aspect,
-                               0, img.levels, 0, std::min(layers, img.layers)};
+                               base, levels, min_layer, std::min(layers, img.layers - min_layer)};
         if (p_vkCreateImageView(vk_device(), &ci, nullptr, &v) != VK_SUCCESS) v = img.view;
     }
     return v;
@@ -356,12 +363,34 @@ bool sampled_ready(uint64_t texture) {
     Texture* t = get<Texture>(texture);
     if (!t || !t->image) return false;
     const GpuImage& img = *t->image;
-    return (img.uploaded || img.rendered) && img.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    return img.rendered ? img.layout == VK_IMAGE_LAYOUT_GENERAL
+                        : img.uploaded && img.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
-VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape& shape, uint32_t swizzle) {
+VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer) {
+    level = std::min(level, img.levels - 1);
+    // A 3D image's slice is a layer of its 2D-array-compatible views, counted at this level.
+    layer = std::min(layer, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? std::max(1u, img.depth >> level) - 1 : img.layers - 1);
+    if (level == 0 && layer == 0 && img.levels == 1 && img.layers == 1 && img.view_type == VK_IMAGE_VIEW_TYPE_2D)
+        return img.view;
+    static std::map<std::tuple<VkImage, uint32_t, uint32_t>, VkImageView> cache;
+    auto& v = cache[{img.image, level, layer}];
+    if (!v) {
+        VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        ci.image = img.image;
+        ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        ci.format = img.format;
+        ci.subresourceRange = {img.aspect, level, 1, layer, 1};
+        if (p_vkCreateImageView(vk_device(), &ci, nullptr, &v) != VK_SUCCESS) v = img.view;
+    }
+    return v;
+}
+
+VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape& shape, const ViewInfo* view,
+                         VkImageLayout* layout) {
     Texture* t = get<Texture>(texture);
     GpuImage* img = t ? image_of(texture) : nullptr;
+    *layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     if (!img) return dummy_view(cb, shape);
     if (!img->rendered && !img->uploaded) upload_texture(cb, *t, *img);
     if (img->layout == VK_IMAGE_LAYOUT_UNDEFINED) {  // never written: black, not garbage
@@ -372,8 +401,9 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
             p_vkCmdClearColorImage(cb, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
         }
     }
-    transition(cb, *img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    return view_of(*img, view_type(shape), swizzle);
+    *layout = img->rendered ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    transition(cb, *img, *layout);
+    return view_of(*img, view_type(shape), view ? *view : ViewInfo{});
 }
 
 std::map<VkImageViewType, GpuImage>& dummies() {

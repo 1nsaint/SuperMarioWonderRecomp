@@ -116,11 +116,18 @@ struct SamplerInfo {  // NVN enums (nvn_sampler.cpp)
     float lod_min = 0, lod_max = 1000, lod_bias = 0, max_anisotropy = 1, border[4] = {};
 };
 
+// What an NVNtextureView selects (nvnTextureViewGet*): 0 levels/layers means "all of the texture's", swizzle 0 the
+// texture's own (else 4 NVNtextureSwizzle bytes, R in the low byte).
+struct ViewInfo {
+    uint32_t base_level = 0, levels = 0, min_layer = 0, layers = 0, swizzle = 0;
+};
+ViewInfo read_view(CPU& c, uint64_t view);  // nvn_objects.cpp; a null view gives the defaults
+
 struct DescriptorPool : Object {  // an NVNtexturePool or NVNsamplerPool
     uint64_t pool = 0, offset = 0;
     uint32_t count = 0;
     std::map<uint32_t, uint64_t> textures;     // id -> guest NVNtexture*
-    std::map<uint32_t, uint32_t> swizzles;     // id -> the registering view's swizzle (4 NVNtextureSwizzle bytes)
+    std::map<uint32_t, ViewInfo> views;        // id -> the registering view, when it selects anything
     std::map<uint32_t, SamplerInfo> samplers;  // id -> sampler state
 };
 
@@ -188,6 +195,11 @@ struct DepthStencilInfo {
 };
 struct PolygonInfo {
     uint32_t cull = 0, front = 0, mode = 0, offset_enables = 0;
+};
+
+struct TargetViews {  // SetRenderTargets' blob: level and layer per color target (0..7) and depth (8)
+    uint8_t level[9] = {};
+    uint16_t layer[9] = {};
 };
 
 std::shared_ptr<CmdList> command_list(uint64_t handle);  // a recorded handle's commands (nvn_cmd.cpp)

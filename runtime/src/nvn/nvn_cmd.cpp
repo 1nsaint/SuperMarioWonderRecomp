@@ -134,7 +134,15 @@ void SetRenderTargets(CPU& c) {
     cmd.n = n;
     for (uint32_t k = 0; k < n && c.x[2]; k++) cmd.a[k] = ld<uint64_t>(c.x[2] + 8 * k);
     cmd.a[8] = c.x[4];  // depth/stencil
-    record(c.x[0], cmd);
+    // The views pick the level and layer rendered to (a bloom chain renders each mip of one texture in turn).
+    TargetViews tv;
+    for (uint32_t k = 0; k < n && c.x[3]; k++) {
+        ViewInfo v = read_view(c, ld<uint64_t>(c.x[3] + 8 * k));
+        tv.level[k] = uint8_t(v.base_level), tv.layer[k] = uint16_t(v.min_layer);
+    }
+    ViewInfo dv = read_view(c, c.x[5]);
+    tv.level[8] = uint8_t(dv.base_level), tv.layer[8] = uint16_t(dv.min_layer);
+    record(c.x[0], cmd, &tv, sizeof tv);
 }
 
 void ClearColor(CPU& c) {

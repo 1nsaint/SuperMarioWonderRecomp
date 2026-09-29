@@ -289,6 +289,7 @@ GpuImage* image_of(uint64_t guest) {
     bool is3d = t->target == 2, cube = t->target == 8 || t->target == 9;
     bool array = t->target == 3 || t->target == 4 || t->target == 6 || t->target == 9;
     img->layers = is3d ? 1 : (array || cube) ? depth : 1;
+    img->depth = is3d ? depth : 1;
     if (cube && img->layers < 6) img->layers = 6;
     img->view_type = is3d                              ? VK_IMAGE_VIEW_TYPE_3D
                      : t->target == 9                  ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
@@ -310,7 +311,9 @@ GpuImage* image_of(uint64_t guest) {
         compressed = bw > 1 || bh > 1;
     }
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ci.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+    // 3D textures are rendered one slice at a time (a colour-grading LUT): 2D views of a slice need this flag
+    // (Metal otherwise refuses a 2D view of a 3D texture).
+    ci.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : is3d ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0;
     ci.imageType = is3d ? VK_IMAGE_TYPE_3D : t->target == 0 || t->target == 3 ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
     ci.format = img->format;
     ci.extent = {img->width, ci.imageType == VK_IMAGE_TYPE_1D ? 1 : img->height, is3d ? depth : 1};
@@ -411,13 +414,7 @@ void make_upload_buffer(uint64_t size) {
     g_upload_size = size;
 }
 
-struct Exec {
-    uint64_t colors[8] = {};
-    uint32_t color_count = 0;
-    uint64_t depth = 0;
-};
-
-void replay(VkCommandBuffer cb, Exec& st, const CmdList& list, int depth) {
+void replay(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth) {
     for (const Cmd& c : list.cmds) {
         switch (c.op) {
             case Cmd::SetRenderTargets:
@@ -425,6 +422,9 @@ void replay(VkCommandBuffer cb, Exec& st, const CmdList& list, int depth) {
                 st.color_count = c.n;
                 for (uint32_t k = 0; k < 8; k++) st.colors[k] = k < c.n ? c.a[k] : 0;
                 st.depth = c.a[8];
+                st.views = {};
+                if (c.blob < list.blobs.size() && list.blobs[c.blob].size() == sizeof(TargetViews))
+                    std::memcpy(&st.views, list.blobs[c.blob].data(), sizeof st.views);
                 break;
             case Cmd::ClearColor: {
                 draw_end_rendering(cb);
@@ -442,7 +442,8 @@ void replay(VkCommandBuffer cb, Exec& st, const CmdList& list, int depth) {
                     if (seen.size() < 64 && seen.insert({st.colors[c.n], col}).second)
                         log("clear %llx (%ux%u) to %s", (unsigned long long)st.colors[c.n], img->width, img->height, col);
                 }
-                VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, std::min<uint32_t>(st.views.level[c.n], img->levels - 1), 1,
+                                          std::min<uint32_t>(st.views.layer[c.n], img->layers - 1), 1};
                 p_vkCmdClearColorImage(cb, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
                 break;
             }
@@ -453,7 +454,8 @@ void replay(VkCommandBuffer cb, Exec& st, const CmdList& list, int depth) {
                 transition(cb, *img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 img->rendered = true;
                 VkClearDepthStencilValue v{c.f[0], uint32_t(c.i[0])};
-                VkImageSubresourceRange r{img->aspect, 0, 1, 0, 1};
+                VkImageSubresourceRange r{img->aspect, std::min<uint32_t>(st.views.level[8], img->levels - 1), 1,
+                                          std::min<uint32_t>(st.views.layer[8], img->layers - 1), 1};
                 p_vkCmdClearDepthStencilImage(cb, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
                 break;
             }
@@ -467,14 +469,7 @@ void replay(VkCommandBuffer cb, Exec& st, const CmdList& list, int depth) {
                     }
                 }
                 break;
-            default: {
-                Targets t;
-                std::memcpy(t.colors, st.colors, sizeof t.colors);
-                t.color_count = st.color_count;
-                t.depth = st.depth;
-                draw_command(cb, c, list, t);
-                break;
-            }
+            default: draw_command(cb, c, list, st); break;
         }
     }
 }
@@ -591,7 +586,7 @@ void gpu_submit(CPU&, const std::vector<std::shared_ptr<CmdList>>& lists) {
     g_upload_used = 0;
     if (!begin()) return;
     draw_begin_submit();
-    Exec st;
+    Targets st;
     for (auto& l : lists) replay(g_cb, st, *l, 0);
     draw_end_rendering(g_cb);
     end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);

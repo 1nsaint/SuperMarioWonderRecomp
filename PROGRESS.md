@@ -15,13 +15,25 @@ NVN implemented over Vulkan (MoltenVK).
 | N1 CPU side: recompile, boot to `nvnBootstrapLoader` | #8 | **done**: the game runs its frame loop on macOS (2,000+ frames, no crash) |
 | N2 NVN reconnaissance (tracer, API.md) | #9 | **mostly done**: tracer, driver addresses of all 534 procs, device info, signatures of the procs in use; API.md to write |
 | N3 device, pools, sync, window (first NVN pixel) | #10 | **done**: MoltenVK device, swapchain, window textures presented, clears replayed (dark grey = never drawn) |
-| N4 textures and samplers | #11 | **working**: untiling + upload (BNTX block heights), ASTC/BCn, samplers, swizzles; texture views (levels/layers) next |
+| N4 textures and samplers | #11 | **working**: untiling + upload (BNTX block heights), ASTC/BCn, samplers, swizzles, views (levels/layers) |
 | N5 Maxwell shaders → SPIR-V | #12 | **done**: 12,717/12,717 blocks offline + the 34 embedded in main; runtime cache by hash |
-| N6 pipeline state and draws | #13 | **working**: pipelines, descriptor sets, dynamic rendering; the title screen draws (colour bug: render-target views) |
+| N6 pipeline state and draws | #13 | **working**: pipelines, descriptor sets, dynamic rendering, texture views; **the title screen renders correctly** |
 | N7 whole game, performance | #14 | not started |
 | NA AudioRenderer (`audren:u`) | — (new) | **renders in process** (the sdk's own server + DSP code, DFC); output to the Mac next |
 
 ## Log
+
+### 2026-09-28 (night, latest): the title screen, correct colours
+
+![Super Mario Bros. Wonder title screen rendered natively through NVN → Vulkan on an M1](docs/media/wonder/05-title-screen.png)
+
+- **The title screen renders correctly on the Mac**: recompiled CPU code + NVN replayed on Vulkan/MoltenVK, colours
+  exact (a texel of the key art: 60,196,130 in the texture, 60,195,128 on screen after the post chain).
+- Last fix: texture views. The bloom chain renders each mip of one texture while sampling the previous one; NVN picks
+  the level with the `NVNtextureView` of `SetRenderTargets` and of the texture pool. Without it everything went to
+  level 0, uninitialised levels were sampled, R and B became NaN and the screen green. Now attachments are per
+  level/layer, rendered images stay `GENERAL`, 3D images are 2D-array compatible (the LUT is rendered by slice).
+- Still slow (~2-3 fps on the title): every submit waits for the GPU, descriptor sets and uploads are redone per draw.
 
 ### 2026-09-28 (night, later): the title screen through Vulkan
 
@@ -167,11 +179,9 @@ layouts (`Layout/*.blarc`).
 
 ## Next
 
-1. Texture views: the level/layer of `SetRenderTargets` views and of texture-pool views (bloom mip chain → the NaN
-   that turns the title green).
-2. Title screen correct, then input through to the file select and World 1-1.
-3. Performance (N7): stop waiting for the GPU at every submit, cache descriptor sets, keep uploaded textures.
-4. Audio to the Mac speakers; c[0] driver constants for compute; `docs/nvn/API.md`.
-5. Split `nvn_shaders.cpp` (815 lines, over the 700-line cap).
+1. Performance (N7): stop waiting for the GPU at every submit, cache descriptor sets, keep uploaded textures.
+2. Input: past the title to the file select and World 1-1.
+3. Audio to the Mac speakers; c[0] driver constants for compute; `docs/nvn/API.md`.
+4. Split `nvn_shaders.cpp` (815 lines, over the 700-line cap).
 
 Branch: `feat/nvn-n1-wonder-cpu`, stacked on `feat/nvn-n0-core-split`.
