@@ -1,3 +1,4 @@
+#include <cstdlib>
 // NVNformat -> VkFormat (docs/nvn/API.md). The NVN values index the SDK driver's own format table (sdk+d34198,
 // 0x30 bytes each): its block size, bytes per block, bits per channel, integer/normalized flags, sRGB bit and
 // depth/stencil kinds fix what each value is. The families come in the table's order:

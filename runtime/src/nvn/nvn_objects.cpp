@@ -203,18 +203,37 @@ void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBu
     t.pool = driver(c, "nvnTextureBuilderGetMemoryPool", {builder});
     t.offset = driver(c, "nvnTextureBuilderGetMemoryOffset", {builder});
     t.storage_size = texture_storage_size(c, builder);
-    // Packaged (BNTX) textures: their layout's first word holds log2 of the block height (BRTI +0x34,
-    // docs/nvn/TILING.md); the data must be untiled with it rather than the default.
+    // Packaged (BNTX) textures were tiled offline with a block height often one step below the default
+    // (docs/nvn/TILING.md). The layout the builder returns does not carry it (it reads 1 for every texture in
+    // Wonder), so it only says "packaged", and the block height is the fit that matches every BNTX texture in the
+    // game: the smallest power of two >= rows * 3 / 32, at most 16 GOBs.
     uint64_t layout = driver(c, "nvnTextureBuilderGetPackagedTextureLayout", {builder});
     if (layout >= kModuleBase && layout < kKernelBase + kKernelSize) layout = ld<uint64_t>(layout);
-    if (layout) t.block_height_gobs = 1u << (layout & 7);
+    if (layout) {
+        uint32_t bw = 1, bh = 1, bytes = 0;
+        format_block(t.format, bw, bh, bytes);
+        uint32_t rows = (t.height + bh - 1) / bh, h = 1;
+        while (h * 32 < rows * 3 && h < 16) h <<= 1;
+        t.block_height_gobs = h;
+    }
+
+    // Swizzle: single-channel textures are often read through it (a font atlas in R8 read as alpha = R); without
+    // it Vulkan returns alpha 1 and the text shaders covered the screen.
+    {
+        uint64_t tmp = scratch(c, 16);
+        for (int k = 0; k < 4; k++) st<uint32_t>(tmp + 4 * k, 2u + k);
+        driver(c, "nvnTextureBuilderGetSwizzle", {builder, tmp, tmp + 4, tmp + 8, tmp + 12});
+        for (int k = 0; k < 4; k++) t.swizzle[k] = uint8_t(std::min<uint32_t>(ld<uint32_t>(tmp + 4 * k), 5));
+    }
     if (auto* p = get<MemoryPool>(t.pool)) {
         t.memory = pool_host(*p, t.offset);
         t.gpu = p->gpu + t.offset;
     }
-    if (g_trace)
-        log("nvn: texture %llx: target %u format %u %ux%ux%u levels %u samples %u flags %x size %llx", (unsigned long long)guest,
-            t.target, t.format, t.width, t.height, t.depth, t.levels, t.samples, t.flags, (unsigned long long)t.storage_size);
+    if (g_trace || std::getenv("NX_TRACE_TEXTURES"))
+        log("nvn: texture %llx: target %u format %#x %ux%ux%u levels %u samples %u flags %x size %llx block height %u "
+            "swizzle %u%u%u%u", (unsigned long long)guest, t.target, t.format, t.width, t.height, t.depth, t.levels,
+            t.samples, t.flags, (unsigned long long)t.storage_size, t.block_height_gobs, t.swizzle[0], t.swizzle[1],
+            t.swizzle[2], t.swizzle[3]);
     c.x[0] = 1;
 }
 
@@ -255,9 +274,21 @@ void DescriptorPoolFinalize(CPU& c) { destroy(c.x[0]); }
 
 // nvnTexturePoolRegisterTexture / RegisterImage(pool, int id, const NVNtexture*, const NVNtextureView*)
 void TexturePoolRegister(CPU& c) {
+    // The view may override the texture's swizzle (a font atlas in R8 is registered with alpha = R).
+    uint32_t swizzle = 0;
+    if (c.x[3]) {
+        uint64_t tmp = scratch(c, 16);
+        for (int k = 0; k < 4; k++) st<uint32_t>(tmp + 4 * k, 2u + k);
+        if (driver(c, "nvnTextureViewGetSwizzle", {c.x[3], tmp, tmp + 4, tmp + 8, tmp + 12}) & 1)
+            for (int k = 0; k < 4; k++) swizzle |= std::min<uint32_t>(ld<uint32_t>(tmp + 4 * k), 5) << (8 * k);
+    }
     if (auto* d = get<DescriptorPool>(c.x[0])) {
         std::lock_guard lk(objects_lock());
         d->textures[uint32_t(c.x[1])] = c.x[2];
+        if (swizzle)
+            d->swizzles[uint32_t(c.x[1])] = swizzle;
+        else
+            d->swizzles.erase(uint32_t(c.x[1]));
     }
 }
 

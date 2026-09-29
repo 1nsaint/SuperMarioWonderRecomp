@@ -4,6 +4,7 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 
 #include "nvn_pipeline.h"
@@ -71,15 +72,31 @@ VkImageViewType view_type(const ImageShape& s) {  // SPIR-V Dim: 0 1D, 1 2D, 2 3
     }
 }
 
-VkImageView view_of(GpuImage& img, VkImageViewType type) {
-    if (type == img.view_type) return img.view;
-    static std::map<std::pair<VkImage, VkImageViewType>, VkImageView> cache;
-    auto& v = cache[{img.image, type}];
+bool identity(const VkComponentMapping& m) {
+    auto id = [](VkComponentSwizzle s, VkComponentSwizzle own) { return s == VK_COMPONENT_SWIZZLE_IDENTITY || s == own; };
+    return id(m.r, VK_COMPONENT_SWIZZLE_R) && id(m.g, VK_COMPONENT_SWIZZLE_G) && id(m.b, VK_COMPONENT_SWIZZLE_B) &&
+           id(m.a, VK_COMPONENT_SWIZZLE_A);
+}
+
+// A view for sampling: the image's own when it fits, else one of the view type with the texture's swizzle.
+VkImageView view_of(GpuImage& img, VkImageViewType type, uint32_t swizzle) {
+    VkComponentMapping m = img.swizzle;
+    if (swizzle) {
+        constexpr VkComponentSwizzle kSwizzle[] = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE,
+                                                   VK_COMPONENT_SWIZZLE_R,    VK_COMPONENT_SWIZZLE_G,
+                                                   VK_COMPONENT_SWIZZLE_B,    VK_COMPONENT_SWIZZLE_A};
+        m = {kSwizzle[swizzle & 0xFF], kSwizzle[(swizzle >> 8) & 0xFF], kSwizzle[(swizzle >> 16) & 0xFF],
+             kSwizzle[swizzle >> 24]};
+    }
+    if (type == img.view_type && identity(m)) return img.view;
+    static std::map<std::tuple<VkImage, VkImageViewType, uint32_t, uint32_t, uint32_t, uint32_t>, VkImageView> cache;
+    auto& v = cache[{img.image, type, uint32_t(m.r), uint32_t(m.g), uint32_t(m.b), uint32_t(m.a)}];
     if (!v) {
         VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         ci.image = img.image;
         ci.viewType = type;
         ci.format = img.format;
+        ci.components = m;
         uint32_t layers = img.layers;
         if (type == VK_IMAGE_VIEW_TYPE_2D || type == VK_IMAGE_VIEW_TYPE_1D) layers = 1;
         if (type == VK_IMAGE_VIEW_TYPE_CUBE) layers = 6;
@@ -226,7 +243,10 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = key.polygon.mode == 0 ? VK_POLYGON_MODE_POINT : key.polygon.mode == 1 ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
     rs.cullMode = vk_cull(key.polygon.cull);
-    rs.frontFace = key.polygon.front == 0 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    // NVNfrontFace CW 0 / CCW 1 is in the GL sense (y up). Wonder sets the upper-left window origin, where the
+    // hardware negates y like Vulkan does, so a face the game calls CCW is wound CW in Vulkan's framebuffer: with
+    // the enum taken as is, the fullscreen composite was culled and the window kept its guest memory (magenta).
+    rs.frontFace = key.polygon.front == 0 ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
     rs.lineWidth = 1.0f;
 
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -339,7 +359,7 @@ bool sampled_ready(uint64_t texture) {
     return (img.uploaded || img.rendered) && img.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
-VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape& shape) {
+VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape& shape, uint32_t swizzle) {
     Texture* t = get<Texture>(texture);
     GpuImage* img = t ? image_of(texture) : nullptr;
     if (!img) return dummy_view(cb, shape);
@@ -353,7 +373,7 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
         }
     }
     transition(cb, *img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    return view_of(*img, view_type(shape));
+    return view_of(*img, view_type(shape), swizzle);
 }
 
 std::map<VkImageViewType, GpuImage>& dummies() {

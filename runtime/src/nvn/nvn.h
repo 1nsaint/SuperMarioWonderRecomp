@@ -100,6 +100,7 @@ struct Texture : Object {
     uint64_t pool = 0, offset = 0, storage_size = 0;
     uint64_t memory = 0, gpu = 0;
     uint32_t block_height_gobs = 0;  // packaged (BNTX) textures carry their own; 0: the layout's default
+    uint8_t swizzle[4] = {2, 3, 4, 5};  // NVNtextureSwizzle per channel (0 zero, 1 one, 2 R, 3 G, 4 B, 5 A)
     std::shared_ptr<GpuImage> image;  // made on first use by the GPU
 };
 
@@ -119,6 +120,7 @@ struct DescriptorPool : Object {  // an NVNtexturePool or NVNsamplerPool
     uint64_t pool = 0, offset = 0;
     uint32_t count = 0;
     std::map<uint32_t, uint64_t> textures;     // id -> guest NVNtexture*
+    std::map<uint32_t, uint32_t> swizzles;     // id -> the registering view's swizzle (4 NVNtextureSwizzle bytes)
     std::map<uint32_t, SamplerInfo> samplers;  // id -> sampler state
 };
 

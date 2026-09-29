@@ -15,13 +15,32 @@ NVN implemented over Vulkan (MoltenVK).
 | N1 CPU side: recompile, boot to `nvnBootstrapLoader` | #8 | **done**: the game runs its frame loop on macOS (2,000+ frames, no crash) |
 | N2 NVN reconnaissance (tracer, API.md) | #9 | **mostly done**: tracer, driver addresses of all 534 procs, device info, signatures of the procs in use; API.md to write |
 | N3 device, pools, sync, window (first NVN pixel) | #10 | **done**: MoltenVK device, swapchain, window textures presented, clears replayed (dark grey = never drawn) |
-| N4 textures and samplers | #11 | formats (0xa1 values), block-linear sizes, samplers decoded; deswizzle + upload in progress |
-| N5 Maxwell shaders → SPIR-V | #12 | **offline translation done**: 12,717/12,717 blocks valid SPIR-V (Ryujinx MIT translator), runtime cache in progress |
-| N6 pipeline state and draws | #13 | binds, states (decoded via the driver), draws recorded; enums mapped; pipelines next |
+| N4 textures and samplers | #11 | **working**: untiling + upload (BNTX block heights), ASTC/BCn, samplers, swizzles; texture views (levels/layers) next |
+| N5 Maxwell shaders → SPIR-V | #12 | **done**: 12,717/12,717 blocks offline + the 34 embedded in main; runtime cache by hash |
+| N6 pipeline state and draws | #13 | **working**: pipelines, descriptor sets, dynamic rendering; the title screen draws (colour bug: render-target views) |
 | N7 whole game, performance | #14 | not started |
 | NA AudioRenderer (`audren:u`) | — (new) | **renders in process** (the sdk's own server + DSP code, DFC); output to the Mac next |
 
 ## Log
+
+### 2026-09-28 (night, later): the title screen through Vulkan
+
+![Title screen, tiling and swizzles fixed, colours still wrong](docs/media/wonder/04-title-swizzle-nan-green.png)
+
+- **The title art renders natively** (M1, MoltenVK): the Super Mario Bros. Wonder key art, logo and checkered
+  background come out of the game's own NVN command lists, replayed as Vulkan draws with the translated shaders. The
+  remaining defect is colour: R and B are NaN from the bloom chain (render-target views not implemented yet).
+- Six bugs found on the way, each with its screenshot and how it was found: [docs/nvn/DEBUG.md](docs/nvn/DEBUG.md).
+  In short: command-memory usage must survive `EndRecording` (the engine dropped every scene list), the front face is
+  inverted under the upper-left origin (the composite was culled: magenta), packaged textures use the survey's
+  block-height fit (the builder's layout is always 1), channel-mask outputs are 4-byte words, texture swizzles
+  (builder and pool view) are applied.
+- Recorded vs replayed draws now match (6,368 recorded, 6,492 replayed including re-submitted lists).
+- `ReportCounter` writes {counter, timestamp} at replay; timestamps are host nanoseconds (the conversions are
+  identities).
+- New debug switches (texture dumps at any point, raw texels, per-target draw traces with state, texture traces):
+  table in docs/nvn/DEBUG.md.
+- Slow: ~3-4 fps once the title scene runs (synchronous replay, every submit waits for the GPU). N7.
 
 ### 2026-09-28 (late night): Vulkan on the Mac, shaders translated
 
@@ -148,10 +167,11 @@ layouts (`Layout/*.blarc`).
 
 ## Next
 
-1. Link `wonder` on macOS (`game_main` is ~630 MB of C++, ~15 min on the M1 with `-j6`) and run the first boot.
-2. Fix what SDK 16 breaks on the way to `nvnBootstrapLoader` (services, SVCs, TLS layout, offline stubs for
-   friends/NEX/bcat/prepo).
-3. N2 trace up to the first present; `docs/nvn/API.md` from the trace.
-4. N3: device, queue, memory pools (`VK_EXT_external_memory_host`), window: a clear colour through NVN.
+1. Texture views: the level/layer of `SetRenderTargets` views and of texture-pool views (bloom mip chain → the NaN
+   that turns the title green).
+2. Title screen correct, then input through to the file select and World 1-1.
+3. Performance (N7): stop waiting for the GPU at every submit, cache descriptor sets, keep uploaded textures.
+4. Audio to the Mac speakers; c[0] driver constants for compute; `docs/nvn/API.md`.
+5. Split `nvn_shaders.cpp` (815 lines, over the 700-line cap).
 
 Branch: `feat/nvn-n1-wonder-cpu`, stacked on `feat/nvn-n0-core-split`.

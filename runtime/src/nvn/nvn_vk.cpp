@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -257,6 +258,8 @@ bool make_swapchain() {
 
 VkDevice vk_device() { return g_device; }
 VkPhysicalDevice vk_physical() { return g_physical; }
+VkQueue vk_queue() { return g_queue; }
+uint32_t vk_queue_family() { return g_family; }
 bool vk_depth_clip_control() { return g_depth_clip_control; }
 
 uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
@@ -326,6 +329,9 @@ GpuImage* image_of(uint64_t guest) {
     ai.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (!check(p_vkAllocateMemory(g_device, &ai, nullptr, &img->memory), "vkAllocateMemory")) return nullptr;
     p_vkBindImageMemory(g_device, img->image, img->memory, 0);
+    constexpr VkComponentSwizzle kSwizzle[] = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_R,
+                                               VK_COMPONENT_SWIZZLE_G,    VK_COMPONENT_SWIZZLE_B,   VK_COMPONENT_SWIZZLE_A};
+    img->swizzle = {kSwizzle[t->swizzle[0]], kSwizzle[t->swizzle[1]], kSwizzle[t->swizzle[2]], kSwizzle[t->swizzle[3]]};
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vi.image = img->image;
     vi.viewType = img->view_type;
@@ -429,6 +435,13 @@ void replay(VkCommandBuffer cb, Exec& st, const CmdList& list, int depth) {
                 img->rendered = true;  // GPU-written from now on: never re-read from guest memory
                 VkClearColorValue v{};
                 std::memcpy(v.float32, c.f, 16);
+                if (std::getenv("NX_TRACE_DRAWS")) {
+                    static std::set<std::pair<uint64_t, std::string>> seen;
+                    char col[64];
+                    std::snprintf(col, sizeof col, "%g %g %g %g", c.f[0], c.f[1], c.f[2], c.f[3]);
+                    if (seen.size() < 64 && seen.insert({st.colors[c.n], col}).second)
+                        log("clear %llx (%ux%u) to %s", (unsigned long long)st.colors[c.n], img->width, img->height, col);
+                }
                 VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
                 p_vkCmdClearColorImage(cb, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
                 break;
@@ -568,6 +581,9 @@ void readback_write(const GpuImage& img, uint64_t frame) {
 
 }  // namespace
 
+void debug_dump_textures(uint64_t frame);  // nvn_debug.cpp
+uint64_t draw_take_dump_request();          // nvn_draw.cpp
+
 void gpu_submit(CPU&, const std::vector<std::shared_ptr<CmdList>>& lists) {
     std::lock_guard lk(g_gpu);
     if (!init()) return;
@@ -579,6 +595,7 @@ void gpu_submit(CPU&, const std::vector<std::shared_ptr<CmdList>>& lists) {
     for (auto& l : lists) replay(g_cb, st, *l, 0);
     draw_end_rendering(g_cb);
     end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);
+    if (uint64_t n = draw_take_dump_request(); n && dump_every() && n % dump_every() == 0) debug_dump_textures(n);
 }
 
 void gpu_present(uint64_t texture) {
@@ -623,6 +640,7 @@ void gpu_present(uint64_t texture) {
     bool dump = src && dump_every() && presents % dump_every() == 0 && readback_record(*src);
     end_and_wait(g_acquired, g_rendered);
     if (dump) readback_write(*src, presents);
+    if (dump_every() && presents % dump_every() == 0) debug_dump_textures(presents);
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &g_rendered;

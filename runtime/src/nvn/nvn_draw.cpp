@@ -122,13 +122,16 @@ struct Resolved {
 };
 
 // The texture and sampler a handle names in the bound pools.
-void texture_for(uint64_t handle, uint64_t& texture, SamplerInfo& sampler) {
+void texture_for(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, uint32_t* swizzle = nullptr) {
     uint32_t sid = 0;
     uint32_t tid = handle_texture(handle, &sid);
     texture = 0;
+    if (swizzle) *swizzle = 0;
     if (auto* tp = get<DescriptorPool>(g_state.texture_pool)) {
         auto it = tp->textures.find(tid);
         if (it != tp->textures.end()) texture = it->second;
+        auto sw = tp->swizzles.find(tid);
+        if (swizzle && sw != tp->swizzles.end()) *swizzle = sw->second;
     }
     if (auto* sp = get<DescriptorPool>(g_state.sampler_pool)) {
         auto it = sp->samplers.find(sid);
@@ -139,6 +142,8 @@ void texture_for(uint64_t handle, uint64_t& texture, SamplerInfo& sampler) {
 struct Stats {
     uint64_t total = 0, no_program = 0, no_vertex = 0, no_pipeline = 0, no_indices = 0, done = 0, to_window = 0;
 } g_stats;
+
+uint64_t g_dump_draws = 0, g_dump_request = 0;
 
 bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, const Cmd& c) {
     g_stats.total++;
@@ -234,9 +239,10 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         auto [s, b] = tex_bindings[k];
         uint64_t texture = 0;
         SamplerInfo si;
-        texture_for(handles[k], texture, si);
+        uint32_t swizzle = 0;
+        texture_for(handles[k], texture, si, &swizzle);
         VkDescriptorImageInfo ii{};
-        ii.imageView = texture ? sampled_view(cb, texture, b->image) : dummy_view(cb, b->image);
+        ii.imageView = texture ? sampled_view(cb, texture, b->image, swizzle) : dummy_view(cb, b->image);
         ii.sampler = sampler_for(si, b->image.depth);
         ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         images.push_back(ii);
@@ -322,8 +328,20 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         p_vkCmdDraw(cb, uint32_t(c.i[1]), uint32_t(std::max(1, c.i[3])), uint32_t(c.i[0]), uint32_t(c.i[2]));
     }
     g_stats.done++;
-    static const bool trace = std::getenv("NX_TRACE_DRAWS") != nullptr;
-    if (trace && g_stats.done <= 40) {
+    // NX_DUMP_ON_TARGET=<hex NVNtexture*>: every NX_DUMP_FRAMES-th draw into it asks for NX_DUMP_TEXTURES to be read
+    // back right after this submit (before later frames change them).
+    static const char* dump_env = std::getenv("NX_DUMP_ON_TARGET");
+    static const uint64_t dump_target = dump_env ? std::strtoull(dump_env, nullptr, 16) : 0;
+    if (dump_target && t.colors[0] == dump_target) g_dump_request = ++g_dump_draws;
+    // NX_TRACE_DRAWS=<first draw>: logs 80 draws from there.
+    static const char* trace_env = std::getenv("NX_TRACE_DRAWS");
+    static const uint64_t trace_from = trace_env ? std::strtoull(trace_env, nullptr, 10) : 0;
+    // NX_TRACE_TARGET=<hex NVNtexture*>: only draws into that color target.
+    static const char* target_env = std::getenv("NX_TRACE_TARGET");
+    static const uint64_t trace_target = target_env ? std::strtoull(target_env, nullptr, 16) : 0;
+    static uint64_t traced = 0;
+    if (trace_env && g_stats.done >= trace_from && traced < 80 && (!trace_target || t.colors[0] == trace_target)) {
+        traced++;
         std::string tex;
         for (size_t k = 0; k < tex_bindings.size(); k++) {
             uint64_t texture = 0;
@@ -336,6 +354,18 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                           tx && tx->image && tx->image->rendered ? " rt" : "");
             tex += b;
         }
+        if (const Range& u = g_state.uniforms[1][0]; u.address)
+            if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
+                log("  fs c3 @%llx+%llx: %g %g %g %g | %g %g %g %g", (unsigned long long)u.address,
+                    (unsigned long long)u.size, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+        const BlendTarget& b0 = g_state.blend[0];
+        log("  blend %u (%u %u %u %u eq %u %u) mask %x logic %x alpha %x fmt %d", g_state.color.blend_enable[0], b0.src_rgb,
+            b0.dst_rgb, b0.src_a, b0.dst_a, b0.eq_rgb, b0.eq_a, g_state.mask.mask[0], g_state.color.logic_op,
+            g_state.color.alpha_test, t.colors[0] ? int(image_of(t.colors[0])->format) : -1);
+        log("  viewport %d %d %d %d (%d) scissor %d %d %d %d (%d) cull %u front %u depth %g..%g test %u", g_state.viewport[0],
+            g_state.viewport[1], g_state.viewport[2], g_state.viewport[3], g_state.has_viewport, g_state.scissor[0],
+            g_state.scissor[1], g_state.scissor[2], g_state.scissor[3], g_state.has_scissor, g_state.polygon.cull,
+            g_state.polygon.front, g_state.depth_near, g_state.depth_far, g_state.depth.depth_test);
         log("draw %llu: vs %s fs %s mode %u %s count %d targets %u:%llx depth %llx%s", (unsigned long long)g_stats.done,
             vs->hash.c_str(), fs ? fs->hash.c_str() : "-", mode, indexed ? "indexed" : "arrays",
             indexed ? c.i[0] : c.i[1], t.color_count, (unsigned long long)t.colors[0], (unsigned long long)t.depth, tex.c_str());
@@ -440,6 +470,12 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
         case Cmd::DrawElements: draw(cb, targets, c.n, true, c); break;
         default: break;
     }
+}
+
+uint64_t draw_take_dump_request() {
+    uint64_t r = g_dump_request;
+    g_dump_request = 0;
+    return r;
 }
 
 }  // namespace nx::nvn

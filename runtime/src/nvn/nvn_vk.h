@@ -18,6 +18,7 @@ struct GpuImage {
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     bool rendered = false;  // written by the GPU: never re-uploaded from guest memory
     bool uploaded = false;  // filled from the texture's pool memory
+    VkComponentMapping swizzle{};  // for sampling (attachment views stay identity)
 };
 
 VkDevice vk_device();

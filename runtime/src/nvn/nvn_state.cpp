@@ -164,9 +164,12 @@ void BindChannelMaskState(CPU& c) {
     uint64_t state = c.x[1], tmp = scratch(c, 16);
     ChannelMaskInfo s;
     for (uint32_t k = 0; k < 8; k++) {
-        driver(c, "nvnChannelMaskStateGetChannelMask", {state, k, tmp, tmp + 1, tmp + 2, tmp + 3});
-        s.mask[k] = uint8_t((ld<uint8_t>(tmp) & 1) | (ld<uint8_t>(tmp + 1) & 1) << 1 | (ld<uint8_t>(tmp + 2) & 1) << 2 |
-                            (ld<uint8_t>(tmp + 3) & 1) << 3);
+        // Four NVNboolean* outputs, one slot of 4 bytes each: slots 1 byte apart overlapped when the driver stores
+        // words, and draws lost channels (the title art came out green only).
+        for (int ch = 0; ch < 4; ch++) st<uint32_t>(tmp + 4 * ch, 0);
+        driver(c, "nvnChannelMaskStateGetChannelMask", {state, k, tmp, tmp + 4, tmp + 8, tmp + 12});
+        s.mask[k] = uint8_t((ld<uint8_t>(tmp) & 1) | (ld<uint8_t>(tmp + 4) & 1) << 1 | (ld<uint8_t>(tmp + 8) & 1) << 2 |
+                            (ld<uint8_t>(tmp + 12) & 1) << 3);
     }
     Cmd cmd{Cmd::BindChannelMaskState};
     record(c.x[0], cmd, &s, sizeof s);
