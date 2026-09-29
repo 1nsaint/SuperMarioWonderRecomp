@@ -4,6 +4,8 @@
 //
 // nvnProgramSetShaders(NVNprogram*, int count, const NVNshaderData*): {NVNbufferAddress code; const void* control}
 // per stage (0x10 bytes); the Ext variant's entries have a third, zero word (0x18 bytes).
+#include <cstdlib>
+#include <string>
 #include <vector>
 
 #include "nvn.h"
@@ -37,6 +39,12 @@ void set_shaders(CPU& c, size_t stride) {
             continue;
         }
         if (const ShaderInfo* s = shader_for(pool->memory + offset, control)) shaders.push_back(s);
+    }
+    static const bool trace = std::getenv("NX_TRACE_PROGRAMS") != nullptr;  // each program's stages when set
+    if (trace) {
+        std::string line;
+        for (const ShaderInfo* s : shaders) line += " " + s->hash;
+        log("nvn: program %llx set:%s", (unsigned long long)c.x[0], line.c_str());
     }
     if (auto* p = get<Program>(c.x[0])) p->shaders = std::move(shaders);
     c.x[0] = 1;

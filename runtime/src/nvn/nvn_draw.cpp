@@ -652,7 +652,8 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
             break;
         }
         case Cmd::ReportCounter: {  // {value, timestamp}: the work before it is done when the replay gets here
-            static uint64_t reports = 0;
+            static uint64_t reports = 0, types_seen = 0;
+            if (c.n < 64 && !(types_seen >> c.n & 1)) types_seen |= 1ull << c.n, log("nvn: first counter report of type %u", c.n);
             if (uint8_t* p = const_cast<uint8_t*>(guest_bytes(c.a[0]))) {
                 uint64_t v[2] = {++reports, plat::monotonic_ns()};
                 std::memcpy(p, v, sizeof v);

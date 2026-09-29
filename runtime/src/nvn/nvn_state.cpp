@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "nvn.h"
+#include "nvn_shaders.h"
 #include "platform.h"
 
 namespace nx::nvn {
@@ -54,6 +55,14 @@ void BindProgram(CPU& c) {
     cmd.a[0] = c.x[1];
     cmd.mask = uint32_t(c.x[2]);
     record(c.x[0], cmd);
+    static const bool trace = std::getenv("NX_TRACE_PROGRAMS") != nullptr;  // binds of skinned programs (input 6)
+    static int logged = 0;
+    if (const auto* sh = trace && logged < 40 ? program_shaders(c.x[1]) : nullptr)
+        for (const ShaderInfo* s : *sh)
+            for (const ShaderIo& in : s->refl.inputs)
+                if (s->stage == ShaderStage::Vertex && in.location == 6 && logged++ < 40)
+                    log("nvn: skinned program %llx (vs %s) bound into cmd %llx", (unsigned long long)c.x[1],
+                        s->hash.c_str(), (unsigned long long)c.x[0]);
 }
 
 void BindUniformBuffer(CPU& c) {
