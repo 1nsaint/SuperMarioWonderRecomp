@@ -9,12 +9,31 @@ Writes (all symbols are prefixed with the module name, so several modules link i
   report.txt      coverage: unhandled instructions, unresolved indirect branches
 """
 import argparse
+import contextlib
+import io
 import os
 import time
 
 from . import analysis, emit, nso
 
 INSNS_PER_FILE = 12000
+
+
+@contextlib.contextmanager
+def open_if_changed(path):
+    """Like open(path, "w"), but leaves the file (and its timestamp) alone when the text is the same, so a rebuild
+    after regenerating compiles only the files that changed."""
+    buf = io.StringIO()
+    yield buf
+    text = buf.getvalue()
+    try:
+        with open(path) as f:
+            if f.read() == text:
+                return
+    except OSError:
+        pass
+    with open(path, "w") as f:
+        f.write(text)
 
 
 def cstr(s):
@@ -44,8 +63,10 @@ def main():
         want = {int(x, 16) for x in args.only}
         funcs = [f for f in funcs if f.start in want]
 
-    with open(os.path.join(args.out, "funcs.h"), "w") as h:
-        h.write(f"#pragma once\n#include <nx/cpu.h>\n\n#undef NXB\n#define NXB {base:#x}ull\n\n")
+    with open_if_changed(os.path.join(args.out, "funcs.h")) as h:
+        # --base is an address in the reference layout (modules at 0x40_0000_0000); the build's NX_BASE (nx/cpu.h,
+        # per host) moves all modules together, so the same generated code serves every platform.
+        h.write(f"#pragma once\n#include <nx/cpu.h>\n\n#undef NXB\n#define NXB (NX_BASE + {base - REF_BASE:#x}ull)\n\n")
         for f in an.functions:
             h.write(f"void {e.fn(f.start)}(nx::CPU& c);\n")
 
@@ -56,7 +77,7 @@ def main():
         cur_n += (f.end - f.start) // 4
         if cur_n >= INSNS_PER_FILE or k == len(funcs) - 1:
             fname = f"code_{len(files):03d}.cpp"
-            with open(os.path.join(args.out, fname), "w") as out:
+            with open_if_changed(os.path.join(args.out, fname)) as out:
                 out.write('#include "funcs.h"\n\n')
                 out.write("\n\n".join(cur))
                 out.write("\n")
@@ -78,8 +99,11 @@ def main():
         print(f"  {n:7} {mn}")
 
 
+REF_BASE = 0x4000000000  # where --base addresses are measured from (NX_BASE of the reference layout)
+
+
 def write_table(path, m, an, e, name, base):
-    with open(path, "w") as out:
+    with open_if_changed(path) as out:
         out.write('#include "funcs.h"\n#include <nx/module.h>\n\n')
         out.write("static const nx::FuncEntry funcs[] = {\n")
         for f in an.functions:
@@ -98,7 +122,7 @@ def write_table(path, m, an, e, name, base):
         out.write(f"static const uint64_t init_array[] = {{{ia}}};\n")
         out.write(f"static const uint64_t fini_array[] = {{{fa}}};\n\n")
         out.write(f"extern const nx::ModuleInfo nx_module_{name} = {{\n")
-        out.write(f"    {cstr(name)}, {base:#x}ull,\n")
+        out.write(f"    {cstr(name)}, NX_BASE + {base - REF_BASE:#x}ull,\n")
         out.write(f"    {m.text[0]:#x}, {m.text[1]:#x}, {m.ro[0]:#x}, {m.ro[1]:#x}, "
                   f"{m.data[0]:#x}, {m.data[1]:#x}, {m.bss[0]:#x}, {m.bss[1]:#x},\n")
         out.write(f"    funcs, {len(an.functions)},\n")

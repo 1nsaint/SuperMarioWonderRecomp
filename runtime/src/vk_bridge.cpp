@@ -2,13 +2,20 @@
 // device creation (extension filtering), the Switch surface (VK_NN_vi_surface -> VK_KHR_win32_surface), physical
 // device order (discrete GPU first) and debug callbacks (guest function pointers the host must never call).
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include <nx/game.h>
+
 #include "vk_gen.h"
+#include "vk_present.h"
+
+namespace nx {
+}
 
 namespace nx::vk {
 
@@ -31,7 +38,8 @@ const std::unordered_set<std::string> kSpecial = {
     "vkCreateDebugReportCallbackEXT", "vkDestroyInstance", "vkEnumeratePhysicalDevices",
     "vkDestroyDebugUtilsMessengerEXT", "vkDestroyDebugReportCallbackEXT", "vkGetPhysicalDeviceQueueFamilyProperties",
     "vkGetPhysicalDeviceQueueFamilyProperties2", "vkGetPhysicalDeviceQueueFamilyProperties2KHR", "vkQueuePresentKHR", "vkGetDeviceQueue", "vkCreateSwapchainKHR",
-    "vkAcquireNextImageKHR",
+    "vkAcquireNextImageKHR", "vkGetSwapchainImagesKHR", "vkDestroySwapchainKHR", "vkWaitForFences",
+    "vkGetPhysicalDeviceSurfaceSupportKHR", "vkGetPhysicalDeviceSurfaceCapabilitiesKHR", "vkGetPhysicalDeviceSurfaceFormatsKHR", "vkGetPhysicalDeviceSurfacePresentModesKHR", "vkDestroySurfaceKHR",
 };
 
 void load_loader() {
@@ -118,6 +126,7 @@ void w_vkEnumerateInstanceLayerProperties(CPU& c) {
 
 void w_vkCreateInstance(CPU& c) {  // (const VkInstanceCreateInfo*, alloc, VkInstance*)
     load_loader();
+    game::renderer_start();
     VkInstanceCreateInfo ci = *reinterpret_cast<const VkInstanceCreateInfo*>(c.x[0]);
     uint32_t nhave = 0;
     host_enum_inst_ext(nullptr, &nhave, nullptr);
@@ -258,26 +267,191 @@ void w_vkCreateDevice(CPU& c) {  // (physical, const VkDeviceCreateInfo*, alloc,
 
 // ---- surface and debug ----------------------------------------------------------------------------------------
 
+// The OS can take the window away (Android: home, app switcher, screen lock) and hand out a new one; the Switch
+// never loses its screen, so the game keeps its surface and swapchain for good. The handles it holds stay the
+// same (the first host handles, used as names from then on) and the host surface and swapchain behind them are
+// replaced when the window changes or the driver says they are lost.
+struct SurfaceInfo {
+    VkInstance instance;
+    void* window;  // a reference we hold (plat::create_window)
+    uint64_t generation;
+    VkSurfaceKHR host;
+};
+std::unordered_map<uint64_t, SurfaceInfo> g_surfaces;  // game handle -> current
+
+// The game's surface and swapchain handles are ours (a host handle value could come back for another object once
+// the host one behind it was re-made).
+uint64_t g_next_handle = 0x0000FA4E00000001ull;
+
+// The host surface behind a game handle, re-made on the current window if the OS replaced it. False: no window.
+bool refresh_surface(SurfaceInfo& s) {
+    uint64_t gen = plat::window_generation();
+    if (s.host && s.generation == gen) return true;
+    if (s.host) {
+        p_vkDestroySurfaceKHR(s.instance, s.host, nullptr);
+        plat::release_window(s.window);
+        s.host = VK_NULL_HANDLE;
+    }
+    s.window = plat::create_window();
+    s.generation = gen;
+    uint64_t h = 0;
+    VkResult r = VkResult(plat::vulkan_create_surface(s.instance, s.window, &h, reinterpret_cast<void*>(host_gipa)));
+    log("vk: surface re-made on window %p (generation %llu): %d", s.window, (unsigned long long)gen, r);
+    s.host = reinterpret_cast<VkSurfaceKHR>(h);
+    return r == VK_SUCCESS;
+}
+
+VkSurfaceKHR host_surface(uint64_t game) {
+    auto it = g_surfaces.find(game);
+    if (it == g_surfaces.end()) return reinterpret_cast<VkSurfaceKHR>(game);
+    refresh_surface(it->second);
+    return it->second.host;
+}
+
 void w_vkCreateViSurfaceNN(CPU& c) {  // (instance, const VkViSurfaceCreateInfoNN*, alloc, VkSurfaceKHR*)
     auto* vi = reinterpret_cast<const VkViSurfaceCreateInfoNN*>(c.x[1]);
     uint64_t s = 0;
     auto r = VkResult(plat::vulkan_create_surface(arg<VkInstance>(c.x[0]), vi->window, &s,
                                                   reinterpret_cast<void*>(host_gipa)));
     log("vkCreateViSurfaceNN -> %s surface on %p: %d", plat::vulkan_surface_extension(), vi->window, r);
-    if (r == VK_SUCCESS) st<uint64_t>(c.x[3], s);
+    if (r == VK_SUCCESS) {
+        uint64_t game = g_next_handle++;
+        st<uint64_t>(c.x[3], game);
+        // The window came from nn::vi::GetNativeWindow (a reference the game never gives back): ours now.
+        g_surfaces[game] = {arg<VkInstance>(c.x[0]), vi->window, plat::window_generation(), reinterpret_cast<VkSurfaceKHR>(s)};
+    }
     c.x[0] = ret_u64(r);
 }
 
+void w_vkDestroySurfaceKHR(CPU& c) {  // (instance, surface, alloc)
+    auto it = g_surfaces.find(c.x[1]);
+    if (it == g_surfaces.end()) {
+        p_vkDestroySurfaceKHR(arg<VkInstance>(c.x[0]), arg<VkSurfaceKHR>(c.x[1]), nullptr);
+        return;
+    }
+    if (it->second.host) p_vkDestroySurfaceKHR(it->second.instance, it->second.host, nullptr);
+    plat::release_window(it->second.window);
+    g_surfaces.erase(it);
+}
+
+void w_vkGetPhysicalDeviceSurfaceSupportKHR(CPU& c) {  // (physical, family, surface, VkBool32*)
+    c.x[0] = ret_u64(p_vkGetPhysicalDeviceSurfaceSupportKHR(arg<VkPhysicalDevice>(c.x[0]), uint32_t(c.x[1]),
+                                                            host_surface(c.x[2]), arg<VkBool32*>(c.x[3])));
+}
+
+void w_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(CPU& c) {  // (physical, surface, caps*)
+    c.x[0] = ret_u64(p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(arg<VkPhysicalDevice>(c.x[0]), host_surface(c.x[1]),
+                                                                 arg<VkSurfaceCapabilitiesKHR*>(c.x[2])));
+}
+
+void w_vkGetPhysicalDeviceSurfaceFormatsKHR(CPU& c) {  // (physical, surface, count*, formats*)
+    c.x[0] = ret_u64(p_vkGetPhysicalDeviceSurfaceFormatsKHR(arg<VkPhysicalDevice>(c.x[0]), host_surface(c.x[1]),
+                                                            arg<uint32_t*>(c.x[2]), arg<VkSurfaceFormatKHR*>(c.x[3])));
+}
+
+void w_vkGetPhysicalDeviceSurfacePresentModesKHR(CPU& c) {  // (physical, surface, count*, modes*)
+    c.x[0] = ret_u64(p_vkGetPhysicalDeviceSurfacePresentModesKHR(
+        arg<VkPhysicalDevice>(c.x[0]), host_surface(c.x[1]), arg<uint32_t*>(c.x[2]), arg<VkPresentModeKHR*>(c.x[3])));
+}
+
 // ---- screenshots: NX_SCREENSHOT=<frame>[,<frame>...] writes private/captures/frame_<n>.bmp ---------------------
+
+// Hades keeps its per-frame command pools and buffers in fixed arrays of 3 (main+26e428), indexed by the swapchain
+// image index. Hosts that hand out more images (Android: 4+) get a virtual swapchain: the game sees 3 plain images
+// and each present copies the rendered one into the host image acquired for it.
+constexpr uint32_t kMaxGuestImages = 3;
+
+// Where the frame time goes, reported with the fps line: host time spent blocked in fence waits (GPU behind),
+// acquire and present, summed over the report interval.
+std::atomic<uint64_t> g_wait_fence_ns{0}, g_wait_acquire_ns{0}, g_wait_present_ns{0};
+
+struct Timed {
+    std::atomic<uint64_t>& sum;
+    uint64_t t0 = plat::monotonic_ns();
+    ~Timed() { sum += plat::monotonic_ns() - t0; }
+};
 
 struct SwapchainInfo {
     VkDevice device;
     VkFormat format;
     VkExtent2D extent;
-    std::vector<VkImage> images;
+    uint32_t layers = 1;
+    VkSwapchainKHR host_sc = VK_NULL_HANDLE;  // the current host swapchain (the game's handle is its first one)
+    uint64_t surface = 0;                     // the game's surface handle
+    VkSwapchainCreateInfoKHR ci{};            // as created (host-adjusted), to re-make it
+    std::vector<uint32_t> families;
+    uint64_t generation = 0;  // window generation it was made for
+    bool lost = false;        // the host said out of date / surface lost: re-make before the next acquire
+    VkQueue queue = VK_NULL_HANDLE;  // where the game presents
+    PresentPass pass;        // draws the game's image into the host one (rotated); else a plain copy
+    bool prerotate = false;  // host swapchain in the display's own orientation
+    std::vector<VkImage> images;  // what the game sees (the virtual images when `virt`)
+    // Virtual swapchain.
+    bool virt = false;
+    std::vector<VkImage> host;           // the host swapchain's images
+    std::vector<VkDeviceMemory> memory;  // of the virtual images
+    std::vector<uint32_t> host_of;       // virtual index -> host index acquired for it
+    uint32_t next = 0;                   // next virtual index to hand out
+    std::vector<VkSemaphore> copied;     // per host image: its copy is done, present may start
+    VkCommandPool pool = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> cmds;  // ring of copy command buffers
+    std::vector<VkFence> fences;
+    uint32_t slot = 0;
 };
 std::unordered_map<uint64_t, SwapchainInfo> g_swapchains;
 std::unordered_map<uint64_t, std::pair<VkDevice, uint32_t>> g_queues;  // queue -> (device, family)
+
+uint32_t find_memory_type(VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFlags want) {
+    VkPhysicalDeviceMemoryProperties mp;
+    p_vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+        if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
+    return 0;
+}
+
+void destroy_virtual(SwapchainInfo& s) {
+    if (!s.virt) return;
+    p_vkDeviceWaitIdle(s.device);
+    s.pass.destroy();
+    for (VkImage i : s.images) p_vkDestroyImage(s.device, i, nullptr);
+    for (VkDeviceMemory m : s.memory) p_vkFreeMemory(s.device, m, nullptr);
+    for (VkSemaphore x : s.copied) p_vkDestroySemaphore(s.device, x, nullptr);
+    for (VkFence f : s.fences) p_vkDestroyFence(s.device, f, nullptr);
+    if (s.pool) p_vkDestroyCommandPool(s.device, s.pool, nullptr);
+}
+
+void make_copied_semaphores(SwapchainInfo& s);
+
+// Plain images with the swapchain's format, size and usage, standing in for the host swapchain's images.
+bool make_virtual(SwapchainInfo& s, const VkSwapchainCreateInfoKHR& ci) {
+    s.virt = true;
+    s.images.assign(kMaxGuestImages, VK_NULL_HANDLE);
+    s.memory.assign(kMaxGuestImages, VK_NULL_HANDLE);
+    s.host_of.assign(kMaxGuestImages, 0);
+    for (uint32_t k = 0; k < kMaxGuestImages; k++) {
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.imageType = VK_IMAGE_TYPE_2D;
+        ii.format = ci.imageFormat;
+        ii.extent = {ci.imageExtent.width, ci.imageExtent.height, 1};
+        ii.mipLevels = 1;
+        ii.arrayLayers = ci.imageArrayLayers;
+        ii.samples = VK_SAMPLE_COUNT_1_BIT;
+        ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.usage = ci.imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (p_vkCreateImage(s.device, &ii, nullptr, &s.images[k]) != VK_SUCCESS) return false;
+        VkMemoryRequirements mr;
+        p_vkGetImageMemoryRequirements(s.device, s.images[k], &mr);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size;
+        mai.memoryTypeIndex = find_memory_type(g_physical, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (p_vkAllocateMemory(s.device, &mai, nullptr, &s.memory[k]) != VK_SUCCESS) return false;
+        p_vkBindImageMemory(s.device, s.images[k], s.memory[k], 0);
+    }
+    make_copied_semaphores(s);
+    return true;
+}
 
 void w_vkGetDeviceQueue(CPU& c) {  // (device, family, index, VkQueue*)
     VkQueue q = VK_NULL_HANDLE;
@@ -286,47 +460,170 @@ void w_vkGetDeviceQueue(CPU& c) {  // (device, family, index, VkQueue*)
     g_queues[reinterpret_cast<uint64_t>(q)] = {arg<VkDevice>(c.x[0]), uint32_t(c.x[1])};
 }
 
+// The host's surface capabilities applied to the game's create info (what the Switch driver accepts is not what
+// every host surface supports, Android/Adreno especially): keep the game's choices where the surface allows them.
+void adapt_to_surface(VkSwapchainCreateInfoKHR& ci) {
+    if (!g_physical) return;
+    VkSurfaceCapabilitiesKHR caps{};
+    p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_physical, ci.surface, &caps);
+    if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+        ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;  // for screenshots
+    if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+        ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;  // for a virtual swapchain's copies
+    if (!(caps.supportedCompositeAlpha & ci.compositeAlpha))
+        for (VkCompositeAlphaFlagBitsKHR a : {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+                                               VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR})
+            if (caps.supportedCompositeAlpha & a) {
+                ci.compositeAlpha = a;
+                break;
+            }
+    if (!(caps.supportedTransforms & ci.preTransform)) ci.preTransform = caps.currentTransform;
+    ci.minImageCount = std::max(ci.minImageCount, caps.minImageCount);
+    if (caps.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
+    uint32_t nm = 0;
+    p_vkGetPhysicalDeviceSurfacePresentModesKHR(g_physical, ci.surface, &nm, nullptr);
+    std::vector<VkPresentModeKHR> modes(nm);
+    p_vkGetPhysicalDeviceSurfacePresentModesKHR(g_physical, ci.surface, &nm, modes.data());
+    if (std::find(modes.begin(), modes.end(), ci.presentMode) == modes.end()) ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+}
+
+void get_host_images(SwapchainInfo& s) {
+    uint32_t n = 0;
+    p_vkGetSwapchainImagesKHR(s.device, s.host_sc, &n, nullptr);
+    s.host.resize(n);
+    p_vkGetSwapchainImagesKHR(s.device, s.host_sc, &n, s.host.data());
+}
+
+void make_copied_semaphores(SwapchainInfo& s) {
+    VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    s.copied.assign(s.host.size(), VK_NULL_HANDLE);
+    for (VkSemaphore& x : s.copied) p_vkCreateSemaphore(s.device, &sci, nullptr, &x);
+}
+
+// A new host surface/swapchain behind the game's handles (virtual swapchains only: the game's images stay).
+bool remake(SwapchainInfo& s) {
+    p_vkDeviceWaitIdle(s.device);
+    for (VkSemaphore x : s.copied) p_vkDestroySemaphore(s.device, x, nullptr);
+    s.copied.clear();
+    if (s.host_sc) p_vkDestroySwapchainKHR(s.device, s.host_sc, nullptr);
+    s.host_sc = VK_NULL_HANDLE;
+    auto it = g_surfaces.find(s.surface);
+    if (it == g_surfaces.end() || !refresh_surface(it->second)) return false;
+    s.ci.surface = it->second.host;
+    s.ci.pQueueFamilyIndices = s.families.empty() ? nullptr : s.families.data();
+    adapt_to_surface(s.ci);
+    if (s.prerotate) {
+        VkSurfaceCapabilitiesKHR caps{};
+        p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_physical, s.ci.surface, &caps);
+        bool sideways = caps.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR);
+        s.ci.preTransform = caps.currentTransform;
+        // The screen's own size (the game may render smaller: the present pass scales).
+        uint32_t sw = 0, sh = 0;
+        plat::screen_size(sw, sh);
+        VkExtent2D screen = sw && sh ? VkExtent2D{sw, sh} : s.extent;
+        s.ci.imageExtent = sideways ? VkExtent2D{screen.height, screen.width} : screen;
+        s.ci.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    }
+    VkResult r = p_vkCreateSwapchainKHR(s.device, &s.ci, nullptr, &s.host_sc);
+    s.generation = it->second.generation;
+    s.lost = r != VK_SUCCESS;
+    if (r != VK_SUCCESS) {
+        log("vk: swapchain re-make failed: %d", r);
+        s.host_sc = VK_NULL_HANDLE;
+        return false;
+    }
+    get_host_images(s);
+    make_copied_semaphores(s);
+    s.next = 0;
+    if (s.pass.ready() && !s.pass.set_targets(s.host, s.ci.imageExtent, s.ci.preTransform)) s.pass.destroy();
+    log("vk: host swapchain %ux%u, transform %u, %zu images%s", s.ci.imageExtent.width, s.ci.imageExtent.height,
+        unsigned(s.ci.preTransform), s.host.size(), s.pass.ready() ? ", drawn by the present pass" : ", copied");
+    return true;
+}
+
+// Suboptimal from a pre-rotated swapchain: re-make it if the display's orientation changed (phone turned over).
+void check_orientation(SwapchainInfo& s) {
+    if (!s.prerotate || !s.ci.surface) return;
+    VkSurfaceCapabilitiesKHR caps{};
+    p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_physical, s.ci.surface, &caps);
+    if (caps.currentTransform != s.ci.preTransform) s.lost = true;
+}
+
 void w_vkCreateSwapchainKHR(CPU& c) {  // (device, const VkSwapchainCreateInfoKHR*, alloc, VkSwapchainKHR*)
     VkSwapchainCreateInfoKHR ci = *reinterpret_cast<const VkSwapchainCreateInfoKHR*>(c.x[1]);
+    uint64_t game_surface = reinterpret_cast<uint64_t>(ci.surface);
+    ci.surface = host_surface(game_surface);
+    ci.pNext = nullptr;
+    if (ci.oldSwapchain)
+        if (auto it = g_swapchains.find(reinterpret_cast<uint64_t>(ci.oldSwapchain)); it != g_swapchains.end())
+            ci.oldSwapchain = it->second.host_sc;
     // What the Switch driver accepts is not what every host surface supports (Android/Adreno especially): keep
     // the game's choices where the surface allows them, otherwise fall back to what it does.
-    if (g_physical) {
-        VkSurfaceCapabilitiesKHR caps{};
-        p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_physical, ci.surface, &caps);
-        if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
-            ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;  // for screenshots
-        if (!(caps.supportedCompositeAlpha & ci.compositeAlpha))
-            for (VkCompositeAlphaFlagBitsKHR a : {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
-                                                   VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR})
-                if (caps.supportedCompositeAlpha & a) {
-                    ci.compositeAlpha = a;
-                    break;
-                }
-        if (!(caps.supportedTransforms & ci.preTransform)) ci.preTransform = caps.currentTransform;
-        ci.minImageCount = std::max(ci.minImageCount, caps.minImageCount);
-        if (caps.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
-        uint32_t nm = 0;
-        p_vkGetPhysicalDeviceSurfacePresentModesKHR(g_physical, ci.surface, &nm, nullptr);
-        std::vector<VkPresentModeKHR> modes(nm);
-        p_vkGetPhysicalDeviceSurfacePresentModesKHR(g_physical, ci.surface, &nm, modes.data());
-        if (std::find(modes.begin(), modes.end(), ci.presentMode) == modes.end()) ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-    }
+    adapt_to_surface(ci);
     VkSwapchainKHR sc = VK_NULL_HANDLE;
     VkResult r = p_vkCreateSwapchainKHR(arg<VkDevice>(c.x[0]), &ci, nullptr, &sc);
     log("vkCreateSwapchainKHR %ux%u format %d, %u images, present mode %d -> %d", ci.imageExtent.width,
         ci.imageExtent.height, ci.imageFormat, ci.minImageCount, ci.presentMode, r);
     if (r == VK_SUCCESS) {
-        st<uint64_t>(c.x[3], reinterpret_cast<uint64_t>(sc));
-        SwapchainInfo& s = g_swapchains[reinterpret_cast<uint64_t>(sc)];
+        uint64_t game = g_next_handle++;
+        st<uint64_t>(c.x[3], game);
+        SwapchainInfo& s = g_swapchains[game];
         s.device = arg<VkDevice>(c.x[0]);
         s.format = ci.imageFormat;
         s.extent = ci.imageExtent;
-        uint32_t n = 0;
-        p_vkGetSwapchainImagesKHR(s.device, sc, &n, nullptr);
-        s.images.resize(n);
-        p_vkGetSwapchainImagesKHR(s.device, sc, &n, s.images.data());
+        s.layers = ci.imageArrayLayers;
+        s.host_sc = sc;
+        s.surface = game_surface;
+        s.ci = ci;
+        if (ci.imageSharingMode == VK_SHARING_MODE_CONCURRENT && ci.pQueueFamilyIndices)
+            s.families.assign(ci.pQueueFamilyIndices, ci.pQueueFamilyIndices + ci.queueFamilyIndexCount);
+        s.generation = plat::window_generation();
+        get_host_images(s);
+        uint32_t n = uint32_t(s.host.size());
+        s.images = s.host;
+        // Virtual (the game's own images, copied on present) when the host has more images than the game handles,
+        // and wherever the window can be replaced: the host swapchain can then be re-made under the game.
+        if (n > kMaxGuestImages || std::strcmp(plat::vulkan_surface_extension(), "VK_KHR_android_surface") == 0) {
+            if (!(ci.imageUsage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) || !make_virtual(s, ci))
+                fatal("swapchain has %u images, the game handles %u, and no virtual swapchain could be made", n,
+                      kMaxGuestImages);
+            log("vk: %u host swapchain images, the game sees %u (copied on present)", n, kMaxGuestImages);
+            if (std::strcmp(plat::vulkan_surface_extension(), "VK_KHR_android_surface") == 0) {
+                uint32_t sw = 0, sh = 0;
+                plat::screen_size(sw, sh);
+                if (s.pass.init(s.device, s.format, s.images, sw != s.extent.width || sh != s.extent.height)) {
+                    s.prerotate = true;
+                    remake(s);  // again, in the display's orientation
+                } else {
+                    s.pass.destroy();
+                    log("vk: present pass not available, copying");
+                }
+            }
+        }
     }
     c.x[0] = ret_u64(r);
+}
+
+void w_vkGetSwapchainImagesKHR(CPU& c) {  // (device, swapchain, uint32_t* count, VkImage*)
+    auto it = g_swapchains.find(c.x[1]);
+    if (it == g_swapchains.end()) {
+        c.x[0] = ret_u64(p_vkGetSwapchainImagesKHR(arg<VkDevice>(c.x[0]), arg<VkSwapchainKHR>(c.x[1]),
+                                                   arg<uint32_t*>(c.x[2]), arg<VkImage*>(c.x[3])));
+        return;
+    }
+    if (!it->second.virt) get_host_images(it->second), it->second.images = it->second.host;
+    c.x[0] = ret_u64(enumerate(it->second.images, c.x[2], c.x[3]));
+}
+
+void w_vkDestroySwapchainKHR(CPU& c) {  // (device, swapchain, alloc)
+    auto it = g_swapchains.find(c.x[1]);
+    if (it == g_swapchains.end()) {
+        p_vkDestroySwapchainKHR(arg<VkDevice>(c.x[0]), arg<VkSwapchainKHR>(c.x[1]), nullptr);
+        return;
+    }
+    destroy_virtual(it->second);
+    if (it->second.host_sc) p_vkDestroySwapchainKHR(it->second.device, it->second.host_sc, nullptr);
+    g_swapchains.erase(it);
 }
 
 std::vector<uint64_t> screenshot_frames() {
@@ -337,14 +634,6 @@ std::vector<uint64_t> screenshot_frames() {
             if (*p == ',') p++;
         }
     return v;
-}
-
-uint32_t find_memory_type(VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFlags want) {
-    VkPhysicalDeviceMemoryProperties mp;
-    p_vkGetPhysicalDeviceMemoryProperties(pd, &mp);
-    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
-        if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
-    return 0;
 }
 
 // Copies the image about to be presented into a host buffer (waiting on the game's semaphores and signalling a
@@ -464,12 +753,173 @@ void wait_while_minimized() {
     while (plat::window_minimized()) plat::sleep_ns(50'000'000);
 }
 
+void w_vkWaitForFences(CPU& c) {  // (device, count, const VkFence*, waitAll, timeout)
+    Timed t{g_wait_fence_ns};
+    c.x[0] = ret_u64(p_vkWaitForFences(arg<VkDevice>(c.x[0]), uint32_t(c.x[1]), arg<const VkFence*>(c.x[2]),
+                                       VkBool32(c.x[3]), c.x[4]));
+}
+
 void w_vkAcquireNextImageKHR(CPU& c) {  // (device, swapchain, timeout, semaphore, fence, uint32_t* index)
     wait_while_minimized();
-    VkResult r = p_vkAcquireNextImageKHR(arg<VkDevice>(c.x[0]), arg<VkSwapchainKHR>(c.x[1]), c.x[2],
-                                         arg<VkSemaphore>(c.x[3]), arg<VkFence>(c.x[4]), arg<uint32_t*>(c.x[5]));
-    if (r != VK_SUCCESS) log("vkAcquireNextImageKHR -> %d", r);
-    c.x[0] = ret_u64(r);
+    Timed timed{g_wait_acquire_ns};
+    // The game's semaphore and fence go to the host acquire: they signal when the host image is free, which is
+    // what the copy on present writes. The game gets the next virtual image.
+    auto it = g_swapchains.find(c.x[1]);
+    SwapchainInfo* s = it != g_swapchains.end() && it->second.virt ? &it->second : nullptr;
+    uint32_t host = 0;
+    VkResult r = VK_ERROR_OUT_OF_DATE_KHR;
+    if (!s) {
+        VkSwapchainKHR sc = it != g_swapchains.end() ? it->second.host_sc : arg<VkSwapchainKHR>(c.x[1]);
+        r = p_vkAcquireNextImageKHR(arg<VkDevice>(c.x[0]), sc, c.x[2], arg<VkSemaphore>(c.x[3]), arg<VkFence>(c.x[4]),
+                                    arg<uint32_t*>(c.x[5]));
+    } else {
+        // Window replaced or swapchain lost: re-make it under the game (waiting for a window as long as it takes).
+        for (int attempt = 0; attempt < 50; attempt++) {
+            wait_while_minimized();
+            if (s->lost || !s->host_sc || s->generation != plat::window_generation()) {
+                if (!remake(*s)) {
+                    plat::sleep_ns(100'000'000);
+                    continue;
+                }
+            }
+            r = p_vkAcquireNextImageKHR(s->device, s->host_sc, c.x[2], arg<VkSemaphore>(c.x[3]), arg<VkFence>(c.x[4]), &host);
+            if (r == VK_SUBOPTIMAL_KHR) check_orientation(*s);
+            if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR || r == VK_TIMEOUT || r == VK_NOT_READY) break;
+            log("vkAcquireNextImageKHR -> %d: re-making the swapchain", r);
+            s->lost = true;
+        }
+    }
+    if (s && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)) {
+        uint32_t v = s->next;
+        s->next = (v + 1) % kMaxGuestImages;
+        s->host_of[v] = host;
+        st<uint32_t>(c.x[5], v);
+    }
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) log("vkAcquireNextImageKHR -> %d", r);
+    // The game does not handle out-of-date (a console never loses its screen): suboptimal is success for it.
+    c.x[0] = ret_u64(r == VK_SUBOPTIMAL_KHR ? VK_SUCCESS : r);
+}
+
+// Records and submits the copies of a present's virtual images into their host images: waits on the game's
+// semaphores, signals the per-host-image `copied` semaphores the host present waits on instead, and rewrites the
+// image indices to the host ones.
+void copy_virtual(VkQueue queue, VkPresentInfoKHR& pi, std::vector<uint32_t>& indices, std::vector<VkSemaphore>& waits) {
+    SwapchainInfo* first = nullptr;
+    for (uint32_t k = 0; k < pi.swapchainCount; k++) {
+        auto it = g_swapchains.find(reinterpret_cast<uint64_t>(pi.pSwapchains[k]));
+        if (it != g_swapchains.end() && it->second.virt) {
+            first = &it->second;
+            break;
+        }
+    }
+    if (!first) return;
+    VkDevice dev = first->device;
+    if (!first->pool) {
+        auto q = g_queues.find(reinterpret_cast<uint64_t>(queue));
+        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = q != g_queues.end() ? q->second.second : 0;
+        p_vkCreateCommandPool(dev, &pci, nullptr, &first->pool);
+        first->cmds.resize(kMaxGuestImages);
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = first->pool;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = kMaxGuestImages;
+        p_vkAllocateCommandBuffers(dev, &cai, first->cmds.data());
+        first->fences.resize(kMaxGuestImages);
+        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        for (VkFence& f : first->fences) p_vkCreateFence(dev, &fci, nullptr, &f);
+    }
+    uint32_t slot = first->slot;
+    first->slot = (slot + 1) % kMaxGuestImages;
+    VkFence fence = first->fences[slot];
+    VkCommandBuffer cb = first->cmds[slot];
+    p_vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
+    p_vkResetFences(dev, 1, &fence);
+    p_vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    p_vkBeginCommandBuffer(cb, &bi);
+
+    indices.assign(pi.pImageIndices, pi.pImageIndices + pi.swapchainCount);
+    std::vector<VkSemaphore> signals;
+    for (uint32_t k = 0; k < pi.swapchainCount; k++) {
+        auto it = g_swapchains.find(reinterpret_cast<uint64_t>(pi.pSwapchains[k]));
+        if (it == g_swapchains.end() || !it->second.virt) continue;
+        SwapchainInfo& s = it->second;
+        uint32_t v = indices[k], h = s.host_of[v];
+        if (s.pass.ready()) {
+            s.pass.record(cb, v, h);
+            indices[k] = h;
+            signals.push_back(s.copied[h]);
+            continue;
+        }
+        VkImage src = s.images[v], dst = s.host[h];
+        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, s.layers};
+        auto barrier = [&](VkImage img, VkAccessFlags sa, VkAccessFlags da, VkImageLayout from, VkImageLayout to) {
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.srcAccessMask = sa;
+            b.dstAccessMask = da;
+            b.oldLayout = from;
+            b.newLayout = to;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = img;
+            b.subresourceRange = range;
+            return b;
+        };
+        VkImageMemoryBarrier pre[2] = {
+            barrier(src, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+            barrier(dst, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+        };
+        p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                               nullptr, 2, pre);
+        VkImageCopy region{};
+        region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, s.layers};
+        region.extent = {s.extent.width, s.extent.height, 1};
+        p_vkCmdCopyImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                         &region);
+        // The virtual image goes back to the layout the game left it in; later work on it (next frames) waits
+        // for the copy through this barrier.
+        VkImageMemoryBarrier post[2] = {
+            barrier(src, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
+            barrier(dst, VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
+        };
+        p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                               nullptr, 2, post);
+        indices[k] = h;
+        signals.push_back(s.copied[h]);
+    }
+    p_vkEndCommandBuffer(cb);
+
+    std::vector<VkPipelineStageFlags> stages(pi.waitSemaphoreCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.waitSemaphoreCount = pi.waitSemaphoreCount;
+    si.pWaitSemaphores = pi.pWaitSemaphores;
+    si.pWaitDstStageMask = stages.data();
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    si.signalSemaphoreCount = uint32_t(signals.size());
+    si.pSignalSemaphores = signals.data();
+    p_vkQueueSubmit(queue, 1, &si, fence);
+    waits = std::move(signals);
+    pi.waitSemaphoreCount = uint32_t(waits.size());
+    pi.pWaitSemaphores = waits.data();
+    pi.pImageIndices = indices.data();
+}
+
+// The present info with the host swapchains behind the game's handles; records which queue presents.
+void to_host_swapchains(VkQueue queue, VkPresentInfoKHR& pi, std::vector<VkSwapchainKHR>& out) {
+    out.assign(pi.pSwapchains, pi.pSwapchains + pi.swapchainCount);
+    for (VkSwapchainKHR& sc : out)
+        if (auto it = g_swapchains.find(reinterpret_cast<uint64_t>(sc)); it != g_swapchains.end()) {
+            sc = it->second.host_sc;
+            it->second.queue = queue;
+        }
+    pi.pSwapchains = out.data();
 }
 
 void w_vkQueuePresentKHR(CPU& c) {
@@ -481,15 +931,50 @@ void w_vkQueuePresentKHR(CPU& c) {
     VkPresentInfoKHR pi = *arg<const VkPresentInfoKHR*>(c.x[1]);
     VkSemaphore extra = VK_NULL_HANDLE;
     if (std::find(shots.begin(), shots.end(), frames + 1) != shots.end()) capture(queue, pi, frames + 1, extra);
+    std::vector<uint32_t> host_indices;
+    std::vector<VkSemaphore> copied;
+    copy_virtual(queue, pi, host_indices, copied);
+    const VkSwapchainKHR* game_swapchains = pi.pSwapchains;
+    std::vector<VkSwapchainKHR> host_swapchains;
+    to_host_swapchains(queue, pi, host_swapchains);
+    uint64_t tp = plat::monotonic_ns();
     VkResult r = p_vkQueuePresentKHR(queue, &pi);
+    g_wait_present_ns += plat::monotonic_ns() - tp;
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
+        // The window went away under us (or changed): re-make at the next acquire; the game never sees it.
+        for (uint32_t k = 0; k < pi.swapchainCount; k++)
+            if (auto it = g_swapchains.find(reinterpret_cast<uint64_t>(game_swapchains[k])); it != g_swapchains.end())
+                it->second.lost = true;
+        log("vkQueuePresentKHR -> %d: swapchain will be re-made", r);
+        r = VK_SUCCESS;
+    } else if (r == VK_SUBOPTIMAL_KHR) {
+        for (uint32_t k = 0; k < pi.swapchainCount; k++)
+            if (auto it = g_swapchains.find(reinterpret_cast<uint64_t>(game_swapchains[k])); it != g_swapchains.end())
+                check_orientation(it->second);
+        r = VK_SUCCESS;
+    }
     nx::g_frame = frames + 1;
     if (extra) {
         p_vkQueueWaitIdle(queue);
         p_vkDestroySemaphore(g_swapchains.begin()->second.device, extra, nullptr);
     }
+    // Worst frame (time between presents) of the interval: what is felt as stutter.
+    static uint64_t prev_present = 0, worst = 0;
+    uint64_t now_ns = plat::monotonic_ns();
+    if (prev_present) worst = std::max(worst, now_ns - prev_present);
+    prev_present = now_ns;
+    if (frames == 0) game::first_frame();
     if (++frames == 1 || frames % 300 == 0) {
-        double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        log("vk: frame %llu presented (%d), %.1f fps average", (unsigned long long)frames, r, frames / s);
+        static auto last = t0;
+        auto now = std::chrono::steady_clock::now();
+        double s = std::chrono::duration<double>(now - t0).count(), ds = std::chrono::duration<double>(now - last).count();
+        auto per_frame = [](std::atomic<uint64_t>& a) { return a.exchange(0) / 300.0 / 1e6; };
+        log("vk: frame %llu presented (%d), %.1f fps (last %.1f s), %.1f average; worst %.1f ms; per frame: "
+            "fences %.2f ms, acquire %.2f ms, present %.2f ms",
+            (unsigned long long)frames, r, frames == 1 ? 0.0 : 300 / ds, ds, frames / s, worst / 1e6,
+            per_frame(g_wait_fence_ns), per_frame(g_wait_acquire_ns), per_frame(g_wait_present_ns));
+        last = now;
+        worst = 0;
     }
     c.x[0] = ret_u64(r);
 }
@@ -516,8 +1001,16 @@ NX_HLE("vkGetPhysicalDeviceQueueFamilyProperties2KHR", w_vkGetPhysicalDeviceQueu
 NX_HLE("vkCreateViSurfaceNN", w_vkCreateViSurfaceNN);
 NX_HLE("vkQueuePresentKHR", w_vkQueuePresentKHR);
 NX_HLE("vkAcquireNextImageKHR", w_vkAcquireNextImageKHR);
+NX_HLE("vkWaitForFences", w_vkWaitForFences);
 NX_HLE("vkGetDeviceQueue", w_vkGetDeviceQueue);
 NX_HLE("vkCreateSwapchainKHR", w_vkCreateSwapchainKHR);
+NX_HLE("vkGetSwapchainImagesKHR", w_vkGetSwapchainImagesKHR);
+NX_HLE("vkDestroySwapchainKHR", w_vkDestroySwapchainKHR);
+NX_HLE("vkDestroySurfaceKHR", w_vkDestroySurfaceKHR);
+NX_HLE("vkGetPhysicalDeviceSurfaceSupportKHR", w_vkGetPhysicalDeviceSurfaceSupportKHR);
+NX_HLE("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", w_vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
+NX_HLE("vkGetPhysicalDeviceSurfaceFormatsKHR", w_vkGetPhysicalDeviceSurfaceFormatsKHR);
+NX_HLE("vkGetPhysicalDeviceSurfacePresentModesKHR", w_vkGetPhysicalDeviceSurfacePresentModesKHR);
 NX_HLE("vkCreateDebugUtilsMessengerEXT", w_create_debug_callback);
 NX_HLE("vkCreateDebugReportCallbackEXT", w_create_debug_callback);
 NX_HLE("vkDestroyDebugUtilsMessengerEXT", w_destroy_debug_callback);

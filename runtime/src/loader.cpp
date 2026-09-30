@@ -57,7 +57,11 @@ void log(const char* fmt, ...) {
 #else
         std::string def = plat::data_root() + "/../nx.log";
 #endif
-        g_log_file = std::fopen(path ? path : def.c_str(), "w");
+        std::string file = path ? path : def;
+        // Keep the previous session's log (a problem report should survive reopening the game).
+        std::remove((file + ".prev").c_str());
+        std::rename(file.c_str(), (file + ".prev").c_str());
+        g_log_file = std::fopen(file.c_str(), "w");
     }
     plat::log_line(buf);
     if (g_log_file) {
@@ -91,15 +95,24 @@ static void missing_stub(CPU& c) {
     c.x[0] = 0;
 }
 
-uint64_t hle_address(const char* name) {
+uint64_t hle_address_or(const char* name, HleFn fallback) {
+    static std::mutex lock;  // NVN hands out procs by name at run time, from any thread
+    std::lock_guard lk(lock);
+    // Other threads index g_thunks while we add to it: never reallocate (one entry per 16 bytes of the region).
+    if (g_thunks.capacity() < kThunkSize / 16) g_thunks.reserve(kThunkSize / 16);
     auto it = g_thunk_by_name.find(name);
     if (it != g_thunk_by_name.end()) return it->second;
+    if (g_thunks.size() == kThunkSize / 16) fatal("out of HLE thunks");
     HleFn fn = hle_lookup(name);
     uint64_t addr = kThunkBase + g_thunks.size() * 16;
-    g_thunks.push_back({name, fn ? fn : missing_stub});
+    g_thunks.push_back({name, fn ? fn : fallback});
     g_thunk_by_name[name] = addr;
     return addr;
 }
+
+uint64_t hle_address(const char* name) { return hle_address_or(name, missing_stub); }
+
+const char* hle_current_name() { return t_missing_name; }
 
 // ---- dispatch -------------------------------------------------------------------------------------------------
 
@@ -137,12 +150,30 @@ std::string describe(uint64_t addr) {
     return buf;
 }
 
+void backtrace(CPU& c);
+
+// Indirect calls (every blr of the game) look the target up here: the modules' text ranges in a small flat array.
+struct FastModule {
+    uint64_t base, text_size;
+    const Fn* table;
+};
+FastModule g_fast[4];
+size_t g_fast_count = 0;
+
 void call(CPU& c, uint64_t t) {
-    for (auto& m : g_modules) {
+    for (size_t k = 0; k < g_fast_count; k++) {
+        const FastModule& m = g_fast[k];
         uint64_t off = t - m.base;
-        if (off < m.info->text_size) {
+        if (off < m.text_size) [[likely]] {
             Fn fn = m.table[off >> 2];
-            if (!fn) fatal("call into the middle of a function: %s (lr %s)", describe(t).c_str(), describe(c.x[30]).c_str());
+            if (!fn) [[unlikely]] {
+                for (int k = 0; k < 31; k += 4)
+                    log("  x%-2d %016llx %016llx %016llx %016llx", k, (unsigned long long)c.x[k],
+                        (unsigned long long)c.x[k + 1], (unsigned long long)c.x[k + 2],
+                        (unsigned long long)(k + 3 < 31 ? c.x[k + 3] : c.x[31]));
+                backtrace(c);
+                fatal("call into the middle of a function: %s (lr %s)", describe(t).c_str(), describe(c.x[30]).c_str());
+            }
             fn(c);
             return;
         }
@@ -159,8 +190,6 @@ void call(CPU& c, uint64_t t) {
     }
     fatal("call to %llx (%s), lr %s", (unsigned long long)t, describe(t).c_str(), describe(c.x[30]).c_str());
 }
-
-void backtrace(CPU& c);
 
 void trace_sp(CPU& c, uint64_t pc) {
     log("sp %llx x19 %llx at %s", (unsigned long long)c.x[31], (unsigned long long)c.x[19], describe(pc).c_str());
@@ -200,6 +229,7 @@ void load_modules(const ModuleInfo* const* mods, size_t count, const std::string
         LoadedModule lm{mi, mi->base, size, new Fn[mi->text_size / 4]()};
         for (size_t k = 0; k < mi->func_count; k++) lm.table[mi->funcs[k].offset / 4] = mi->funcs[k].fn;
         g_modules.push_back(lm);
+        if (g_fast_count < 4) g_fast[g_fast_count++] = {lm.base, mi->text_size, lm.table};
 
         for (size_t k = 0; k < mi->symbol_count; k++) {
             const Symbol& s = mi->symbols[k];

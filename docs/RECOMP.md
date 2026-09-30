@@ -44,6 +44,26 @@ Bugs it caught:
 - `FMAXNM`/`FMINNM` with a sNaN
 - `BIC`/`ORR` vector immediate on 64-bit arrangements (the upper half was not cleared)
 
+### Running it on macOS / Linux
+
+`python -m tests.difftest <module.nso> <work dir>` builds the runner with `clang++` (extra flags from
+`NX_DIFFTEST_CFLAGS`, e.g. `-DNX_SOFT_CRYPTO` to test the software crypto path) and uses `mmap` + signals instead
+of `VirtualAlloc` + SEH. The scratch buffer sits at 0x3_0000_0000 there (macOS arm64 reserves the low 4 GiB).
+Unicorn runs as CPU model MAX, so ARMv8.1 atomics and the crypto extension are emulated.
+
+On Super Mario Bros. Wonder (SDK 16): `main` 2,414 tests / 28,968 runs, `sdk` 3,472 tests / 55,552 runs,
+0 mismatches. Bugs it caught there: vector `clz`/`cls` emitted as general-purpose ops; `frsqrts`/`frecps` not fused
+(hardware rounds `(3 - a*b) / 2` once, without overflowing in between); `scvtf` vector with fractional bits.
+
+## Instruction coverage added for SDK 16 (Wonder)
+
+AdvSIMD scalar forms (one lane of b/h/s/d), `fcvt*` into a SIMD register, pairwise min/max (`fmaxp`, `sminp`, ...),
+`sminv/uminv`, `facge/facgt`, `sqrdmulh`, halving subtract, `srshl`, `rshrn`, `uabdl/sabdl`, `umlsl/smlsl`,
+`sadalp/uadalp`, `ld2r/ld3r/ld4r`, exclusive pairs (`ldxp/stxp`, 128-bit compare-exchange), all ARMv8.1 LSE
+atomics (`cas`, `casp`, `ldadd`/`ldclr`/`ldeor`/`ldset`/`ld[su]{max,min}`, `st*`, `swp`, emitted as seq_cst
+`__atomic` builtins) and the crypto extension (AES, SHA-1, SHA-256, PMULL.1Q in `nx/cpu.h`: host instructions on
+arm64 with +aes/+sha2, a software version from the ARM pseudocode elsewhere).
+
 ## Known gaps
 
 - Branches, calls and exclusives are not covered by the differential test (they need a whole-function harness).

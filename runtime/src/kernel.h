@@ -1,7 +1,9 @@
 // Kernel objects shared by kernel.cpp and ipc.cpp.
 #pragma once
 
+#include <condition_variable>
 #include <memory>
+#include <vector>
 #include <string>
 
 #include <nx/runtime.h>
@@ -21,6 +23,11 @@ struct KThread : KObject {
     CPU ctx{};
     uint64_t tls = 0;
     uint64_t entry = 0;
+    int64_t host_tid = 0;
+    uint64_t last_yield = 0;  // svcSleepThread(0) back-off
+    uint32_t yields = 0;
+    uint64_t last_tick_call = 0;  // nn::os::GetSystemTick back-off
+    uint32_t tick_spins = 0;
     int prio = 44, core = 0;
     bool started = false, exited = false, cancel = false;
     // wait state (under the kernel lock)
@@ -28,6 +35,7 @@ struct KThread : KObject {
     uint32_t wait_result = 0;
     uint64_t wait_mutex = 0, wait_key = 0, wait_addr = 0;
     uint32_t wait_tag = 0;
+    std::condition_variable_any cv;  // this thread's own wake-up (with the kernel lock)
     bool signaled() const override { return exited; }
 };
 
@@ -56,6 +64,16 @@ void handle_close(uint32_t h);
 void notify_all();
 KThread* self_thread();
 void backtrace(CPU& c);
+uint64_t heap_size();  // svcSetHeapSize's current size
+
+// svc_process.cpp
+uint64_t get_info(uint32_t type, uint32_t handle, uint64_t sub, uint32_t& rc);
+uint32_t set_thread_core_mask(uint32_t handle, int32_t ideal, uint64_t mask);
+uint32_t map_transfer_memory(uint32_t handle, uint64_t addr, uint64_t size);
+uint32_t unmap_transfer_memory(uint32_t handle, uint64_t addr, uint64_t size);
+// Initial static TLS of main (its .tdata), copied to tp+0x10 of every thread created afterwards.
+void set_tls_template(uint64_t start, uint64_t end);
+void init_tls_block(uint64_t block);
 
 // ipc.cpp
 uint32_t ipc_connect(const char* port, uint64_t* out_handle);

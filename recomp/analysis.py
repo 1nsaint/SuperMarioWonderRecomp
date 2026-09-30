@@ -262,29 +262,59 @@ def _jump_table(an, f, br):
     mem = re.match(r"\[(\w+)(?:, (\w+))?", ld_ops[1])
     if not size or not mem or not mem.group(2):
         return None
-    table = _const(an, f, a_ld, _regno(mem.group(1)))
-    if table is None or not m.in_image(table):
-        return None
+    base_reg = _regno(mem.group(1))
     idx = _regno(mem.group(2))
     count = _bound(an, f, a_ld, idx)
-    # Without a bound, take every entry that lands on an instruction of this function (up to 256): a superset only
-    # adds labels, while a missing target would be a call into the middle of the function at run time.
-    limit = count if count is not None else 256
-    out = []
-    misses = 0
-    for k in range(limit):
-        p = table + k * size
-        if p + size > len(m.image):
-            break
-        v = int.from_bytes(m.image[p:p + size], "little", signed=signed)
-        t = anchor + (v << shift)
-        if not (f.start <= t < f.end) or t not in an.insns:
-            misses += 1
-            if count is None and misses > 4:
+
+    def entries(table):
+        """(targets, misses) of the table at `table`."""
+        # Without a bound, take every entry that lands on an instruction of this function (up to 256): a superset
+        # only adds labels, while a missing target would be a call into the middle of the function at run time.
+        limit = count if count is not None else 256
+        out = []
+        misses = 0
+        for k in range(limit):
+            p = table + k * size
+            if p + size > len(m.image):
                 break
-            continue
-        out.append(t)
-    return sorted(set(out)) if out else None
+            v = int.from_bytes(m.image[p:p + size], "little", signed=signed)
+            t = anchor + (v << shift)
+            if not (f.start <= t < f.end) or t not in an.insns:
+                misses += 1
+                if count is None and misses > 4:
+                    break
+                continue
+            out.append(t)
+        return out, misses
+
+    table = _const(an, f, a_ld, base_reg)
+    if table is not None and m.in_image(table):
+        out, _ = entries(table)
+        return sorted(set(out)) if out else None
+    # The base register's last definition in address order is not a constant (control flow reaches the load from
+    # another path: Wonder's main+28b3bc takes x24 from an adrp/add 0x5000 bytes earlier, the linear search found an
+    # unrelated movk). With a known bound, try every constant the function puts in that register and keep one whose
+    # entries all land on instructions of this function.
+    if count is None:
+        return None
+    candidates = []
+    a = f.start
+    while a < f.end:
+        mn, op = an.insns.get(a, ("", ""))
+        ops = _ops(op)
+        if mn in ("adrp", "adr", "add") and ops and _regno(ops[0]) == base_reg:
+            c = _const(an, f, a + 4, base_reg)
+            if c is not None and m.in_image(c) and c not in candidates:
+                candidates.append(c)
+        a += 4
+    # Several constants can pass that test (main+28b3bc: an add x24, x23, #0x90 as well as the real adrp/add), and
+    # extra labels are harmless (a case only fires on its exact target), so the union of all of them is taken.
+    found = set()
+    for c in candidates:
+        out, misses = entries(c)
+        if out and misses == 0:
+            found.update(out)
+    return sorted(found) if found else None
 
 
 def _bound(an, f, before, idx):
@@ -295,23 +325,29 @@ def _bound(an, f, before, idx):
     while a >= max(f.start, before - 4 * 40):
         mn, op = an.insns.get(a, ("", ""))
         ops = _ops(op)
-        if len(ops) >= 2 and _regno(ops[0]) in regs and ops[1][0] in "xw":
-            copy = (mn in ("mov", "uxtw", "sxtw") or
-                    (mn == "and" and len(ops) == 3 and ops[2] in ("#0xffffffff", "#4294967295")))
-            if copy:
-                regs.add(_regno(ops[1]))
+        copy = (len(ops) >= 2 and ops[1][0] in "xw" and
+                (mn in ("mov", "uxtw", "sxtw") or
+                 (mn == "and" and len(ops) == 3 and ops[2] in ("#0xffffffff", "#4294967295"))))
+        if copy and _regno(ops[0]) in regs:
+            # Before this point the index lives in the source register.
+            regs.discard(_regno(ops[0]))
+            regs.add(_regno(ops[1]))
+            a -= 4
+            continue
         if mn == "cmp" and len(ops) == 2 and _regno(ops[0]) in regs and ops[1].startswith("#"):
             n = _imm(ops[1][1:])
-            # Find the branch that uses these flags.
+            # Find the branch that uses these flags; a cmp guarding anything else (b.ne, ...) is no bound.
             for k in range(1, 6):
                 bm = an.insns.get(a + 4 * k, ("", ""))[0]
                 if bm == "b.hi":
                     return n + 1
                 if bm == "b.hs":
                     return n
-            return n + 1
-        if mn and mn not in NO_DEST and ops and _regno(ops[0]) == idx and mn not in ("ldrb", "ldrh", "ldr", "ldrsw"):
-            # idx redefined (e.g. sub w9, w9, #10 before the cmp is fine; anything after means we lost track).
-            pass
+            return None
+        if mn and mn not in NO_DEST and ops and _regno(ops[0]) in regs:
+            # The index was produced here (e.g. ldrb w8, [x27, #3]) with no bounds check after it: an older cmp of
+            # the same register guards another value. Wonder's main+22e5f8 lost a case to exactly that (the cmp
+            # w8, #2 of a previous branch capped the table at 3 entries).
+            return None
         a -= 4
     return None

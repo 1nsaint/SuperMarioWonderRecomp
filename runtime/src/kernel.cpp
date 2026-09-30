@@ -4,12 +4,16 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+
+#include <nx/game.h>
 
 #include "kernel.h"
 #include "platform.h"
@@ -23,17 +27,21 @@ constexpr uint32_t kPseudoCurrentThread = 0xFFFF8000;
 constexpr uint32_t kPseudoCurrentProcess = 0xFFFF8001;
 
 std::recursive_mutex g_k;              // the "kernel lock"
-std::condition_variable_any g_cv;      // any change of waitable state
+std::vector<KThread*> g_sync_waiters;  // threads in WaitSynchronization: woken by any change of waitable state
 std::unordered_map<uint32_t, std::shared_ptr<KObject>> g_handles;
 uint32_t g_next_handle = 0x10000;
 std::atomic<uint64_t> g_next_thread_id{0x50};
 uint64_t g_heap_size = 0;
+
 
 std::vector<KThread*> g_mutex_waiters;  // FIFO
 std::vector<KThread*> g_cv_waiters;
 std::vector<KThread*> g_addr_waiters;
 
 thread_local KThread* t_self = nullptr;
+
+std::mutex g_all_lock;  // every thread ever created, for the hang report
+std::vector<std::weak_ptr<KThread>> g_all;
 
 
 }  // namespace
@@ -57,24 +65,72 @@ void handle_close(uint32_t h) {
     g_handles.erase(h);
 }
 
-void notify_all() { g_cv.notify_all(); }
+// A waitable object changed (event signalled, thread exited...): wake the threads waiting on objects, only them.
+// Mutex, condition variable and address waiters are woken one by one (wake()): one global condition variable woke
+// every waiting thread of the process on each signal (the engine's job system broadcasts all the time).
+void notify_all() {
+    std::lock_guard lk(g_k);
+    for (KThread* t : g_sync_waiters) t->cv.notify_one();
+}
 
 KThread* self_thread() { return t_self; }
+
+uint64_t heap_size() { return g_heap_size; }
 
 CPU& current_cpu() { return t_self->ctx; }
 
 uint64_t system_tick() { return plat::monotonic_ns() * 192 / 10000; }  // 19.2 MHz
+
+// The spin throttles below (a 0.5 ms nap for threads spinning on the tick or on yields) were made for Hades on phones.
+// Wonder's job system joins its workers by yielding in a loop: every join became >= 1 ms and the main thread spent
+// ~18% of its time in forced naps, holding the game near 26 fps (docs/nvn/DEBUG.md #37). NX_SPIN_NAPS=0/1 overrides.
+static bool spin_naps() {
+    static const bool on = [] {
+        if (const char* e = std::getenv("NX_SPIN_NAPS")) return e[0] == '1';
+        return std::strcmp(nx::game::kInfo.id, "hades") == 0;
+    }();
+    return on;
+}
+
+// nn::os::GetSystemTick. Hades' main loop (nnMain, main+2496fc) polls it without pause until its fixed step is
+// due: on the Switch that thread owns a core, on a phone it pins a big core at 100% (80% of that thread's time was
+// clock reads) and the heat lowers everyone's clocks. A thread asking again within 20 us, 50 times in a row, is
+// spinning: let it sleep 0.5 ms (the loop keeps sub-millisecond precision against a 16.6 ms step).
+// Hades only (spin_naps()): Wonder's job loops read the tick legitimately.
+static void hle_get_system_tick(CPU& c) {
+    if (KThread* t = spin_naps() ? t_self : nullptr) {
+        uint64_t now = plat::monotonic_ns();
+        if (now - t->last_tick_call < 20'000) {
+            if (++t->tick_spins >= 50) {
+                t->tick_spins = 0;
+                plat::sleep_ns(500'000);
+            }
+        } else {
+            t->tick_spins = 0;
+        }
+        t->last_tick_call = plat::monotonic_ns();
+    }
+    c.x[0] = system_tick();
+}
+NX_HLE("_ZN2nn2os13GetSystemTickEv", hle_get_system_tick);
 
 // ---- waiting --------------------------------------------------------------------------------------------------
 
 // Wait (with g_k held) until `self->wake` or timeout (ns, <0 = forever). Returns false on timeout.
 static bool block(std::unique_lock<std::recursive_mutex>& lk, KThread* self, int64_t timeout_ns) {
     if (timeout_ns < 0) {
-        g_cv.wait(lk, [&] { return self->wake; });
+        self->cv.wait(lk, [&] { return self->wake; });
         return true;
     }
     auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
-    return g_cv.wait_until(lk, until, [&] { return self->wake; });
+    return self->cv.wait_until(lk, until, [&] { return self->wake; });
+}
+
+// Wake a blocked thread (with g_k held).
+static void wake(KThread* t) {
+    t->wake = true;
+    t->wait_result = 0;
+    t->cv.notify_one();
 }
 
 static void remove(std::vector<KThread*>& v, KThread* t) { v.erase(std::remove(v.begin(), v.end(), t), v.end()); }
@@ -103,9 +159,7 @@ static void unlock_mutex(uint64_t addr) {
     }
     remove(g_mutex_waiters, next);
     store32(addr, next->wait_tag | (more ? kHandleWaitMask : 0));
-    next->wake = true;
-    next->wait_result = 0;
-    notify_all();
+    wake(next);
 }
 
 // ---- svc implementations --------------------------------------------------------------------------------------
@@ -140,24 +194,13 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
     g_cv_waiters.push_back(self);
     store32(key, 1);
     if (block(lk, self, timeout)) return self->wait_result;
-    // Timed out: still on the condvar? Then re-acquire the mutex ourselves.
-    if (std::find(g_cv_waiters.begin(), g_cv_waiters.end(), self) != g_cv_waiters.end()) {
-        remove(g_cv_waiters, self);
-        bool others = std::any_of(g_cv_waiters.begin(), g_cv_waiters.end(), [&](KThread* t) { return t->wait_key == key; });
-        if (!others) store32(key, 0);
-        for (;;) {
-            uint32_t v = load32(mutex);
-            if (v == 0) {
-                if (cas32(mutex, 0, tag)) return 0xEA01;
-                continue;
-            }
-            if (!(v & kHandleWaitMask) && !cas32(mutex, v, v | kHandleWaitMask)) continue;
-            break;
-        }
-        self->wake = false;
-        g_mutex_waiters.push_back(self);
-    }
-    block(lk, self, -1);
+    // Timed out (not handed the mutex): leave the condvar, or the mutex queue a signal moved us to, and return
+    // without the mutex. Like Horizon: the SDK re-locks it itself (TimedWait -> InternalCriticalSection::Enter);
+    // returning with it held made that Enter wait on ourselves forever.
+    remove(g_cv_waiters, self);
+    remove(g_mutex_waiters, self);
+    bool others = std::any_of(g_cv_waiters.begin(), g_cv_waiters.end(), [&](KThread* t) { return t->wait_key == key; });
+    if (!others) store32(key, 0);
     return 0xEA01;
 }
 
@@ -177,8 +220,7 @@ static uint32_t svc_signal_process_wide_key(uint64_t key, int32_t count) {
             uint32_t v = load32(t->wait_mutex);
             if (v == 0) {
                 if (!cas32(t->wait_mutex, 0, t->wait_tag)) continue;
-                t->wake = true;
-                t->wait_result = 0;
+                wake(t);
                 break;
             }
             if (!(v & kHandleWaitMask) && !cas32(t->wait_mutex, v, v | kHandleWaitMask)) continue;
@@ -188,11 +230,22 @@ static uint32_t svc_signal_process_wide_key(uint64_t key, int32_t count) {
     }
     bool others = std::any_of(g_cv_waiters.begin(), g_cv_waiters.end(), [&](KThread* t) { return t->wait_key == key; });
     if (!others) store32(key, 0);
-    notify_all();
     return 0;
 }
 
+// NX_TRACE_ADDR=<hex>: log every wait on and signal to that address (lost wakeups in the guest's sync objects).
+static uint64_t trace_addr() {
+    static uint64_t a = [] {
+        const char* e = std::getenv("NX_TRACE_ADDR");
+        return e ? std::strtoull(e, nullptr, 16) : 0ull;
+    }();
+    return a;
+}
+
 static uint32_t svc_wait_for_address(uint64_t addr, uint32_t type, int32_t value, int64_t timeout) {
+    if (addr == trace_addr())
+        log("arb: thread %x waits on %llx type %u value %d (memory %d) timeout %lld", t_self ? t_self->handle : 0,
+            (unsigned long long)addr, type, value, int32_t(load32(addr)), (long long)timeout);
     std::unique_lock lk(g_k);
     KThread* self = t_self;
     int32_t cur = int32_t(load32(addr));
@@ -231,15 +284,16 @@ static int wake_addr(uint64_t addr, int32_t count) {
             continue;
         }
         g_addr_waiters.erase(g_addr_waiters.begin() + i);
-        t->wake = true;
-        t->wait_result = 0;
+        wake(t);
         n++;
     }
-    notify_all();
     return n;
 }
 
 static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t value, int32_t count) {
+    if (addr == trace_addr())
+        log("arb: thread %x signals %llx type %u value %d count %d (memory %d)", t_self ? t_self->handle : 0,
+            (unsigned long long)addr, type, value, count, int32_t(load32(addr)));
     std::unique_lock lk(g_k);
     int waiters = int(std::count_if(g_addr_waiters.begin(), g_addr_waiters.end(), [&](KThread* t) { return t->wait_addr == addr; }));
     switch (type) {
@@ -282,6 +336,11 @@ static uint32_t svc_wait_synchronization(CPU& c, uint64_t handles, int32_t count
     auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout < 0 ? 0 : timeout);
     KThread* self = t_self;
     self->cancel = false;
+    g_sync_waiters.push_back(self);
+    struct Leave {
+        KThread* t;
+        ~Leave() { remove(g_sync_waiters, t); }
+    } leave{self};
     for (;;) {
         int i = ready();
         if (i >= 0) {
@@ -295,8 +354,8 @@ static uint32_t svc_wait_synchronization(CPU& c, uint64_t handles, int32_t count
         }
         if (timeout == 0) return 0xEA01;
         if (timeout < 0)
-            g_cv.wait(lk);
-        else if (g_cv.wait_until(lk, until) == std::cv_status::timeout && ready() < 0)
+            self->cv.wait(lk);
+        else if (self->cv.wait_until(lk, until) == std::cv_status::timeout && ready() < 0)
             return 0xEA01;
     }
 }
@@ -306,6 +365,10 @@ static uint32_t svc_wait_synchronization(CPU& c, uint64_t handles, int32_t count
 static void thread_main(void* p) {
     KThread* t = static_cast<KThread*>(p);
     t_self = t;
+    t->host_tid = plat::current_thread_id();
+    char name[16];
+    std::snprintf(name, sizeof name, "g%llx", (unsigned long long)t->id);
+    plat::set_thread_name(name);
     call(t->ctx, t->entry);
     // Returning from the entry point is like svcExitThread.
     std::lock_guard lk(g_k);
@@ -324,13 +387,110 @@ static std::shared_ptr<KThread> new_thread(uint64_t entry, uint64_t arg, uint64_
     // Static TLS block for the thread (what rtld and the libc provide on Horizon): the thread pointer, stored at
     // TLS region +0x1F0 where nn::os loads TPIDR_EL0 from. main's TLS is 0x440 bytes of .tbss at tp+0x10.
     uint64_t block = kernel_alloc(0x4000);
+    init_tls_block(block);  // main's .tdata initial values (Wonder: 16 bytes, {-1, 0}); the rest is .tbss, zero
     st<uint64_t>(t->tls + 0x1F0, block);
     t->ctx.tpidr = block;
     t->ctx.x[0] = arg;
     t->ctx.x[31] = sp;
     t->ctx.tpidrro = t->tls;
     t->handle = handle_add(t);
+    std::lock_guard al(g_all_lock);
+    g_all.push_back(t);
     return t;
+}
+
+// ---- hang report: when frames stop for a while, log what every guest thread is doing --------------------------
+
+static void report_threads() {
+    std::vector<std::shared_ptr<KThread>> all;
+    {
+        std::lock_guard al(g_all_lock);
+        for (auto& w : g_all)
+            if (auto t = w.lock()) all.push_back(t);
+    }
+    // The wait lists are read under the kernel lock when it can be had; a thread stuck holding it is itself news.
+    std::unique_lock lk(g_k, std::defer_lock);
+    for (int k = 0; k < 100 && !lk.try_lock(); k++) plat::sleep_ns(10'000'000);
+    if (!lk.owns_lock()) log("hang: kernel lock held by someone, reading without it");
+    auto in = [](const std::vector<KThread*>& v, KThread* t) { return std::find(v.begin(), v.end(), t) != v.end(); };
+    for (auto& t : all) {
+        if (!t->started || t->exited) continue;
+        const char* state = "running (guest code or a host call)";
+        uint64_t on = 0;
+        if (lk.owns_lock() && in(g_mutex_waiters, t.get())) {
+            state = "waits for mutex";
+            on = t->wait_mutex;
+        } else if (lk.owns_lock() && in(g_cv_waiters, t.get())) {
+            state = "waits on condvar";
+            on = t->wait_key;
+        } else if (lk.owns_lock() && in(g_addr_waiters, t.get())) {
+            state = "waits on address";
+            on = t->wait_addr;
+        }
+        log("hang: thread %llx (handle %x, entry %s): %s %llx", (unsigned long long)t->id, t->handle,
+            describe(t->entry).c_str(), state, (unsigned long long)on);
+        if (on && std::strcmp(state, "waits for mutex") == 0)
+            log("  mutex word %08x (owner handle %x)", load32(on), load32(on) & ~kHandleWaitMask);
+        backtrace(t->ctx);
+    }
+}
+
+static void watchdog(void*) {
+    uint64_t last = 0, since = plat::monotonic_ns();
+    bool reported = false;
+    for (;;) {
+        plat::sleep_ns(1'000'000'000);
+        // On request: a file named dump_threads in the data folder (e.g. adb shell touch .../dump_threads). Frames
+        // can keep coming while the game's logic is stuck (the render thread is separate).
+        std::string req = plat::data_root() + "/dump_threads";
+        if (FILE* f = plat::fopen_utf8(req, "rb")) {
+            std::fclose(f);
+            std::remove(req.c_str());
+            log("hang: thread dump requested");
+            report_threads();
+        }
+        // A file named profile (optionally holding a number of seconds): sample every guest thread's host pc into
+        // profile.txt next to it.
+        req = plat::data_root() + "/profile";
+        if (FILE* f = plat::fopen_utf8(req, "rb")) {
+            int seconds = 10;
+            if (std::fscanf(f, "%d", &seconds) != 1 || seconds <= 0) seconds = 10;
+            std::fclose(f);
+            std::remove(req.c_str());
+            std::vector<int64_t> tids;
+            std::vector<const uint64_t*> lrs;
+            std::vector<std::shared_ptr<KThread>> keep;  // alive while sampled
+            {
+                std::lock_guard al(g_all_lock);
+                for (auto& w : g_all)
+                    if (auto t = w.lock(); t && t->host_tid && !t->exited) {
+                        tids.push_back(t->host_tid);
+                        lrs.push_back(&t->ctx.x[30]);
+                        keep.push_back(t);
+                        log("profile: thread %llx is host tid %lld (entry %s)", (unsigned long long)t->id,
+                            (long long)t->host_tid, describe(t->entry).c_str());
+                    }
+            }
+            log("profile: sampling %zu threads for %d s", tids.size(), seconds);
+            bool ok = plat::profile(tids.data(), lrs.data(), tids.size(), seconds, plat::data_root() + "/profile.txt");
+            log("profile: %s", ok ? "written to profile.txt" : "not available on this platform");
+        }
+        uint64_t f = g_frame, now = plat::monotonic_ns();
+        if (f != last || plat::window_minimized()) {
+            last = f;
+            since = now;
+            reported = false;
+            continue;
+        }
+        if (f && !reported && now - since > 5'000'000'000ull) {
+            reported = true;
+            log("hang: no frame for 5 s after frame %llu; threads (two samples, 1 s apart):", (unsigned long long)f);
+            report_threads();
+            plat::sleep_ns(1'000'000'000);
+            log("hang: second sample");
+            report_threads();
+        }
+    }
 }
 
 uint32_t create_main_thread(uint64_t stack_size) {
@@ -339,10 +499,73 @@ uint32_t create_main_thread(uint64_t stack_size) {
     auto t = new_thread(0, 0, stack + stack_size, 44, 0);
     t->started = true;
     t_self = t.get();
+    t->host_tid = plat::current_thread_id();
     return t->handle;
 }
 
-void kernel_init() {}
+// Stalls: while no frame comes for more than 60 ms, sample where every guest thread is (its lr, every 5 ms); a
+// stall over 100 ms is logged with each thread's most frequent place, to tell what the frame waited for.
+// NX_THREAD_DUMP_AT=<seconds>: once, every guest thread's call chain (frame-pointer walk), to see what a stuck game
+// waits for.
+static void dump_threads() {
+    std::lock_guard al(g_all_lock);
+    for (auto& w : g_all) {
+        auto t = w.lock();
+        if (!t || !t->started || t->exited) continue;
+        std::string chain = describe(t->ctx.x[30]);
+        uint64_t fp = t->ctx.x[29];
+        for (int k = 0; k < 12 && fp && (fp & 7) == 0 && fp >= kModuleBase; k++) {
+            uint64_t lr = ld<uint64_t>(fp + 8);
+            if (!lr) break;
+            chain += " < " + describe(lr);
+            uint64_t next = ld<uint64_t>(fp);
+            if (next <= fp) break;
+            fp = next;
+        }
+        log("threads: %llx %s", (unsigned long long)t->id, chain.c_str());
+    }
+}
+
+static void stall_sampler(void*) {
+    static const char* dump_env = std::getenv("NX_THREAD_DUMP_AT");
+    uint64_t dump_at = dump_env ? plat::monotonic_ns() + uint64_t(std::atof(dump_env) * 1e9) : 0;
+    uint64_t last_frame = 0, since = plat::monotonic_ns();
+    std::map<std::pair<uint64_t, uint64_t>, uint32_t> hits;  // (thread id, guest lr) -> samples
+    for (;;) {
+        plat::sleep_ns(5'000'000);
+        uint64_t f = g_frame, now = plat::monotonic_ns();
+        if (dump_at && now >= dump_at) dump_threads(), dump_at = 0;
+        if (f != last_frame || plat::window_minimized()) {
+            uint64_t ms = (now - since) / 1'000'000;
+            if (last_frame && ms > 100 && !hits.empty()) {
+                log("stall: %llu ms without a frame after frame %llu; where the threads were:", (unsigned long long)ms,
+                    (unsigned long long)last_frame);
+                std::map<uint64_t, std::pair<uint64_t, uint32_t>> top;  // thread -> (lr, samples)
+                std::map<uint64_t, uint32_t> total;
+                for (auto& [k, n] : hits) {
+                    total[k.first] += n;
+                    if (n > top[k.first].second) top[k.first] = {k.second, n};
+                }
+                for (auto& [id, t] : top)
+                    log("  thread %llx: %s (%u of %u samples)", (unsigned long long)id, describe(t.first).c_str(),
+                        t.second, total[id]);
+            }
+            hits.clear();
+            last_frame = f;
+            since = now;
+            continue;
+        }
+        if (!f || now - since < 60'000'000) continue;
+        std::lock_guard al(g_all_lock);
+        for (auto& w : g_all)
+            if (auto t = w.lock(); t && t->started && !t->exited) hits[{t->id, t->ctx.x[30]}]++;
+    }
+}
+
+void kernel_init() {
+    plat::start_thread(watchdog, nullptr, 1ull << 20);
+    plat::start_thread(stall_sampler, nullptr, 1ull << 20);
+}
 
 // ---- dispatch -------------------------------------------------------------------------------------------------
 
@@ -368,40 +591,6 @@ void backtrace(CPU& c) {
         if (!lr) break;
         log("  #%-2d %s  (fp %llx)", k, describe(lr).c_str(), (unsigned long long)fp);
         fp = ld<uint64_t>(fp);
-    }
-}
-
-static uint64_t get_info(uint32_t type, uint32_t handle, uint64_t sub, uint32_t& rc) {
-    rc = 0;
-    switch (type) {
-        case 0: return 0xF;                         // AllowedCpuIdBitmask
-        case 1: return 0xFFFFFFFFFFFFFFFFull >> 0;  // AllowedThreadPriorityMask
-        case 2: return kAliasBase;
-        case 3: return kAliasSize;
-        case 4: return kHeapBase;
-        case 5: return kHeapMax;
-        case 6: return 0xCD500000;  // TotalMemoryAvailable (~3.2 GiB, like an application)
-        case 7: return g_heap_size + 0x4000000;
-        case 8: return 0;  // IsCurrentProcessBeingDebugged
-        case 9: return 0;  // ResourceLimit handle
-        case 10: return 0;  // IdleTickCount
-        case 11: return 0x1234567890ABCDEFull ^ sub;  // RandomEntropy
-        case 12: return kAddressSpaceBase;
-        case 13: return kAddressSpaceSize;
-        case 14: return kStackBase;
-        case 15: return kStackSize;
-        case 16: return 0;  // SystemResourceSizeTotal
-        case 17: return 0;
-        case 18: return 0x0100535012974000ull;  // ProgramId
-        case 20: return 0;  // UserExceptionContextAddress
-        case 21: return 0xCD500000;
-        case 22: return g_heap_size + 0x4000000;
-        case 23: return 1;  // IsApplication
-        case 0xF0000002: return 0;  // ThreadTickCount
-        default:
-            log("svcGetInfo: unknown type %u sub %llu", type, (unsigned long long)sub);
-            rc = 0xF001;
-            return 0;
     }
 }
 
@@ -464,17 +653,33 @@ void svc(CPU& c, uint32_t imm, uint64_t pc) {
             break;
         }
         case 0x0A: {  // ExitThread
-            std::lock_guard lk(g_k);
-            t_self->exited = true;
-            notify_all();
+            {
+                // The lock must be released before the host thread ends: pthread_exit runs no C++ destructors on
+                // macOS, so a lock_guard alive across it kept the kernel locked for good (Wonder, ~frame 50).
+                std::lock_guard lk(g_k);
+                t_self->exited = true;
+                notify_all();
+            }
             plat::exit_thread();
         }
         case 0x0B: {  // SleepThread(ns)
             int64_t ns = int64_t(c.x[0]);
-            if (ns <= 0)
+            if (ns > 0) {
+                plat::sleep_ns(ns);
+                return;
+            }
+            // Yield (0, -1, -2). On the Switch a thread yielding in a loop only takes time nobody else wants; here
+            // each yield is a syscall on a real core (the network thread polls a flag this way and burned a whole
+            // core, heating the phone). Past 32 yields in a row (each within 2 ms of the last), every yield sleeps
+            // 0.5 ms until the thread does something else for a while.
+            KThread* t = t_self;
+            uint64_t now = plat::monotonic_ns();
+            if (now - t->last_yield > 2'000'000) t->yields = 0;
+            if (!spin_naps() || ++t->yields <= 32)
                 plat::yield();
             else
-                plat::sleep_ns(ns);
+                plat::sleep_ns(500'000);
+            t->last_yield = plat::monotonic_ns();
             return;
         }
         case 0x0C: {  // GetThreadPriority(handle) -> prio
@@ -493,7 +698,8 @@ void svc(CPU& c, uint32_t imm, uint64_t pc) {
             c.x[2] = 0xF;
             break;
         }
-        case 0x0F:  // SetThreadCoreMask
+        case 0x0F:  // SetThreadCoreMask(handle, ideal core, mask)
+            rc = set_thread_core_mask(uint32_t(c.x[0]), int32_t(c.x[1]), c.x[2]);
             break;
         case 0x10:  // GetCurrentProcessorNumber
             c.x[0] = t_self ? uint32_t(std::max(t_self->core, 0)) : 0;
@@ -632,6 +838,12 @@ void svc(CPU& c, uint32_t imm, uint64_t pc) {
             c.x[2] = handle_add(r);
             break;
         }
+        case 0x51:  // MapTransferMemory(handle, addr, size, perm)
+            rc = map_transfer_memory(uint32_t(c.x[0]), c.x[1], c.x[2]);
+            break;
+        case 0x52:  // UnmapTransferMemory(handle, addr, size)
+            rc = unmap_transfer_memory(uint32_t(c.x[0]), c.x[1], c.x[2]);
+            break;
         default:
             log("unhandled svc %#x from %s (x0 %llx x1 %llx x2 %llx)", imm, describe(pc).c_str(),
                 (unsigned long long)c.x[0], (unsigned long long)c.x[1], (unsigned long long)c.x[2]);

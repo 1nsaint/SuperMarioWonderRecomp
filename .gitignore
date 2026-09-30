@@ -2,3 +2,12 @@
 private/
 __pycache__/
 *.pyc
+
+# Game dumps must never be committed, wherever they are dropped.
+*.xci
+*.xci.rar
+*.nsp
+*.nsz
+*.xcz
+*.rar
+*.keys

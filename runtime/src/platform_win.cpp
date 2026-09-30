@@ -1,9 +1,11 @@
 // Windows host: memory, threads, time, files, the game window (F11 / Alt+Enter fullscreen), XInput + keyboard,
 // XAudio2, the Vulkan loader and win32 surface, crash handler, hardware watchpoints (NX_WATCH) and main().
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <thread>
 
@@ -15,6 +17,7 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
 
+#include <nx/game.h>
 #include <nx/runtime.h>
 
 #include "kernel.h"
@@ -63,6 +66,20 @@ void exit_thread() { ExitThread(0); }
 void exit_process(int code) { ExitProcess(UINT(code)); }
 void sleep_ns(int64_t ns) { std::this_thread::sleep_for(std::chrono::nanoseconds(ns)); }
 void yield() { SwitchToThread(); }
+void set_thread_name(const char*) {}
+float default_render_scale() { return 1.0f; }
+void release_window(void*) {}
+uint64_t window_generation() { return 1; }
+void audio_pause(bool) {}
+
+std::string setting(const std::string& key) {
+    std::string env = "NX_";
+    for (char ch : key) env += char(std::toupper(static_cast<unsigned char>(ch)));
+    const char* v = std::getenv(env.c_str());
+    return v ? v : "";
+}
+int64_t current_thread_id() { return int64_t(GetCurrentThreadId()); }
+bool profile(const int64_t*, const uint64_t* const*, size_t, int, const std::string&) { return false; }
 
 uint64_t monotonic_ns() {
     static const LARGE_INTEGER f = [] {
@@ -84,6 +101,13 @@ FILE* fopen_utf8(const std::string& path, const char* mode) {
 }
 int64_t ftell64(FILE* f) { return _ftelli64(f); }
 int fseek64(FILE* f, int64_t off, int origin) { return _fseeki64(f, off, origin); }
+uint64_t read_at(FILE* f, int64_t off, void* buf, uint64_t size) {
+    _lock_file(f);  // seek + read as one step for this FILE
+    _fseeki64_nolock(f, off, SEEK_SET);
+    uint64_t n = _fread_nolock(buf, 1, size, f);
+    _unlock_file(f);
+    return n;
+}
 bool make_dirs(const std::string& path) {
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::u8path(path), ec);
@@ -94,10 +118,12 @@ void log_line(const char* line) { std::fprintf(stderr, "%s\n", line); }
 
 std::string data_root() {
     const char* r = std::getenv("NX_DATA_ROOT");
-    return r ? r : "private";
+    return r ? r : nx::game::kInfo.pc_data_root;
 }
 
 // ---- window ---------------------------------------------------------------------------------------------------
+
+static std::wstring widen(const char* s) { return std::wstring(s, s + std::strlen(s)); }  // ASCII titles
 // The game renders its swapchain at the render resolution; the window can be any size (the compositor scales).
 
 static constexpr DWORD kWindowed = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
@@ -147,7 +173,8 @@ static void window_thread(std::atomic<bool>* ready) {
     WNDCLASSW wc{};
     wc.lpfnWndProc = wndproc;
     wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"HadesRecomp";
+    const std::wstring cls = widen(nx::game::kInfo.title) + L"Recomp";  // tools/capture.ps1 finds the window by it
+    wc.lpszClassName = cls.c_str();
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
     // The render resolution's aspect (NX_RESOLUTION, default 16:9), about 80% of the screen height, centred.
@@ -159,7 +186,7 @@ static void window_thread(std::atomic<bool>* ready) {
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     int w = r.right - r.left, h = r.bottom - r.top;
     int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2, y = (sh - h) / 2;
-    g_window = CreateWindowW(wc.lpszClassName, L"Hades (Switch recomp)  -  F11: fullscreen", kWindowed,
+    g_window = CreateWindowW(wc.lpszClassName, (widen(nx::game::kInfo.title) + L" (Switch recomp)  -  F11: fullscreen").c_str(), kWindowed,
                              std::max(0, x), std::max(0, y), w, h, nullptr, nullptr, wc.hInstance, nullptr);
     if (const char* f = std::getenv("NX_FULLSCREEN"); f && *f == '1') toggle_fullscreen(g_window);
     SetForegroundWindow(g_window);
@@ -189,9 +216,16 @@ void window_size(uint32_t& w, uint32_t& h) {
     h = uint32_t(r.bottom - r.top);
 }
 
+void screen_size(uint32_t& w, uint32_t& h) { window_size(w, h); }
+
 // ---- input: XInput pad 0 + keyboard ---------------------------------------------------------------------------
 
 static bool key(int vk) { return g_window && GetForegroundWindow() == g_window && (GetAsyncKeyState(vk) & 0x8000); }
+
+bool headless() {  // NX_HEADLESS (platform.h)
+    static const bool on = std::getenv("NX_HEADLESS") != nullptr;
+    return on;
+}
 
 void read_pad(PadState& p) {
     XINPUT_STATE xs{};
@@ -351,8 +385,8 @@ uint64_t exe_va(void* p) { return uint64_t(p) - uint64_t(GetModuleHandleW(nullpt
 
 LONG WINAPI watch_handler(EXCEPTION_POINTERS* e) {
     if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !g_watch) return EXCEPTION_CONTINUE_SEARCH;
-    nx::log("WATCH: %llx written (now %llx) at hades.exe+%llx (tools/symbolize.py)", (unsigned long long)g_watch,
-            (unsigned long long)nx::ld<uint64_t>(g_watch), (unsigned long long)exe_va(e->ExceptionRecord->ExceptionAddress));
+    nx::log("WATCH: %llx written (now %llx) at %s.exe+%llx (tools/symbolize.py)", (unsigned long long)g_watch,
+            (unsigned long long)nx::ld<uint64_t>(g_watch), nx::game::kInfo.id, (unsigned long long)exe_va(e->ExceptionRecord->ExceptionAddress));
     dump_guest(nx::current_cpu());
     static int hits = 0;
     if (++hits >= 30) e->ContextRecord->Dr7 = 0;
@@ -362,7 +396,7 @@ LONG WINAPI watch_handler(EXCEPTION_POINTERS* e) {
 LONG WINAPI crash_handler(EXCEPTION_POINTERS* e) {
     auto* r = e->ExceptionRecord;
     uint64_t info = r->NumberParameters > 1 ? r->ExceptionInformation[1] : 0;
-    nx::log("CRASH: exception %08lx at hades.exe+%llx (tools/symbolize.py), data address %llx", r->ExceptionCode,
+    nx::log("CRASH: exception %08lx at %s.exe+%llx (tools/symbolize.py), data address %llx", r->ExceptionCode, nx::game::kInfo.id,
             (unsigned long long)exe_va(r->ExceptionAddress), (unsigned long long)info);
     dump_guest(nx::current_cpu());
     return EXCEPTION_EXECUTE_HANDLER;

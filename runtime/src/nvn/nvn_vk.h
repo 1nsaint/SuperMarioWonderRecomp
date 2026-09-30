@@ -1,0 +1,137 @@
+// The Vulkan side of NVN, shared between nvn_vk.cpp (device, images, submit, present) and nvn_draw.cpp (pipelines,
+// resources, draws). Everything here runs under the GPU lock taken by gpu_submit / gpu_present.
+#pragma once
+
+#include <string>
+#include <vector>
+
+#include "nvn.h"
+#include "vk_gen.h"
+
+namespace nx::nvn {
+
+struct GpuImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;  // every level and layer
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    uint32_t width = 0, height = 0, levels = 1, layers = 1, depth = 1;  // depth: 3D images only
+    VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    bool rendered = false;  // written by the GPU: never re-uploaded from guest memory
+    bool uploaded = false;  // filled from the texture's pool memory
+    VkComponentMapping swizzle{};  // for sampling (attachment views stay identity)
+    bool storage = false;          // created with VK_IMAGE_USAGE_STORAGE_BIT (compute shaders write it)
+    // An R8 texture always read as (1, 1, 1, R) (a glyph cache): stored as RGBA8 (255, 255, 255, R) and sampled
+    // without swizzle. MoltenVK returned alpha 0 for that view swizzle on a 2D-array view, so all text was invisible.
+    bool alpha_from_r = false;
+    uint32_t nvn_format = 0;  // the texture's NVN format
+};
+
+VkDevice vk_device();
+bool vk_depth_clip_control();
+// The core features the device was created with (all the GPU has): depthClamp, depthBiasClamp, depthBounds, ...
+const VkPhysicalDeviceFeatures& vk_features();
+VkPhysicalDevice vk_physical();
+uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want);
+
+// The image behind an NVN texture (guest NVNtexture*), made on first use.
+GpuImage* image_of(uint64_t texture);
+void transition(VkCommandBuffer cb, GpuImage& img, VkImageLayout to);
+
+// Per-submit upload memory (host visible, coherent), reset at every submit: data the replayed commands read from
+// guest memory is copied here at replay time (vertex, index, uniform, storage data, texture staging).
+struct Upload {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    uint64_t offset = 0;
+    uint8_t* ptr = nullptr;
+};
+Upload upload_alloc(uint64_t size, uint64_t align);
+Upload upload(const void* data, uint64_t size, uint64_t align);
+
+// Descriptor sets for this submit (freed when it completes).
+VkDescriptorSet descriptor_set(VkDescriptorSetLayout layout);
+VkDescriptorPool make_descriptor_pool();
+
+// A lost device or a submit running past 2 s: the process ends at once (docs/nvn/DEBUG.md #22).
+[[noreturn]] void gpu_hung(const char* why);
+
+// A compute shader's storage buffer, copied back to guest memory once the submit completed: (upload copy, guest
+// address, size).
+struct WriteBack {
+    uint8_t* from;
+    uint8_t* to;
+    uint64_t size;
+};
+std::vector<WriteBack> draw_take_write_backs();  // nvn_draw.cpp: this submit's, for an asynchronous submit
+
+// nvn_frames.cpp: asynchronous submission (NX_ASYNC_GPU). Slots of command buffer, fence, descriptor pool and ring
+// stretch; retired (fence waited, write-backs copied) on reuse, when the ring is full, or when the game waits.
+bool async_gpu();
+void frame_init(VkCommandPool pool, VkBuffer ring, uint8_t* ring_ptr, uint64_t ring_size);
+VkCommandBuffer frame_begin(bool replay);  // replay: submits with write-backs retired first
+VkSemaphore frame_acquire_semaphore();
+VkSemaphore frame_rendered_semaphore(uint32_t image);
+void frame_submit(VkSemaphore wait, VkSemaphore signal, std::vector<WriteBack> write_backs, bool wait_done);
+void frame_wait_all();
+uint64_t frame_upload_used();
+uint64_t frame_take_wait_ns();
+Upload frame_upload_alloc(uint64_t size, uint64_t align);
+VkDescriptorSet frame_descriptor_set(VkDescriptorSetLayout layout);
+void free_retired_images(uint64_t completed);
+// A GPU-written image of a destroyed texture with the same memory and shape (nvn_frames.cpp), or null.
+std::shared_ptr<GpuImage> reuse_image(const Texture& t);  // images of textures destroyed before submit `completed` + 1
+
+// nvn_debug.cpp: NX_DUMP_FRAMES, the presented texture read back (recorded into the present's command buffer, written
+// after its fence).
+uint32_t frame_dump_every();
+bool frame_dump_record(VkCommandBuffer cb, GpuImage& img);
+void frame_dump_write(const GpuImage& img, uint64_t frame);
+bool debug_snapshots_pending();  // NX_SNAP_*: this submit recorded snapshots (it is then waited for)
+
+// nvn_draw.cpp: replays one draw-related command; ends the render pass it may have open when asked.
+struct Targets {
+    uint64_t colors[8] = {};
+    uint32_t color_count = 0;
+    uint64_t depth = 0;
+    TargetViews views;  // level and layer of each (index 8: depth)
+};
+void draw_begin_submit();
+void draw_end_submit();  // after the GPU finished the submit
+void draw_log_stats();
+void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const Targets& targets);
+// reason (counted in the `nvn passes ended` log): 0 submit end, 1 draw, 2 dispatch, 3 clear of other targets,
+// 4 clear larger than the pass, 5 copy, 6 snapshot, 7 SetRenderTargets (NX_TARGETS_BREAK).
+void draw_end_rendering(VkCommandBuffer cb, int reason = 0);  // before transfers (clears, copies, present) and at the end
+// ClearColor / ClearDepthStencil inside the render pass of the current targets (nvn_draw.cpp).
+void draw_clear(VkCommandBuffer cb, const Targets& targets, const Cmd& c);
+// nvn_replay.cpp: a command list into `cb` (`depth`: CallList nesting).
+void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth);
+
+void replay_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list);  // nvn_copy.cpp: texture copies
+void forget_image_views(const GpuImage& img);
+// nvn_debug.cpp: NX_SNAP_DRAWS mid-frame snapshots of colour target 0.
+bool debug_snap_wanted(uint64_t draw);
+// nvn_debug.cpp: NX_ZERO_DRAWS, shader pairs whose draws produce no pixel.
+bool zero_draws_on();
+void zero_draws_begin_submit(VkCommandBuffer cb);
+bool zero_draws_begin(VkCommandBuffer cb, const std::string& label);
+void zero_draws_end(VkCommandBuffer cb);
+void zero_draws_collect();
+void zero_draws_log();
+void debug_snapshot(VkCommandBuffer cb, GpuImage& img, uint64_t draw);
+void debug_snapshots_write();  // nvn_pipeline.cpp: before an image is freed
+
+// nvn_debug.cpp: GPU time per render pass (NX_GPU_PROFILE=1).
+bool gpu_profile_on();
+void gpu_profile_begin(VkCommandBuffer cb);
+void gpu_profile_mark(VkCommandBuffer cb, const std::string& label);
+void gpu_profile_collect();
+void gpu_profile_log(uint64_t frames);
+
+namespace replay {
+void dedup_reset();  // nvn_dedup.cpp
+}
+
+}  // namespace nx::nvn

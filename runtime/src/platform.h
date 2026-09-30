@@ -20,22 +20,37 @@ void start_thread(ThreadFn fn, void* arg, size_t stack_size);
 [[noreturn]] void exit_process(int code);
 void sleep_ns(int64_t ns);
 void yield();
+void set_thread_name(const char* name);
+int64_t current_thread_id();  // the host OS thread id
+// Samples the given threads (thread CPU time, 1 kHz) for `seconds`: host pc, a few host frames and the guest lr
+// (read through guest_lr[k], the thread's x30). Writes one line per sample to `path`:
+//   <tid> <guest lr> <module>:<offset> [<module>:<offset> ...]   (host pc first, then callers)
+// False where not implemented.
+bool profile(const int64_t* tids, const uint64_t* const* guest_lr, size_t count, int seconds, const std::string& path);  // the host thread's name (debuggers, profilers, top)
 uint64_t monotonic_ns();
 
 // ---- files ----
 FILE* fopen_utf8(const std::string& path, const char* mode);
 int64_t ftell64(FILE* f);
 int fseek64(FILE* f, int64_t off, int origin);
+// Positional read, safe with other threads reading the same FILE (no shared file position). Bytes read.
+uint64_t read_at(FILE* f, int64_t off, void* buf, uint64_t size);
 bool make_dirs(const std::string& path);
 
 // ---- output ----
 void log_line(const char* line);  // stderr / logcat
-std::string data_root();          // where private/ lives ("private" on PC, the app's external files dir on Android)
+std::string data_root();
+std::string setting(const std::string& key);  // a player setting: config.txt (Android), NX_<KEY> (PC); "" if unset          // where private/ lives ("private" on PC, the app's external files dir on Android)
 
 // ---- display, input, audio ----
-void* create_window();       // native window handle for the Vulkan surface (HWND / ANativeWindow*)
+void* create_window();       // native window handle for the Vulkan surface (HWND / ANativeWindow*), kept alive
+void release_window(void* w);  // done with a handle from create_window
+uint64_t window_generation();  // changes when the OS replaced the window (Android: app back from the background)
 bool window_minimized();     // no surface to draw to (minimized / app in background)
 void window_size(uint32_t& w, uint32_t& h);  // client size in pixels
+void screen_size(uint32_t& w, uint32_t& h);  // the display's own size, landscape (Android; the window on PC)
+// The render scale to use when the player sets none: 1 on fast GPUs, less on slower ones (Android).
+float default_render_scale();
 
 // NpadButton bits (Nintendo layout: A is the right face button, B the bottom one).
 enum : uint64_t {
@@ -52,12 +67,19 @@ struct PadState {
     int32_t lx = 0, ly = 0, rx = 0, ry = 0;
 };
 void read_pad(PadState& p);  // player 1
+// NX_HEADLESS=1: no visible window (it is created hidden) and nothing presented; frames still render and
+// NX_DUMP_FRAMES still writes them. For unattended test runs.
+bool headless();
+// Ends the process when its memory footprint passes NX_MEM_LIMIT_GB (default 8); logs it every 30 s (macOS).
+void start_memory_guard();
+void input_script(PadState& p);  // NX_INPUT_SCRIPT presses (input_script.cpp), for unattended runs
 
 // Audio: s16 stereo 48 kHz. `done` is called (on any thread) when a submitted buffer has been played.
 using AudioDone = void (*)(void* ctx);
 bool audio_open(AudioDone done);
 bool audio_submit(const void* data, size_t bytes, void* ctx);  // false: no device (caller paces itself)
 uint32_t audio_queued();
+void audio_pause(bool paused);  // app in the background
 
 // Vulkan: the loader's vkGetInstanceProcAddr and the surface extension of this platform.
 void* vulkan_get_instance_proc_addr();
