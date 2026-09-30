@@ -38,6 +38,7 @@ struct PipelineKey {
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
     uint32_t depth_clamp = 0;  // SetDepthClamp (applied only where the device has the depthClamp feature)
     uint32_t ufloat_colors = 0;  // bit k: colour target k is R11G11B10F (no alpha: destination alpha reads 1)
+    uint32_t alpha_to_coverage = 0;  // BindMultisampleState (G7)
 };
 VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout);
 

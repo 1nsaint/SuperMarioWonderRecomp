@@ -572,3 +572,18 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
       - `NX_R11G11B10_RAW=1` restores the old behaviour.
     - Course and character select unchanged except where they should be (Peach lit, no upload short); course
       ~44 fps.
+52. **1D textures, masked clears, alpha to coverage, copies within one image (GLITCH-PLAN G6/G7/G8/G10).**
+    - **1D textures.** NVN 1D and 1D-array textures (targets 0/3) are 2D / 2D-array images of height 1. Ryujinx samples
+      1D as 2D, so a Vulkan 1D image's 2D view was refused and those draws read the black dummy. `NX_1D_IMAGES=1`
+      restores the old images.
+    - **Masked clears.** A colour clear with some channels masked off runs as a fullscreen draw with that write mask
+      (`nvn_mask_clear.cpp`, two tiny glslc shaders). `NX_CLEARS_NO_MASK=1` restores the old clear. No course clear
+      used a partial mask in the test runs.
+    - **Scissored clears are off.** Clipping clears to the bound scissor left whole regions of the course uncleared
+      (huge black and white shapes); the character select was unaffected. `NX_CLEARS_SCISSOR=1` turns it back on for
+      study.
+    - **`nvnCommandBufferBindMultisampleState`** is no longer a stub. Its alpha-to-coverage enable goes to the
+      pipeline key and `alphaToCoverageEnable` (`NX_NO_ALPHA_TO_COVERAGE=1`).
+    - **Copies within one image.** A copy between two subresources of one image (two texture objects sharing it,
+      #36) is no longer dropped; it runs in GENERAL layout with explicit barriers (`NX_COPY_NO_SAME_IMAGE=1`).
+    - "Too bad!" is still drawn hollow: not a masked clear (none happened). Next suspect: the glyph pass itself.

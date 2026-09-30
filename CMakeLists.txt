@@ -92,6 +92,7 @@ set(NX_RUNTIME_SOURCES
     runtime/src/nvn/nvn_spirv_patch.cpp
     runtime/src/nvn/nvn_draw.cpp
     runtime/src/nvn/nvn_clears.cpp
+    runtime/src/nvn/nvn_mask_clear.cpp
     runtime/src/nvn/nvn_draw_trace.cpp
     runtime/src/vk_bridge.cpp
     runtime/src/vk_gen.cpp

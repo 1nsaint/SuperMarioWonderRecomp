@@ -102,8 +102,10 @@ bool identity(const VkComponentMapping& m) {
            id(m.a, VK_COMPONENT_SWIZZLE_A);
 }
 
+
 // Views Metal accepts of an image: cubes only of cube images with 6 layers per cube, 3D only of 3D images (a 2D
-// view of a 3D image is for rendering a slice), 1D of 1D. A shader declaring another shape than the texture it gets
+// view of a 3D image is for rendering a slice), 1D of 1D (only with NX_1D_IMAGES: NVN 1D textures are 2D images of
+// height 1, since the translator samples them as 2D, G8). A shader declaring another shape than the texture it gets
 // (a samplerCube given a 2D texture) reads the dummy instead: Metal aborts on the view.
 bool view_compatible(const GpuImage& img, VkImageViewType type, uint32_t layers) {
     bool cube_img = img.view_type == VK_IMAGE_VIEW_TYPE_CUBE || img.view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
@@ -293,6 +295,12 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
 
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    // BindMultisampleState's alpha to coverage (G7; single-sampled targets: alpha under 0.5 drops the fragment),
+    // logged once per pipeline that has it. NX_NO_ALPHA_TO_COVERAGE=1: off, as when it was a stub.
+    static const bool no_a2c = std::getenv("NX_NO_ALPHA_TO_COVERAGE") != nullptr;
+    ms.alphaToCoverageEnable = key.alpha_to_coverage && !no_a2c ? VK_TRUE : VK_FALSE;
+    if (key.alpha_to_coverage)
+        log("nvn/vk: alpha to coverage%s: fs %s", no_a2c ? " (off)" : "", key.fs ? key.fs->hash.c_str() : "-");
 
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     bool has_depth = key.depth_format != VK_FORMAT_UNDEFINED;

@@ -5,6 +5,10 @@
 // same area as the quad). Anything else first (a draw on other targets or sampling a cleared image, a dispatch, a
 // copy, the submit's end) clears it in a pass of its own with no draw (docs/nvn/DEBUG.md #47).
 // NX_EAGER_CLEARS=1: the old way (bisecting).
+// Clears are scissored and channel-masked, as on Maxwell (G6): a clear inside a scissor smaller than its target, or
+// with some channels masked off, is never a loadOp; it runs in the pass, with vkCmdClearAttachments on the scissor
+// rectangle, or, masked, a fullscreen draw with that write mask (nvn_mask_clear.cpp). NX_CLEARS_SCISSOR=1 (off: it broke the course) and
+// NX_CLEARS_NO_MASK=1: whole-target and all-channel clears, the old way (bisecting).
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
@@ -29,6 +33,7 @@ struct Pending {
 };
 Pending g_pending;
 uint64_t g_deferred = 0, g_as_load = 0, g_alone = 0;
+uint64_t g_scissored = 0, g_masked = 0, g_mask_fallback = 0, g_scissor_lost = 0;  // G6
 
 // begin_rendering's render area for these targets: the smallest attachment at its level.
 VkExtent2D targets_extent(const Targets& t) {
@@ -124,6 +129,9 @@ void clears_begin_submit() { g_pending.on = false; }
 void clears_log() {
     log("nvn clears: %llu deferred to the next pass on their targets, %llu of those passes with draws, %llu alone",
         (unsigned long long)g_deferred, (unsigned long long)g_as_load, (unsigned long long)g_alone);
+    log("nvn clears: %llu scissored (%llu of those outside the pass: whole target), %llu channel-masked (%llu of those "
+        "all channels: integer target or no pipeline)", (unsigned long long)g_scissored,
+        (unsigned long long)g_scissor_lost, (unsigned long long)g_masked, (unsigned long long)g_mask_fallback);
 }
 
 // Clears run inside the render pass of the current targets (vkCmdClearAttachments), or become the loadOps of the
@@ -150,7 +158,25 @@ void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
     VkExtent2D full{std::max(1u, img->width >> level), std::max(1u, img->height >> level)};
     static const bool transfer = std::getenv("NX_TRANSFER_CLEARS") != nullptr;  // bisecting: whole-image clears
     static const bool eager = std::getenv("NX_EAGER_CLEARS") != nullptr;
-    if (!transfer && !eager && !pass_open_on(t)) {
+    // Off unless NX_CLEARS_SCISSOR=1: clipping clears to the bound scissor broke the course (whole regions left
+    // uncleared: huge black/white shapes, DEBUG.md #52), so NVN's clears are not scissored the way this reads it.
+    static const bool no_scissor = std::getenv("NX_CLEARS_SCISSOR") == nullptr;
+    static const bool no_mask = std::getenv("NX_CLEARS_NO_MASK") != nullptr;
+    // The part of the target the clear covers: the scissor (pass coordinates, as the draws') within the target.
+    VkRect2D rect{{0, 0}, full};
+    if (!no_scissor && replay::g_state.has_scissor) {
+        const int32_t* s = replay::g_state.scissor;
+        int64_t x0 = std::max(0, s[0]), y0 = std::max(0, s[1]);
+        int64_t x1 = std::min<int64_t>(int64_t(s[0]) + std::max(0, s[2]), full.width);
+        int64_t y1 = std::min<int64_t>(int64_t(s[1]) + std::max(0, s[3]), full.height);
+        if (x1 <= x0 || y1 <= y0) return;  // nothing of the target inside the scissor
+        rect = {{int32_t(x0), int32_t(y0)}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+    }
+    bool scissored =
+        rect.offset.x || rect.offset.y || rect.extent.width < full.width || rect.extent.height < full.height;
+    bool masked = color && !no_mask && (c.mask & 0xF) != 0xF;
+    g_scissored += scissored, g_masked += masked;
+    if (!transfer && !eager && !scissored && !masked && !pass_open_on(t)) {
         VkExtent2D e = targets_extent(t);
         if (full.width <= e.width && full.height <= e.height) {  // the pass covers it: a loadOp can clear it
             pass_end_only(cb, 3);  // other targets' pass, and their pending clears
@@ -174,8 +200,10 @@ void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
     }
     VkExtent2D pe = pass_extent();
     if (transfer && !color) a.aspectMask = img->aspect;  // the old clears ignored the masks
-    if (transfer || full.width > pe.width || full.height > pe.height) {
+    bool in_pass = rect.offset.x + rect.extent.width <= pe.width && rect.offset.y + rect.extent.height <= pe.height;
+    if (transfer || !in_pass) {
         // The pass is smaller than this target (a larger shared depth buffer): clear all of it, outside the pass.
+        g_scissor_lost += scissored, g_mask_fallback += masked;
         draw_end_rendering(cb, 4);
         transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);
         VkImageSubresourceRange r{a.aspectMask, std::min<uint32_t>(level, img->levels - 1), 1,
@@ -186,7 +214,12 @@ void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
             p_vkCmdClearDepthStencilImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &a.clearValue.depthStencil, 1, &r);
         return;
     }
-    VkClearRect r{{{0, 0}, pe}, 0, 1};
+    if (masked && mask_clear(cb, t, c.n, c.mask & 0xF, c.f, rect)) {
+        pass_mark_written(1u << c.n);
+        return;
+    }
+    g_mask_fallback += masked;
+    VkClearRect r{rect, 0, 1};  // unscissored: all of the target, which is the pass's area
     p_vkCmdClearAttachments(cb, 1, &a, 1, &r);
     pass_mark_written(color ? 1u << c.n : 1u << 8);  // a later draw sampling it needs a fresh pass
 }

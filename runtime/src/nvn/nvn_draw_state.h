@@ -37,6 +37,7 @@ struct State {
     uint8_t stencil_ref[2] = {0, 0}, stencil_compare_mask[2] = {0xFF, 0xFF}, stencil_write_mask[2] = {0xFF, 0xFF};
     float bias_factor = 0, bias_units = 0, bias_clamp = 0;  // SetPolygonOffsetClamp
     bool depth_bounds = false, depth_clamp = false;
+    bool alpha_to_coverage = false;  // BindMultisampleState (G7)
     float depth_bounds_range[2] = {0, 1};
 };
 

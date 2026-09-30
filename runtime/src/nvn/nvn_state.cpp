@@ -214,6 +214,18 @@ void BindPolygonState(CPU& c) {
     record(c.x[0], cmd, &s, sizeof s);
 }
 
+// BindMultisampleState(cmd, const NVNmultisampleState*) (G7; it was a trace stub). Render targets here are single
+// sampled, so only alpha to coverage is decoded (through the driver's getter, like the other state objects); sample
+// counts, coverage modulation and the alpha-to-coverage dither are not.
+void BindMultisampleState(CPU& c) {
+    uint64_t state = c.x[1];
+    Cmd cmd{Cmd::BindMultisampleState};
+    if (uint64_t fn = state ? real_proc(c, "nvnMultisampleStateGetAlphaToCoverageEnable") : 0)
+        cmd.n = uint32_t(guest_call(c, fn, {state}) & 1);
+    log_state("multisample", cmd.n);
+    record(c.x[0], cmd);
+}
+
 void SetBlendColor(CPU& c) {
     Cmd cmd{Cmd::SetBlendColor};
     if (c.x[1]) std::memcpy(cmd.f, reinterpret_cast<const void*>(c.x[1]), 16);
@@ -298,6 +310,7 @@ NX_HLE("nvnCommandBufferBindColorState", BindColorState);
 NX_HLE("nvnCommandBufferBindChannelMaskState", BindChannelMaskState);
 NX_HLE("nvnCommandBufferBindDepthStencilState", BindDepthStencilState);
 NX_HLE("nvnCommandBufferBindPolygonState", BindPolygonState);
+NX_HLE("nvnCommandBufferBindMultisampleState", BindMultisampleState);
 NX_HLE("nvnCommandBufferSetBlendColor", SetBlendColor);
 NX_HLE("nvnCommandBufferSetDepthRange", SetDepthRange);
 NX_HLE("nvnCommandBufferDrawArrays", DrawArrays);

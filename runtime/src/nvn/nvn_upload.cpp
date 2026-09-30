@@ -57,6 +57,12 @@ bool copies_fit(const Texture& t, const VkBufferImageCopy* r, uint32_t n, uint64
 
 }  // namespace
 
+// NX_1D_IMAGES=1: NVN 1D textures as Vulkan 1D images again (they are 2D of height 1: Ryujinx samples 1D as 2D, G8).
+bool vk_1d_images() {
+    static const bool on = std::getenv("NX_1D_IMAGES") != nullptr;
+    return on;
+}
+
 void clear_image(VkCommandBuffer cb, GpuImage& img, bool magenta) {
     transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkImageSubresourceRange r{img.aspect, 0, img.levels, 0, img.layers};

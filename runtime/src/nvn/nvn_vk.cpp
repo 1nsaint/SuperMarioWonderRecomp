@@ -351,10 +351,11 @@ GpuImage* image_of(uint64_t guest) {
                   : aspect == 1 ? VK_IMAGE_ASPECT_DEPTH_BIT
                   : aspect == 2 ? VK_IMAGE_ASPECT_STENCIL_BIT
                                 : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    bool one_d = vk_1d_images() && (t->target == 0 || t->target == 3);  // else 2D images of height 1 (G8)
     img->width = std::max(1u, t->width);
-    img->height = std::max(1u, t->height);
+    img->height = (t->target == 0 || t->target == 3) && !one_d ? 1u : std::max(1u, t->height);
     img->levels = std::max(1u, t->levels);
-    uint32_t depth = std::max(1u, t->depth);
+    uint32_t depth = std::max(1u, t->target == 3 && !one_d && t->depth <= 1 ? t->height : t->depth);  // GL-style layers
     bool is3d = t->target == 2, cube = t->target == 8 || t->target == 9;
     bool array = t->target == 3 || t->target == 4 || t->target == 6 || t->target == 9;
     img->layers = is3d ? 1 : (array || cube) ? depth : 1;
@@ -364,13 +365,12 @@ GpuImage* image_of(uint64_t guest) {
     uint32_t largest = std::max({img->width, img->height, img->depth}), fit = 1;
     while (largest >>= 1) fit++;
     img->levels = std::min(img->levels, fit);
-    img->view_type = is3d                             ? VK_IMAGE_VIEW_TYPE_3D
-                     : t->target == 9                  ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
-                     : cube                            ? VK_IMAGE_VIEW_TYPE_CUBE
-                     : t->target == 0                  ? VK_IMAGE_VIEW_TYPE_1D
-                     : t->target == 3                  ? VK_IMAGE_VIEW_TYPE_1D_ARRAY
-                     : (t->target == 4 || t->target == 6) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
-                                                         : VK_IMAGE_VIEW_TYPE_2D;
+    img->view_type = is3d             ? VK_IMAGE_VIEW_TYPE_3D
+                     : t->target == 9 ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
+                     : cube           ? VK_IMAGE_VIEW_TYPE_CUBE
+                     : one_d          ? (t->target == 0 ? VK_IMAGE_VIEW_TYPE_1D : VK_IMAGE_VIEW_TYPE_1D_ARRAY)
+                     : array          ? VK_IMAGE_VIEW_TYPE_2D_ARRAY  // 1D array (G8), 2D array, 2D MS array
+                                      : VK_IMAGE_VIEW_TYPE_2D;
     if (img->format == VK_FORMAT_UNDEFINED) {
         log("nvn/vk: texture %llx has format %#x with no Vulkan equivalent", (unsigned long long)guest, t->format);
         img->format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -389,7 +389,7 @@ GpuImage* image_of(uint64_t guest) {
     ci.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : is3d ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0;
     // Colour images may be viewed in another format of the same size (an sRGB view of RGBA8, docs/nvn/DEBUG.md #29).
     if (aspect == 0 && !img->alpha_from_r) ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-    ci.imageType = is3d ? VK_IMAGE_TYPE_3D : t->target == 0 || t->target == 3 ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
+    ci.imageType = is3d ? VK_IMAGE_TYPE_3D : one_d ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
     ci.format = img->format;
     ci.extent = {img->width, ci.imageType == VK_IMAGE_TYPE_1D ? 1 : img->height, is3d ? depth : 1};
     ci.mipLevels = img->levels;

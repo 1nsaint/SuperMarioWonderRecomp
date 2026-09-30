@@ -41,6 +41,9 @@ uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want);
 
 // The image behind an NVN texture (guest NVNtexture*), made on first use.
 GpuImage* image_of(uint64_t texture);
+// NX_1D_IMAGES=1 (bisecting, nvn_pipeline.cpp): NVN 1D and 1D-array textures as Vulkan 1D images, the old way. By
+// default they are 2D / 2D-array images of height 1, which the translated shaders (1D sampled as 2D) can view (G8).
+bool vk_1d_images();
 void transition(VkCommandBuffer cb, GpuImage& img, VkImageLayout to);
 
 // Per-submit upload memory (host visible, coherent), reset at every submit: data the replayed commands read from
@@ -136,6 +139,10 @@ bool pass_open_on(const Targets& t);
 VkExtent2D pass_extent();
 void pass_begin(VkCommandBuffer cb, const Targets& t);
 void pass_mark_written(uint32_t bits);
+// nvn_mask_clear.cpp: colour target `slot` of the open pass on `t` cleared to `rgba` in `rect`, only the channels in
+// `mask` (bit 0 r .. 3 a) written, by a fullscreen draw. False (nothing recorded) for integer targets or no pipeline.
+bool mask_clear(VkCommandBuffer cb, const Targets& t, uint32_t slot, uint32_t mask, const float rgba[4],
+                const VkRect2D& rect);
 // nvn_replay.cpp: a command list into `cb` (`depth`: CallList nesting).
 void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth);
 
