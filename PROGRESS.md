@@ -18,10 +18,28 @@ NVN implemented over Vulkan (MoltenVK).
 | N4 textures and samplers | #11 | **working**: untiling + upload (BNTX block heights), ASTC/BCn, samplers, swizzles, views (levels/layers) |
 | N5 Maxwell shaders → SPIR-V | #12 | **done**: 12,717/12,717 blocks offline + the 34 embedded in main; runtime cache by hash |
 | N6 pipeline state and draws | #13 | **working**: pipelines, descriptor sets, dynamic rendering, texture views; **the title screen renders correctly** |
-| N7 whole game, performance | #14 | **in progress**: title, menus, world map and the first course render correctly; 60 fps in menus, 44-46 in the course (52-57 handheld) |
+| N7 whole game, performance | #14 | **in progress**: title, menus, world map and the first course render correctly; 60 fps in menus and in the course (headless, pipelined fences) |
 | NA AudioRenderer (`audren:u`) | — (new) | **renders in process** (the sdk's own server + DSP code, DFC); output to the Mac next |
 
 ## Log
+
+### 2026-09-30 (evening): 60 fps in the course (headless), W7 fixes
+
+![Course at 60 fps](docs/media/wonder/38-course-60fps-pipelined.png)
+
+- **60.0 fps steady** in course 1-1 headless (it was 48-58).
+  - Cause: pipelined fences, now on by default. The frame's GPU work is no longer waited for, and compute results
+    still reach guest memory before the submit returns.
+  - `NX_PIPELINED=0` restores the synchronous path.
+- Glitches from the gameplay recording (milestone W7):
+  - the game's waits now cover submits being replayed (horizon band, exploded meshes);
+  - EQUAL colour passes get a small depth bias (black silhouettes, wedges);
+  - a slot or object empty at the replay mark uses the current one (green silhouettes);
+  - replay-mark gaps closed (snapshots, sampler slots);
+  - windowed present mode: MAILBOX, else IMMEDIATE.
+- A regression was caught and fixed in the same series: an empty sampler slot at the mark lost the ground's grass.
+- Details: [docs/nvn/DEBUG-2.md](docs/nvn/DEBUG-2.md), entries 59-64.
+- Next: windowed validation with the user (glitches and 60 fps on screen).
 
 ### 2026-09-30 (day): the course renders correctly (samplers restored), glitch plan W6
 

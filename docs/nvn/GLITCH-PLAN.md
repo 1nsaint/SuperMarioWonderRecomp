@@ -135,3 +135,16 @@ console reference before any change. The items below are the original study.
 
 Every step: an env switch for bisecting, a DEBUG.md entry, before/after screenshots, a character-select
 regression check and a course run.
+
+## W7: glitches from the course 1-1 recording (milestone W7, issues #43-#48)
+
+Fixes are in [DEBUG-2.md](DEBUG-2.md), entries 59-64. All pass the headless course; the windowed checks are pending.
+
+| Issue | Glitch | Fix | DEBUG-2 |
+|---|---|---|---|
+| #43 | Horizon band, exploded meshes | Game CPU waits cover submits being replayed | 59 |
+| #44 | Black silhouettes, black/white wedges | `NX_EQUAL_SLACK` depth bias on EQUAL colour passes | 60 |
+| #45 | Flat green silhouettes | A slot or object empty at the mark uses the current one | 64 |
+| #46 | 60 fps | Pipelined fences on by default | 61 |
+| #47 | Windowed stutter | MAILBOX > IMMEDIATE > FIFO | 62 |
+| #48 | Mark gaps | Snapshots retired properly; sampler slot history | 63 |

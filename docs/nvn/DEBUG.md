@@ -706,3 +706,5 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
     - In the `NX_TRACE_DRAWS` log, the detail lines printed after a `draw N:` line describe draw N+1.
     - `NX_TRACE_GLYPHS` crashes on draws that are not text (it reads the glyph atlas at the draw's UVs): use it only
       with `NX_TRACE_FS_HASH` of a text shader.
+
+Continued in [DEBUG-2.md](DEBUG-2.md) (entries 59 onward).

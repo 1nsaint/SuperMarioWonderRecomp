@@ -76,3 +76,10 @@ Read-only study (2026-09-30) of logs and code. Savings are estimates until the i
      - a `VkPipelineCache` on disk for loads.
 
 Expected: step 2 gives about 50 fps; step 3 reaches 60 if replay plus encode stays under ~14 ms; steps 4-5 are headroom.
+
+## Result (2026-09-30, W7)
+
+- Steps 1, 2 and 4 are done (patches A and C).
+- Step 3 (pipelined fences) is on by default since DEBUG-2.md #61.
+- Course 1-1 headless: **60.0 fps steady** (synchronous: 48-58). Windowed confirmation is pending.
+- Step 5 remains headroom.
