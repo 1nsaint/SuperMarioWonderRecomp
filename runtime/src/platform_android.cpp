@@ -564,7 +564,8 @@ extern "C" void android_main(android_app* app) {
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(s, &sa, &g_previous[s]);
 
-    nx::log("%s (Switch recomp) on Android, data at %s", nx::game::kInfo.title, g_root.c_str());
+    nx::log("%s (Switch recomp) on Android, data at %s (own folder %s: %s)", nx::game::kInfo.title, g_root.c_str(),
+            own.c_str(), has_data(own) ? "has the data" : "no analysis/main.bin");
     static bool started = false;
     for (;;) {
         int events;

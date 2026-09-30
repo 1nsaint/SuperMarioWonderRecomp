@@ -583,7 +583,16 @@ void gpu_present(uint64_t texture, const int32_t* crop) {
     pi.pSwapchains = &g_swapchain;
     pi.pImageIndices = &index;
     r = p_vkQueuePresentKHR(g_queue, &pi);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) make_swapchain();
+    // SUBOPTIMAL re-makes the swapchain only when the surface size changed: Android returns it for every present when
+    // the swapchain's transform is not the display's (a Galaxy S23 did for Hades), a rebuild per frame.
+    bool remake = r == VK_ERROR_OUT_OF_DATE_KHR;
+    if (r == VK_SUBOPTIMAL_KHR) {
+        VkSurfaceCapabilitiesKHR caps{};
+        p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_physical, g_surface, &caps);
+        remake = caps.currentExtent.width != UINT32_MAX && (caps.currentExtent.width != g_sc_extent.width ||
+                                                           caps.currentExtent.height != g_sc_extent.height);
+    }
+    if (remake) make_swapchain();
 }
 
 }  // namespace nx::nvn
