@@ -18,10 +18,50 @@ NVN implemented over Vulkan (MoltenVK).
 | N4 textures and samplers | #11 | **working**: untiling + upload (BNTX block heights), ASTC/BCn, samplers, swizzles, views (levels/layers) |
 | N5 Maxwell shaders → SPIR-V | #12 | **done**: 12,717/12,717 blocks offline + the 34 embedded in main; runtime cache by hash |
 | N6 pipeline state and draws | #13 | **working**: pipelines, descriptor sets, dynamic rendering, texture views; **the title screen renders correctly** |
-| N7 whole game, performance | #14 | not started |
+| N7 whole game, performance | #14 | **in progress**: title, menus, world map and the first course render correctly; 60 fps in menus, 44-46 in the course (52-57 handheld) |
 | NA AudioRenderer (`audren:u`) | — (new) | **renders in process** (the sdk's own server + DSP code, DFC); output to the Mac next |
 
 ## Log
+
+### 2026-09-30 (day): the course renders correctly (samplers restored), glitch plan W6
+
+![Course](docs/media/wonder/33-course-samplers-restored-goombas-lit.png)
+![World map](docs/media/wonder/34-world-map-samplers-restored.png)
+
+Five read-only studies of the remaining glitches gave one plan, [docs/nvn/GLITCH-PLAN.md](docs/nvn/GLITCH-PLAN.md)
+(milestone W6, issues #33-#42). What landed (docs/nvn/DEBUG.md #46-#55):
+
+- **Sampler objects restored (#50).** A file split in c41b534 had dropped every sampler proc, so all textures sampled
+  nearest, clamped, mip 0 only, with shadow compare ALWAYS.
+  - Goombas, the tree and the characters are lit: their shaders read the AO target at LOD 1, the only level the game
+    renders.
+  - The sky is smooth, and the map's repeating textures are back.
+- **Images shared across swizzles (#46).** The UI's text strips and the shadow map are no longer sampled as stale
+  uploads.
+- **Deferred clears (#47).** Clears become the next pass's loadOp CLEAR.
+- **Handheld mode (#48).** `NX_HANDHELD=1` gives 720p and 52-57 fps in the course; `nvnWindowSetCrop` is implemented.
+- **Uploads and fresh targets (#51).**
+  - R11G11B10F uploads are widened to the RGBA16F host format.
+  - Fresh render targets and unwritten attachments are cleared, not uploaded or loaded.
+- **Smaller state fixes (#52).**
+  - 1D textures are 2D images of height 1.
+  - Channel-masked clears.
+  - Alpha to coverage.
+  - Copies within one image.
+- **Compute results shared within a submit (#53).**
+- **Texture incarnations per submit (#55).** 640-750 thousand replay lookups per run had hit a texture re-initialized
+  mid-replay.
+- **Translator.** FMZ honoured on FMUL/FFMA (#49, 21 compute blocks).
+
+Course (docked 1080p, headless): 44-46 fps.
+
+Open:
+
+- An intermittent band of stretched geometry at the course horizon, in about 1 run in 3 (#35).
+- The character-select blur and halftone: the ui2d `multi_filter` programs never run (#42).
+- "Too bad!" drawn as an outline.
+- Button glyph font (needs `master_key_16`).
+- 60 fps docked.
 
 ### 2026-09-30 (night): 60 fps in menus, the course at ~30 fps
 
