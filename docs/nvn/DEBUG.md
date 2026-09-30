@@ -551,3 +551,24 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
 
 ![Course](../media/wonder/33-course-samplers-restored-goombas-lit.png)
 ![World map](../media/wonder/34-world-map-samplers-restored.png)
+51. **R11G11B10F uploads, fresh render targets, unwritten attachments (GLITCH-PLAN G3/G4).**
+    - **Uploads.** NVN 0x3f is stored as RGBA16F, but uploads copied its 4-byte texels as 8-byte ones. The copy read
+      twice the data (rows side by side, other uploads in the bottom half), which fits the garbage band after a
+      respawn.
+      - Uploads now widen each texel to four halves (same exponent bias, wider mantissas, alpha 1).
+      - Any copy that would read past the staged data is logged ("upload short") and cleared instead.
+      - Upload code moved to `nvn_upload.cpp`.
+    - **Fresh render targets** (flags 0x8, never written by the GPU, no texel writes) are cleared instead of uploaded
+      from guest memory, which never holds GPU output here. `NX_RT_UPLOAD=1` restores the upload;
+      `NX_ALIAS_MAGENTA=1` clears them magenta to find them.
+    - **Unwritten attachments** (layout UNDEFINED) begin their pass with loadOp CLEAR (colour 0, depth 1), not a LOAD
+      of recycled memory (`NX_UNDEFINED_LOAD=1`).
+    - **`drain_objects`** runs under the GPU lock in `gpu_submit` / `gpu_present`, so no object is freed while
+      another holder of the lock replays.
+    - **R11G11B10F semantics.**
+      - Sampled alpha reads 1.
+      - On such attachments, DST_ALPHA blends become ONE and ONE_MINUS_DST_ALPHA becomes ZERO.
+      - `view_format` compares host texel sizes.
+      - `NX_R11G11B10_RAW=1` restores the old behaviour.
+    - Course and character select unchanged except where they should be (Peach lit, no upload short); course
+      ~44 fps.

@@ -10,7 +10,6 @@
 #include <unordered_map>
 
 #include "nvn_pipeline.h"
-#include "nvn_tiling.h"
 
 namespace nx::nvn {
 
@@ -25,6 +24,11 @@ VkFormat view_format(const GpuImage& img, uint32_t nvn) {
     uint32_t bw = 1, bh = 1, bytes = 0, iw = 1, ih = 1, ibytes = 0;
     format_block(nvn, bw, bh, bytes);
     format_block(img.nvn_format, iw, ih, ibytes);
+    // The sizes of the host formats: R11G11B10F is 4 bytes in NVN but RGBA16F here, and a 4-byte view (RGBA8, R32F)
+    // of an 8-byte image is no valid view (G4, docs/nvn/DEBUG.md #50). NX_VIEW_NVN_SIZES=1: the NVN sizes (bisecting).
+    static const bool nvn_sizes = std::getenv("NX_VIEW_NVN_SIZES") != nullptr;
+    if (!nvn_sizes && vk_block_bytes(f) && vk_block_bytes(img.format))
+        bytes = vk_block_bytes(f), ibytes = vk_block_bytes(img.format);
     bool ok = f != VK_FORMAT_UNDEFINED && format_aspect(nvn) == 0 && bw == iw && bh == ih && bytes == ibytes;
     static std::set<std::pair<uint32_t, uint32_t>> logged;
     if (logged.insert({img.nvn_format, nvn}).second && logged.size() <= 40)
@@ -156,71 +160,11 @@ VkImageView view_of(GpuImage& img, VkImageViewType type, const ViewInfo& view) {
     return v;
 }
 
-// Untiles the texture's pool memory and copies it into the image (every level and layer).
-void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
-    img.uploaded = true;
-    if (gpu_profile_on()) gpu_profile_mark(cb, "texture uploads");
-    if (!t.memory || !t.storage_size) return;
-    if (std::getenv("NX_TRACE_UPLOADS") && t.storage_size >= (1u << 20)) {
-        const uint8_t* m = reinterpret_cast<const uint8_t*>(t.memory);
-        size_t nz = 0;
-        for (uint64_t k = 0; k < t.storage_size; k += 64) nz += m[k] != 0;
-        log("nvn: upload %ux%u fmt %#x stride %u: %zu of %llu sampled bytes non-zero", t.width, t.height, t.format,
-            t.stride, nz, (unsigned long long)(t.storage_size / 64));
-    }
-    uint32_t bw = 1, bh = 1, bytes = 4;
-    format_block(t.format, bw, bh, bytes);
-    std::vector<uint8_t> linear;
-    std::vector<VkBufferImageCopy> copies;
-    uint32_t layers = img.view_type == VK_IMAGE_VIEW_TYPE_3D ? std::max(1u, t.depth) : img.layers;
-    if (img.alpha_from_r && t.stride) {  // R8 pitch-linear -> RGBA8 (255, 255, 255, R), level 0
-        const uint8_t* src = reinterpret_cast<const uint8_t*>(t.memory);
-        uint64_t rows = uint64_t(img.height) * layers;
-        if (uint64_t(t.stride) * rows > t.storage_size) rows = t.storage_size / t.stride;
-        Upload u = upload_alloc(rows * img.width * 4, 16);
-        for (uint64_t y = 0; y < rows; y++) {
-            const uint8_t* s = src + y * t.stride;
-            uint32_t* d = reinterpret_cast<uint32_t*>(u.ptr + y * img.width * 4);
-            for (uint32_t x = 0; x < img.width; x++) d[x] = 0x00FFFFFFu | (uint32_t(s[x]) << 24);
-        }
-        VkBufferImageCopy r{};
-        r.bufferOffset = u.offset;
-        r.imageSubresource = {img.aspect, 0, 0, img.layers};
-        r.imageExtent = {img.width, uint32_t(std::min<uint64_t>(rows, img.height)), 1};
-        transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
-        return;
-    }
-    if (t.stride) {  // pitch-linear: rows as they are
-        uint64_t rows = (img.height + bh - 1) / bh;
-        Upload u = upload(reinterpret_cast<const void*>(t.memory), uint64_t(t.stride) * rows * layers, 16);
-        VkBufferImageCopy r{};
-        r.bufferOffset = u.offset;
-        r.bufferRowLength = t.stride / bytes * bw;
-        r.imageSubresource = {img.aspect, 0, 0, img.layers};
-        r.imageExtent = {img.width, img.height, 1};
-        transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
-        return;
-    }
-    auto levels = deswizzle_texture(reinterpret_cast<const uint8_t*>(t.memory), t.storage_size, img.width,
-                                    img.height, layers, img.levels, bw, bh, bytes, linear, t.block_height_gobs);
-    if (levels.empty()) {
-        log("nvn/vk: texture %ux%u format %#x: could not untile (%llu bytes)", img.width, img.height, t.format,
-            (unsigned long long)t.storage_size);
-        return;
-    }
-    Upload u = upload(linear.data(), linear.size(), 16);
-    for (uint32_t k = 0; k < levels.size(); k++) {
-        VkBufferImageCopy r{};
-        r.bufferOffset = u.offset + levels[k].offset;
-        r.imageSubresource = {img.aspect, k, 0, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? 1u : img.layers};
-        r.imageExtent = {levels[k].width, levels[k].height, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? layers : 1u};
-        copies.push_back(r);
-    }
-    transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(copies.size()),
-                             copies.data());
+// R11G11B10F (0x3f) has no alpha, stored here as RGBA16F: sampling reads alpha 1 and blending takes destination
+// alpha as 1, as Maxwell does (G4, docs/nvn/DEBUG.md #50). NX_R11G11B10_RAW=1: the stored alpha (bisecting).
+bool ufloat_raw() {
+    static const bool raw = std::getenv("NX_R11G11B10_RAW") != nullptr;
+    return raw;
 }
 
 }  // namespace
@@ -372,12 +316,22 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     VkPipelineColorBlendAttachmentState att[8]{};
     for (uint32_t k = 0; k < key.color_count; k++) {
         const BlendTarget& b = key.blend[k];
+        // An R11G11B10F target's destination alpha is 1 on Maxwell; the RGBA16F image holds what the shader wrote.
+        bool ufloat = (key.ufloat_colors >> k & 1) && !ufloat_raw();
+        auto factor = [ufloat](uint32_t f) {
+            VkBlendFactor v = vk_blend_factor(f);
+            if (!ufloat) return v;
+            return v == VK_BLEND_FACTOR_DST_ALPHA             ? VK_BLEND_FACTOR_ONE
+                   : v == VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA ? VK_BLEND_FACTOR_ZERO
+                   : v == VK_BLEND_FACTOR_SRC_ALPHA_SATURATE  ? VK_BLEND_FACTOR_ZERO  // min(As, 1 - 1)
+                                                              : v;
+        };
         att[k].blendEnable = key.color.blend_enable[k] ? VK_TRUE : VK_FALSE;
-        att[k].srcColorBlendFactor = vk_blend_factor(b.src_rgb);
-        att[k].dstColorBlendFactor = vk_blend_factor(b.dst_rgb);
+        att[k].srcColorBlendFactor = factor(b.src_rgb);
+        att[k].dstColorBlendFactor = factor(b.dst_rgb);
         att[k].colorBlendOp = vk_blend_op(b.eq_rgb);
-        att[k].srcAlphaBlendFactor = vk_blend_factor(b.src_a);
-        att[k].dstAlphaBlendFactor = vk_blend_factor(b.dst_a);
+        att[k].srcAlphaBlendFactor = factor(b.src_a);
+        att[k].dstAlphaBlendFactor = factor(b.dst_a);
         att[k].alphaBlendOp = vk_blend_op(b.eq_a);
         att[k].colorWriteMask = key.mask.mask[k] & 0xF;
     }
@@ -508,7 +462,25 @@ GpuImage* ensure_contents(VkCommandBuffer cb, uint64_t texture) {
     if (!img) return nullptr;
     bool dirty = t->dirty.exchange(false);
     static const bool reupload = std::getenv("NX_TEXELS_REUPLOAD") != nullptr;  // bisecting: the old way
-    if (!img->rendered && (!img->uploaded || (dirty && (!img->texels || reupload)))) upload_texture(cb, *t, *img);
+    bool upload = !img->rendered && (!img->uploaded || (dirty && (!img->texels || reupload)));
+    // A render target (COMPRESSIBLE, flag 0x8) the GPU never wrote through this image: its guest memory never holds
+    // GPU output here (another target over the same memory left only stale data), so it starts cleared, not uploaded
+    // (G3 cause 2, docs/nvn/DEBUG.md #50). NX_RT_UPLOAD=1: uploaded as before; NX_ALIAS_MAGENTA=1: cleared magenta.
+    static const bool rt_upload = std::getenv("NX_RT_UPLOAD") != nullptr;
+    static const bool magenta = std::getenv("NX_ALIAS_MAGENTA") != nullptr;
+    if (upload && !rt_upload && (t->flags & 0x8) && !img->uploaded && !img->texels && !dirty) {
+        bool writes = false;
+        {
+            std::shared_lock lk(objects_lock());
+            writes = !t->writes.empty();
+        }
+        if (!writes) {
+            clear_image(cb, *img, magenta);
+            img->uploaded = true;
+            upload = false;
+        }
+    }
+    if (upload) upload_texture(cb, *t, *img);
     apply_texel_writes(cb, *t, *img);
     if (img->layout == VK_IMAGE_LAYOUT_UNDEFINED) {  // never written: black, not garbage
         transition(cb, *img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -544,6 +516,13 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
                 for (int k = 0; k < 4; k++) s |= uint32_t(std::min<uint8_t>(t->swizzle[k], 5)) << (8 * k);
             vi.swizzle = s;
         }
+    // R11G11B10F: a channel reading A (NVNtextureSwizzle 5) reads ONE (1), after the texture's swizzle (G4).
+    if (!ufloat_raw() && !img->alpha_from_r && (img->nvn_format == 0x3f || vi.format == 0x3f)) {
+        uint32_t s = vi.swizzle ? vi.swizzle : 0x05040302u;  // 0: identity (R G B A)
+        for (int k = 0; k < 4; k++)
+            if ((s >> (8 * k) & 0xFF) == 5) s = (s & ~(0xFFu << (8 * k))) | (1u << (8 * k));
+        vi.swizzle = s;
+    }
     VkImageView v = view_of(*img, view_type(shape), vi);
     if (!v) {
         *layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;

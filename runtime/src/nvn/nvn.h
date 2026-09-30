@@ -195,6 +195,10 @@ struct DescriptorPool : Object {  // an NVNtexturePool or NVNsamplerPool
 // NVNformat -> VkFormat, and whether it is color (0), depth (1), stencil (2) or both (3) (nvn_format.cpp).
 VkFormat vk_format(uint32_t format);
 uint32_t format_aspect(uint32_t format);
+// Bytes per texel of a Vulkan format as buffer-image copies count them (nvn_format.cpp); 0 for block-compressed and
+// combined depth/stencil formats, whose NVN size (format_block) is the host's. Differs from the NVN size where a
+// format is stored wider than the game's: 0x3f R11G11B10F is 4 bytes in NVN, RGBA16F (8) here.
+uint32_t vk_block_bytes(VkFormat format);
 
 // NVN enums -> Vulkan (nvn_enums.cpp).
 VkBlendFactor vk_blend_factor(uint32_t f);

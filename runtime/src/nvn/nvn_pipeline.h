@@ -37,6 +37,7 @@ struct PipelineKey {
     uint32_t color_count = 0;
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
     uint32_t depth_clamp = 0;  // SetDepthClamp (applied only where the device has the depthClamp feature)
+    uint32_t ufloat_colors = 0;  // bit k: colour target k is R11G11B10F (no alpha: destination alpha reads 1)
 };
 VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout);
 
@@ -76,6 +77,11 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
 // The image behind a texture with its contents in place (uploaded, CPU writes applied, never-written ones cleared);
 // null for an unknown texture. Records transfers: outside render passes.
 GpuImage* ensure_contents(VkCommandBuffer cb, uint64_t texture);
+// nvn_upload.cpp: the texture's pool memory untiled (or taken row by row, pitch-linear) into the image, every level
+// and layer; cleared instead when the copies would read past what was staged. Marks it uploaded.
+void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img);
+// Every level and layer to zero (colour; magenta with `magenta`), depth and stencil to 0. Leaves TRANSFER_DST.
+void clear_image(VkCommandBuffer cb, GpuImage& img, bool magenta = false);
 // A single level and layer of an image, for rendering to.
 void sampled_ready_log();
 void check_linear_content(Texture& t);  // nvn_sampler.cpp

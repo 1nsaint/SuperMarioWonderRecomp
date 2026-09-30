@@ -94,6 +94,10 @@ int api_stage(ShaderStage s) { return s == ShaderStage::Fragment ? 1 : s == Shad
 
 void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     if (clears_pending_other(t)) clears_flush(cb);  // other targets' clears first, in order
+    // An image never written (layout UNDEFINED) has nothing to load: loadOp CLEAR to zero, not a LOAD of whatever
+    // the memory held (G3, docs/nvn/DEBUG.md #50); a pending clear still wins (clears_apply). Env: bisecting.
+    static const bool load_undefined = std::getenv("NX_UNDEFINED_LOAD") != nullptr;
+    uint32_t fresh = 0;  // bit c colour c, bit 8 depth: begun cleared to 0 (depth 0, stencil 0)
     VkRenderingAttachmentInfo colors[8]{};
     VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     VkExtent2D extent{UINT32_MAX, UINT32_MAX};
@@ -102,6 +106,7 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
         GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
         g_pass_images[k] = img;
         if (!img) continue;
+        if (img->layout == VK_IMAGE_LAYOUT_UNDEFINED && !load_undefined) fresh |= 1u << k;
         transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);  // rendered images stay GENERAL (sampled while rendered)
         img->rendered = true;
         uint32_t level = std::min<uint32_t>(t.views.level[k], img->levels - 1);
@@ -117,7 +122,7 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
                 (unsigned long long)t.colors[k], level, t.views.layer[k], img->width, img->height, img->levels,
                 img->layers, colors[k].imageView == img->view ? "WHOLE IMAGE (fallback)" : "ok");
         colors[k].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        colors[k].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        colors[k].loadOp = fresh >> k & 1 ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
         colors[k].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         extent = {std::min(extent.width, std::max(1u, img->width >> level)),
                   std::min(extent.height, std::max(1u, img->height >> level))};
@@ -125,12 +130,14 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     GpuImage* dimg = t.depth ? image_of(t.depth) : nullptr;
     g_pass_images[8] = dimg;
     if (dimg && dimg->aspect != VK_IMAGE_ASPECT_COLOR_BIT) {
+        if (dimg->layout == VK_IMAGE_LAYOUT_UNDEFINED && !load_undefined) fresh |= 1u << 8;
         transition(cb, *dimg, VK_IMAGE_LAYOUT_GENERAL);
         dimg->rendered = true;
         uint32_t level = std::min<uint32_t>(t.views.level[8], dimg->levels - 1);
         depth.imageView = attachment_view(*dimg, level, t.views.layer[8]);
         depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        depth.loadOp = fresh >> 8 & 1 ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        depth.clearValue.depthStencil = {1.0f, 0};  // far (a fresh depth buffer; the course passes test LESS)
         depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         extent = {std::min(extent.width, std::max(1u, dimg->width >> level)),
                   std::min(extent.height, std::max(1u, dimg->height >> level))};
@@ -151,7 +158,7 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     }
     p_vkCmdBeginRendering(cb, &ri);
     g_rendering = true;
-    g_pass_written = cleared;  // as a clear inside the pass: sampling it needs it stored first
+    g_pass_written = cleared | fresh;  // as a clear inside the pass: sampling it needs it stored first
     g_pass = t;
     g_pass_extent = extent;
 }
@@ -481,6 +488,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     for (uint32_t k = 0; k < t.color_count; k++) {
         GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
         key.color_formats[k] = img ? view_format(*img, t.views.format[k]) : VK_FORMAT_R8G8B8A8_UNORM;
+        if (img && (img->nvn_format == 0x3f || t.views.format[k] == 0x3f)) key.ufloat_colors |= 1u << k;  // G4
     }
     GpuImage* dimg = t.depth ? image_of(t.depth) : nullptr;
     key.depth_format = dimg && dimg->aspect != VK_IMAGE_ASPECT_COLOR_BIT ? dimg->format : VK_FORMAT_UNDEFINED;

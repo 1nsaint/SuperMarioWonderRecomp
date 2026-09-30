@@ -1,0 +1,169 @@
+// Texture uploads (nvn_pipeline.h): guest pool memory into the host image, untiled, widened where the host stores a
+// format wider than NVN does, and checked against what the copies read (docs/nvn/DEBUG.md #50).
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <set>
+#include <vector>
+
+#include "nvn_pipeline.h"
+#include "nvn_tiling.h"
+
+namespace nx::nvn {
+
+using namespace nx::vk;
+
+namespace {
+
+// R11G11B10F (NVN 0x3f) is stored as RGBA16F (nvn_format.cpp). Its channels are unsigned floats with half's 5-bit
+// exponent and bias 15, and 6 (R, G) or 5 (B) mantissa bits: each is a half with the low mantissa bits zero and no
+// sign, so shifting it into place is exact (Inf and NaN included). Alpha is 1. Copying the 4-byte texels as they are
+// read twice the data: rows side by side, bits reinterpreted, the bottom half from other uploads (the garbage band).
+void widen_r11g11b10(const uint8_t* src, uint8_t* dst, uint64_t texels) {
+    for (uint64_t k = 0; k < texels; k++) {
+        uint32_t v;
+        std::memcpy(&v, src + k * 4, 4);
+        uint16_t h[4] = {uint16_t((v & 0x7FF) << 4), uint16_t(((v >> 11) & 0x7FF) << 4),
+                         uint16_t(((v >> 22) & 0x3FF) << 5), 0x3C00};
+        std::memcpy(dst + k * 8, h, 8);
+    }
+}
+
+// Bytes from `base` to the end of what vkCmdCopyBufferToImage reads for `r`, at `bytes` per bw x bh block.
+uint64_t copy_end(const VkBufferImageCopy& r, uint64_t base, uint32_t bw, uint32_t bh, uint32_t bytes) {
+    uint64_t row_blocks = ((r.bufferRowLength ? r.bufferRowLength : r.imageExtent.width) + bw - 1) / bw;
+    uint64_t image_rows = ((r.bufferImageHeight ? r.bufferImageHeight : r.imageExtent.height) + bh - 1) / bh;
+    uint64_t w = (r.imageExtent.width + bw - 1) / bw, h = (r.imageExtent.height + bh - 1) / bh;
+    uint64_t slices = uint64_t(r.imageExtent.depth) * r.imageSubresource.layerCount;
+    if (!w || !h || !slices) return r.bufferOffset - base;
+    return r.bufferOffset - base + ((slices - 1) * image_rows + (h - 1)) * row_blocks * bytes + w * bytes;
+}
+
+// The copies read at most `staged` bytes from `base`, counted at the host format's size. A copy past it reads other
+// uploads of the submit (or past the buffer): garbage, so the image is cleared instead. NX_NO_UPLOAD_GUARD=1: the old
+// way (bisecting).
+bool copies_fit(const Texture& t, const VkBufferImageCopy* r, uint32_t n, uint64_t base, uint64_t staged, uint32_t bw,
+                uint32_t bh, uint32_t bytes) {
+    static const bool off = std::getenv("NX_NO_UPLOAD_GUARD") != nullptr;
+    uint64_t need = 0;
+    for (uint32_t k = 0; k < n; k++) need = std::max(need, copy_end(r[k], base, bw, bh, bytes));
+    if (off || need <= staged) return true;
+    static std::set<uint32_t> logged;  // once per format
+    if (logged.insert(t.format).second)
+        log("nvn/vk: upload short: texture %ux%u format %#x reads %llu bytes, %llu staged: cleared instead", t.width,
+            t.height, t.format, (unsigned long long)need, (unsigned long long)staged);
+    return false;
+}
+
+}  // namespace
+
+void clear_image(VkCommandBuffer cb, GpuImage& img, bool magenta) {
+    transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageSubresourceRange r{img.aspect, 0, img.levels, 0, img.layers};
+    if (img.aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+        VkClearColorValue v{};
+        if (magenta) v = {{1.0f, 0.0f, 1.0f, 1.0f}};
+        p_vkCmdClearColorImage(cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
+    } else {
+        VkClearDepthStencilValue v{1.0f, 0};  // far: the course passes test LESS
+        p_vkCmdClearDepthStencilImage(cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
+    }
+}
+
+void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
+    img.uploaded = true;
+    if (gpu_profile_on()) gpu_profile_mark(cb, "texture uploads");
+    if (!t.memory || !t.storage_size) return;
+    if (std::getenv("NX_TRACE_UPLOADS") && t.storage_size >= (1u << 20)) {
+        const uint8_t* m = reinterpret_cast<const uint8_t*>(t.memory);
+        size_t nz = 0;
+        for (uint64_t k = 0; k < t.storage_size; k += 64) nz += m[k] != 0;
+        log("nvn: upload %ux%u fmt %#x stride %u: %zu of %llu sampled bytes non-zero", t.width, t.height, t.format,
+            t.stride, nz, (unsigned long long)(t.storage_size / 64));
+    }
+    uint32_t bw = 1, bh = 1, bytes = 4;
+    format_block(t.format, bw, bh, bytes);
+    // What the copies read per block: the host format's size (RGBA16F for R11G11B10F), else the NVN one.
+    uint32_t host_bytes = vk_block_bytes(img.format) ? vk_block_bytes(img.format) : bytes;
+    // NX_R11G11B10_NARROW=1: R11G11B10F copied at 4 bytes per texel, as before (the guard then clears it unless
+    // NX_NO_UPLOAD_GUARD=1 too; bisecting).
+    static const bool narrow = std::getenv("NX_R11G11B10_NARROW") != nullptr;
+    bool widen = !narrow && t.format == 0x3f && img.format == VK_FORMAT_R16G16B16A16_SFLOAT && !img.alpha_from_r;
+    std::vector<uint8_t> linear;
+    std::vector<VkBufferImageCopy> copies;
+    uint32_t layers = img.view_type == VK_IMAGE_VIEW_TYPE_3D ? std::max(1u, t.depth) : img.layers;
+    if (img.alpha_from_r && t.stride) {  // R8 pitch-linear -> RGBA8 (255, 255, 255, R), level 0
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(t.memory);
+        uint64_t rows = uint64_t(img.height) * layers;
+        if (uint64_t(t.stride) * rows > t.storage_size) rows = t.storage_size / t.stride;
+        Upload u = upload_alloc(rows * img.width * 4, 16);
+        for (uint64_t y = 0; y < rows; y++) {
+            const uint8_t* s = src + y * t.stride;
+            uint32_t* d = reinterpret_cast<uint32_t*>(u.ptr + y * img.width * 4);
+            for (uint32_t x = 0; x < img.width; x++) d[x] = 0x00FFFFFFu | (uint32_t(s[x]) << 24);
+        }
+        VkBufferImageCopy r{};
+        r.bufferOffset = u.offset;
+        r.imageSubresource = {img.aspect, 0, 0, img.layers};
+        r.imageExtent = {img.width, uint32_t(std::min<uint64_t>(rows, img.height)), 1};
+        transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+        return;
+    }
+    if (t.stride) {  // pitch-linear: rows as they are
+        uint64_t rows = (img.height + bh - 1) / bh;
+        VkBufferImageCopy r{};
+        r.imageSubresource = {img.aspect, 0, 0, img.layers};
+        r.imageExtent = {img.width, img.height, 1};
+        Upload u;
+        uint64_t staged = 0;
+        if (widen) {  // tightly packed RGBA16F rows; rows past the storage stay zero
+            const uint8_t* src = reinterpret_cast<const uint8_t*>(t.memory);
+            uint64_t n = rows * layers, have = std::min<uint64_t>(n, t.storage_size / t.stride);
+            uint64_t texels = std::min<uint64_t>(img.width, t.stride / 4);
+            staged = n * img.width * 8;
+            u = upload_alloc(staged, 16);
+            std::memset(u.ptr, 0, staged);
+            for (uint64_t y = 0; y < have; y++) widen_r11g11b10(src + y * t.stride, u.ptr + y * img.width * 8, texels);
+        } else {
+            staged = uint64_t(t.stride) * rows * layers;
+            u = upload(reinterpret_cast<const void*>(t.memory), staged, 16);
+            r.bufferRowLength = t.stride / bytes * bw;
+        }
+        r.bufferOffset = u.offset;
+        if (!copies_fit(t, &r, 1, u.offset, staged, bw, bh, host_bytes)) return clear_image(cb, img);
+        transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+        return;
+    }
+    auto levels = deswizzle_texture(reinterpret_cast<const uint8_t*>(t.memory), t.storage_size, img.width,
+                                    img.height, layers, img.levels, bw, bh, bytes, linear, t.block_height_gobs);
+    if (levels.empty()) {
+        log("nvn/vk: texture %ux%u format %#x: could not untile (%llu bytes)", img.width, img.height, t.format,
+            (unsigned long long)t.storage_size);
+        return;
+    }
+    // Widened, every offset in the linear buffer doubles (level offsets are multiples of the 4-byte texel).
+    uint64_t scale = widen ? 2 : 1;
+    Upload u;
+    if (widen) {
+        u = upload_alloc(linear.size() * 2, 16);
+        widen_r11g11b10(linear.data(), u.ptr, linear.size() / 4);
+    } else {
+        u = upload(linear.data(), linear.size(), 16);
+    }
+    for (uint32_t k = 0; k < levels.size(); k++) {
+        VkBufferImageCopy r{};
+        r.bufferOffset = u.offset + levels[k].offset * scale;
+        r.imageSubresource = {img.aspect, k, 0, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? 1u : img.layers};
+        r.imageExtent = {levels[k].width, levels[k].height, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? layers : 1u};
+        copies.push_back(r);
+    }
+    if (!copies_fit(t, copies.data(), uint32_t(copies.size()), u.offset, linear.size() * scale, bw, bh, host_bytes))
+        return clear_image(cb, img);
+    transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(copies.size()),
+                             copies.data());
+}
+
+}  // namespace nx::nvn

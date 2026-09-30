@@ -577,9 +577,9 @@ std::shared_ptr<const DeferredValues> g_deferred;  // the submit being replayed 
 const DeferredValues* current_deferred() { return g_deferred.get(); }
 
 void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_ptr<const DeferredValues> deferred) {
-    drain_objects();  // nothing replays now: objects the game destroyed can go
     g_deferred = std::move(deferred);
     std::lock_guard lk(g_gpu);
+    drain_objects();  // nothing replays now, and under the GPU lock: objects the game destroyed can go (#50)
     if (!init()) return;
     bool async = async_gpu();
     if (!async) {  // the previous submit was waited for: all of it is free
@@ -632,8 +632,8 @@ void present_headless(uint64_t texture) {
 }
 
 void gpu_present(uint64_t texture, const int32_t* crop) {
-    drain_objects();
     std::lock_guard lk(g_gpu);
+    drain_objects();  // under the GPU lock, as in gpu_submit
     if (!init()) return;
     if (!async_gpu()) free_retired_images(UINT64_MAX);
     if (plat::headless()) return present_headless(texture);
