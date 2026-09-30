@@ -212,3 +212,12 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
       (MoltenVK did, twice, as the cache grew between the two calls).
     - Course 1-1 headless, two identical runs: 11 intervals under 55 fps without the cache, 5 with it.
     - `NX_PIPELINE_CACHE=0`: no cache.
+
+74. **Android performance hints (ADPF, A5).**
+    - `perf_hint.cpp`: the thread that replays NVN (`QueueSubmitCommands`) and the presenting one join an
+      `APerformanceHint` session with a 16.7 ms target.
+    - Each frame's work, from the end of the last present's pacing to the next present, is reported. The phone then
+      raises clocks when a frame runs late instead of guessing from load.
+    - Loaded with `dlsym` (Android 13+; older versions go without). `NX_ADPF=0`: off. It does nothing on the Mac and
+      Windows.
+    - The Mac regression is unchanged (course 1-1 at 60 fps). The effect on the S23 waits for the phone.

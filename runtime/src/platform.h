@@ -73,6 +73,10 @@ struct OverlayShape {
     float x, y, r, alpha;
 };
 size_t touch_overlay(OverlayShape* out, size_t max);
+// Performance hints (perf_hint.cpp; Android ADPF, nothing elsewhere): the calling thread takes part in making frames;
+// a frame's work took `ns`.
+void perf_hint_thread();
+void perf_hint_frame(int64_t ns);
 // NX_HEADLESS=1: no visible window (it is created hidden) and nothing presented; frames still render and
 // NX_DUMP_FRAMES still writes them. For unattended test runs.
 bool headless();

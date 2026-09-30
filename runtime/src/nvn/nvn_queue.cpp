@@ -104,6 +104,7 @@ std::atomic<uint64_t> g_presents{0};
 void QueueInitialize(CPU& c) { c.x[0] = 1; }  // NVNboolean (NVNqueue*, const NVNqueueBuilder*)
 void QueueFinalize(CPU&) {}
 void QueueSubmitCommands(CPU& c) {  // (NVNqueue*, int count, const NVNcommandHandle*)
+    plat::perf_hint_thread();  // this thread replays: part of every frame (perf_hint.cpp)
     std::vector<std::shared_ptr<CmdList>> lists;
     static uint64_t submitted = 0, missing = 0;
     for (uint32_t k = 0; k < uint32_t(c.x[1]); k++) {
@@ -256,6 +257,11 @@ void pace_present(int interval) {
 }
 
 void QueuePresentTexture(CPU& c) {
+    // The frame's work, from the end of the last present's pacing to now (perf_hint.cpp: ADPF on Android).
+    static uint64_t work_from = 0;
+    uint64_t t_in = plat::monotonic_ns();
+    plat::perf_hint_thread();
+    if (work_from) plat::perf_hint_frame(int64_t(t_in - work_from));
     if (auto* w = get<Window>(c.x[1])) {
         // At most two presents queued: the game runs at most two frames ahead of the replay.
         static uint64_t queued[2] = {};
@@ -269,6 +275,7 @@ void QueuePresentTexture(CPU& c) {
         }
         pace_present(w->interval);
     }
+    work_from = plat::monotonic_ns();
     uint64_t n = ++g_presents;
     if (n == 1 || (n & (n - 1)) == 0) log("nvn: present #%llu (texture %d)", (unsigned long long)n, int(c.x[2]));
     g_frame++;
