@@ -40,6 +40,11 @@ bool texture_race_old() {
     return old;
 }
 
+bool mark_empty_old() {
+    static const bool on = std::getenv("NX_MARK_EMPTY_OLD") != nullptr;
+    return on;
+}
+
 void note_replaced(uint64_t guest) {
     if (texture_race_old()) return;
     auto it = objects().find(guest);
@@ -55,6 +60,8 @@ Object* find_object(uint64_t guest, uint64_t mark) {
     if (h == g_retired.end()) return current;
     for (auto& [epoch, object] : h->second)
         if (epoch > mark) {  // the first change after the mark retired what the replay must see
+            // Created after the mark (null then) and before the replay: the object the lists mean (DEBUG.md #64).
+            if (!object && !mark_empty_old()) return current;
             if (object != current) {
                 uint64_t n = g_resolved_old.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (n == 1 || n == 100 || n % 10000 == 0)

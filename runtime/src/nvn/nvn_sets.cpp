@@ -55,7 +55,10 @@ void lookup_handle(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, Vie
     PoolEntry e;
     {
         std::shared_lock lk(objects_lock());
-        if (tp && !pool_entry_at(g_state.texture_pool, tid, t_replay_mark, e)) {
+        // A slot empty at the mark was registered after the lists were recorded but before the submit: the current
+        // entry (NVN reads descriptors when the GPU runs; DEBUG.md #64). NX_MARK_EMPTY_OLD=1: the empty entry.
+        if (tp && (!pool_entry_at(g_state.texture_pool, tid, t_replay_mark, e) || (!e.has && !mark_empty_old()))) {
+            e = {};
             if (auto it = tp->textures.find(tid); it != tp->textures.end()) e.has = true, e.texture = it->second;
             if (auto it = tp->snapshots.find(tid); it != tp->snapshots.end()) e.snapshot = it->second;
             if (auto it = tp->views.find(tid); it != tp->views.end()) e.has_view = true, e.view = it->second;

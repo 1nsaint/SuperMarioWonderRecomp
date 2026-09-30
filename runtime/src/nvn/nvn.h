@@ -233,6 +233,7 @@ struct PoolEntry {
 void note_pool_change(uint64_t pool, uint32_t id, const PoolEntry& before);  // objects_lock held exclusively
 // objects_lock held: the slot's entry at `mark` when it changed since (false: the current entry is the one).
 bool pool_entry_at(uint64_t pool, uint32_t id, uint64_t mark, PoolEntry& out);
+bool mark_empty_old();  // NX_MARK_EMPTY_OLD=1: a slot or object empty at the mark stays empty (bisecting, #64)
 // The same for sampler pool slots (DEBUG.md #63): recorded only when the sampler changes.
 struct SamplerSlot {
     bool has = false;
