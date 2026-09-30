@@ -23,6 +23,33 @@ NVN implemented over Vulkan (MoltenVK).
 
 ## Log
 
+### 2026-09-30 (night): Wonder boots on Android; W8 fixes; Windows plan
+
+![World map with the player](docs/media/wonder/39-world-map-player.png)
+![Touch controls, present-pass self-test](docs/media/wonder/41-android-touch-overlay-selftest.png)
+
+- **Mac (W8):**
+  - Button icons: our own NintendoExtended glyph font. The title reads "Press [L] + [R] to Start".
+  - World map: the player is drawn. A pool swizzle leaked from another slot, and the composite read the silhouette
+    strength as the distance.
+  - A pipeline cache on disk halves the course's hitches.
+  - A CPU BC decoder for GPUs without BC, bit-exact against Pillow.
+- **Android (branch `feat/android-wonder`):**
+  - A0 (build) and A1 (runs on a Galaxy S23 at 40-60 fps at the title) are met.
+  - Two phone-only faults are fixed: the zygote's executable sat in the alias region, and the data folder was not
+    readable by the app.
+  - Screen: the present pass (rotation, fit, alpha 1, the surface's own format) is checked on the Mac and waits for
+    the phone.
+  - Drawn touch controls for Wonder, ADPF performance hints, and the phone's data zip and install scripts.
+- **Windows:** a plan and a data zip for the PC (branch `feat/windows-wonder`, docs/nvn/WINDOWS-PORT.md, milestone
+  WIN).
+- **Open:**
+  - The exploded-mesh glitch (#43) is intermittent. One run of today's showed it, persistently, after loading a
+    pipeline cache saved while pipelines were being made. The save is now done under the GPU lock and being
+    re-checked (DEBUG-2 #76).
+  - Windowed fps (#51).
+- Details: [docs/nvn/DEBUG-2.md](docs/nvn/DEBUG-2.md), entries 65-76.
+
 ### 2026-09-30 (evening): 60 fps in the course (headless), W7 fixes
 
 ![Course at 60 fps](docs/media/wonder/38-course-60fps-pipelined.png)

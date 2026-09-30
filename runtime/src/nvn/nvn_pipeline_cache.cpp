@@ -1,9 +1,9 @@
 // A Vulkan pipeline cache kept on disk (docs/nvn/ANDROID-PORT.md A3, DEBUG-2.md #73): every pipeline built in a
 // session is compiled again in the next one, a hitch at each new scene (Adreno takes tens of ms per pipeline).
-// The cache is <data root>/cache/pipelines_<vendor>_<device>.bin, loaded when the first pipeline is made and saved
-// on a thread of its own every 32 new pipelines (pipeline_cache() is called once per pipeline made; the driver's cache
-// is internally synchronised, so replays go on meanwhile). Data from another driver is left out: its header must
-// match this device's vendor, device and cache UUID. NX_PIPELINE_CACHE=0: no cache.
+// The cache is <data root>/cache/pipelines2_<vendor>_<device>.bin, loaded when the first pipeline is made and saved
+// every 32 new pipelines (pipeline_cache() is called once per pipeline made): read under the GPU lock, written to the
+// file on a thread of its own. Data from another driver is left out: its header must match this device's vendor,
+// device and cache UUID. NX_PIPELINE_CACHE=0: no cache.
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -56,25 +56,29 @@ bool matches(const std::vector<uint8_t>& data, const VkPhysicalDeviceProperties&
            std::memcmp(data.data() + 16, props.pipelineCacheUUID, VK_UUID_SIZE) == 0;
 }
 
+// The cache's contents are read here, on the replaying thread under the GPU lock, where no pipeline is being made;
+// only the file is written on a thread of its own. Read on another thread while pipelines were made (the first
+// version), MoltenVK could serialise a half-updated cache: a run that loaded one drew the course's tree trunk as huge
+// brown triangles from a point on (DEBUG-2.md #76).
 void save() {
-    if (g_saving.exchange(true)) return;
-    std::thread([] {
-        size_t n = 0;
-        std::vector<uint8_t> data;
-        for (int tries = 0; tries < 4 && data.empty(); tries++) {  // INCOMPLETE: it grew between the two calls
-            if (p_vkGetPipelineCacheData(vk_device(), g_cache, &n, nullptr) != VK_SUCCESS || !n) break;
-            data.resize(n);
-            if (p_vkGetPipelineCacheData(vk_device(), g_cache, &n, data.data()) != VK_SUCCESS) data.clear();
-        }
-        if (data.empty()) log("nvn/vk: pipeline cache: the driver returned no data (%u pipelines)", g_new.load());
-        if (!data.empty()) {
-            std::string tmp = g_path + ".tmp";
-            if (FILE* f = plat::fopen_utf8(tmp, "wb")) {
-                bool ok = std::fwrite(data.data(), 1, n, f) == n;
-                ok = std::fclose(f) == 0 && ok;
-                if (ok && std::rename(tmp.c_str(), g_path.c_str()) == 0)
-                    log("nvn/vk: pipeline cache saved (%.1f MB)", double(n) / 1e6);
-            }
+    if (g_saving) return;  // the previous file is still being written
+    size_t n = 0;
+    std::vector<uint8_t> data;
+    for (int tries = 0; tries < 4 && data.empty(); tries++) {  // INCOMPLETE: retried
+        if (p_vkGetPipelineCacheData(vk_device(), g_cache, &n, nullptr) != VK_SUCCESS || !n) break;
+        data.resize(n);
+        if (p_vkGetPipelineCacheData(vk_device(), g_cache, &n, data.data()) != VK_SUCCESS) data.clear();
+    }
+    if (data.empty()) return log("nvn/vk: pipeline cache: the driver returned no data (%u pipelines)", g_new.load());
+    data.resize(n);
+    g_saving = true;
+    std::thread([data = std::move(data)] {
+        std::string tmp = g_path + ".tmp";
+        if (FILE* f = plat::fopen_utf8(tmp, "wb")) {
+            bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+            ok = std::fclose(f) == 0 && ok;
+            if (ok && std::rename(tmp.c_str(), g_path.c_str()) == 0)
+                log("nvn/vk: pipeline cache saved (%.1f MB)", double(data.size()) / 1e6);
         }
         g_saving = false;
     }).detach();
@@ -91,7 +95,7 @@ VkPipelineCache pipeline_cache() {
         std::string dir = plat::data_root() + "/cache";
         plat::make_dirs(dir);
         char name[64];
-        std::snprintf(name, sizeof name, "/pipelines_%04x_%04x.bin", props.vendorID, props.deviceID);
+        std::snprintf(name, sizeof name, "/pipelines2_%04x_%04x.bin", props.vendorID, props.deviceID);  // 2: #76
         g_path = dir + name;
         std::vector<uint8_t> data = read_file(g_path);
         bool use = matches(data, props);
@@ -102,7 +106,8 @@ VkPipelineCache pipeline_cache() {
         log("nvn/vk: pipeline cache %s: %s", g_path.c_str(),
             use ? "loaded" : data.empty() ? "new" : "from another driver, started over");
     });
-    if (g_cache && (g_new.fetch_add(1) + 1) % 32 == 0) save();  // one call per pipeline made
+    // One call per pipeline made, under the GPU lock (replays make them): every 32 the cache is saved.
+    if (g_cache && (g_new.fetch_add(1) + 1) % 32 == 0) save();
     return g_cache;
 }
 

@@ -234,3 +234,17 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
     - Course 1-1 with `NX_FORCE_BC_DECODE=1`: the same screens as native BC, 60 fps, a 3.95 GB peak.
     - The same comparison caught the exploded-mesh glitch (issue #43) in the *native* reference run. Huge brown
       triangles appeared near the pipe near the end of the course, so #43 is still open (DEBUG-2 #76).
+
+76. **Exploded meshes after loading a pipeline cache (#73's first version).**
+    - Of about twenty course runs today, one (w9r) drew the tree trunk as huge brown triangles. It stayed that way
+      from frame 13200 to the end: a lasting state, not a one-frame race.
+    - That run was the first to load a cache that had been saved while pipelines were being made: the first version
+      read the cache on a thread of its own. MoltenVK could then serialise a half-updated cache, and a vertex shader
+      loaded from it came out wrong.
+    - Fix: the cache's contents are read on the replaying thread, under the GPU lock, where no pipeline is being made.
+      Only the file is written on another thread. The file name changed (`pipelines2_*`), so a cache saved the old
+      way is never loaded.
+    - Check: three course runs in a row (a new cache, then loaded twice) are clean, 60 fps.
+    - `tools/detect_explode.py` flags frames with large brown areas in the sky. It has known false positives (title,
+      character select, the tree), so look at what it flags.
+    - The exploded meshes of the user's recording (#43) predate the cache, and that issue stays open.
