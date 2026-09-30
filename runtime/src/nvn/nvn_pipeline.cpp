@@ -311,7 +311,7 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     // LINE 1, FILL 2), and the bit of the mode drawn with decides. Factor, units and clamp are dynamic (SetDepthBias
     // at each draw, nvn_raster.cpp): the game sets them on the command buffer, not in the state object.
     uint32_t offset_bit = key.polygon.mode <= 2 ? 1u << key.polygon.mode : 4u;
-    rs.depthBiasEnable = key.polygon.offset_enables & offset_bit ? VK_TRUE : VK_FALSE;
+    rs.depthBiasEnable = key.polygon.offset_enables & offset_bit || equal_slack_pass(key.depth) ? VK_TRUE : VK_FALSE;
 
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;

@@ -61,7 +61,7 @@ struct Bound {
     VkViewport viewport{};
     VkRect2D scissor{};
     float blend[4] = {};
-    uint32_t raster[9] = {};  // raster_dynamic's inputs: stencil reference and masks per face, the depth bias
+    uint32_t raster[10] = {};  // raster_dynamic's inputs: stencil reference and masks per face, the depth bias
 } g_bound;
 uint64_t g_state_set = 0, g_state_kept = 0;  // state commands recorded and left out, for the log
 
@@ -83,10 +83,12 @@ void bind_vertex(VkCommandBuffer cb, uint32_t binding, const Upload& u) {
 void set_dynamic(VkCommandBuffer cb, const VkViewport& vp, const VkRect2D& sc) {
     Bound& b = g_bound;
     const State& s = g_state;
-    uint32_t raster[9] = {s.stencil_ref[0],        s.stencil_ref[1],        s.stencil_compare_mask[0],
+    uint32_t raster[10] = {s.stencil_ref[0],        s.stencil_ref[1],        s.stencil_compare_mask[0],
                           s.stencil_compare_mask[1], s.stencil_write_mask[0], s.stencil_write_mask[1]};
     std::memcpy(raster + 6, &s.bias_factor, 4), std::memcpy(raster + 7, &s.bias_units, 4);
     std::memcpy(raster + 8, &s.bias_clamp, 4);
+    bool slack = s.depth.depth_test && equal_slack_pass(s.depth);
+    raster[9] = slack;
     bool all = !b.has_dynamic;
     b.has_dynamic = true;
     auto differs = [&](bool d) { return (all || d) ? (g_state_set++, true) : (g_state_kept++, false); };
@@ -95,7 +97,7 @@ void set_dynamic(VkCommandBuffer cb, const VkViewport& vp, const VkRect2D& sc) {
     if (differs(std::memcmp(b.blend, s.blend_color, sizeof b.blend) != 0))
         p_vkCmdSetBlendConstants(cb, s.blend_color), std::memcpy(b.blend, s.blend_color, sizeof b.blend);
     if (differs(std::memcmp(b.raster, raster, sizeof raster) != 0))  // stencil reference and masks, depth bias
-        raster_dynamic(cb), std::memcpy(b.raster, raster, sizeof raster);  // (nvn_raster.cpp)
+        raster_dynamic(cb, slack), std::memcpy(b.raster, raster, sizeof raster);  // (nvn_raster.cpp)
 }
 
 void begin_rendering(VkCommandBuffer cb, const Targets& t) {

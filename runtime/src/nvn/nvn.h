@@ -112,6 +112,7 @@ T* get(uint64_t guest) {
 // while a replay may still hold a pointer from get<T>() (nvn_trace.cpp). Under objects_lock.
 void defer_object(std::unique_ptr<Object> o);
 void drain_objects();
+void wait_submits_so_far();  // nvn_queue.cpp: until the submits made so far were replayed (DEBUG.md #59)
 
 template <typename T>
 T& make(uint64_t guest) {
@@ -312,6 +313,9 @@ struct DepthStencilInfo {
 struct PolygonInfo {
     uint32_t cull = 0, front = 0, mode = 0, offset_enables = 0;
 };
+// nvn_raster.cpp: an EQUAL colour pass after a depth pre-pass (tested, not written), drawn with a small depth bias
+// toward the camera (DEBUG.md #60). NX_EQUAL_SLACK=<units> (default 4, 0: off); the slope term is 1 per unit of it.
+bool equal_slack_pass(const DepthStencilInfo& d);
 
 struct TargetViews {  // SetRenderTargets' blob: level and layer per color target (0..7) and depth (8)
     uint8_t level[9] = {};

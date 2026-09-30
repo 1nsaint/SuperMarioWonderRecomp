@@ -112,6 +112,7 @@ void MemoryPoolInitialize(CPU& c) {
 }
 
 void MemoryPoolFinalize(CPU& c) {
+    wait_submits_so_far();              // a submit replayed on another thread may still read it
     worker_finish();                    // the replay thread may still read it
     gpu_wait(gpu_write_back_serial());  // NX_ASYNC_GPU: no compute result lands in freed memory
     if (auto* p = get<MemoryPool>(c.x[0])) pool_unregister(p);
@@ -188,6 +189,7 @@ void MemoryPoolFlushMappedRange(CPU& c) {
 }
 // The CPU is about to read what the GPU wrote: with NX_ASYNC_GPU, compute results still in flight are waited for.
 void MemoryPoolInvalidateMappedRange(CPU&) {
+    wait_submits_so_far();  // a submit replayed on another thread: its results first (nvn_queue.cpp)
     worker_finish();  // compute results reach guest memory when their submit is replayed and done
     gpu_wait(gpu_write_back_serial());
 }
