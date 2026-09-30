@@ -27,6 +27,7 @@ struct Region {
     uint64_t size = 0;  // guest bytes from the key
     uint64_t cap = 0;   // bytes of the copy from up.offset (size, then zeros)
     Upload up;          // the copy of the key's first byte
+    std::shared_ptr<std::vector<uint8_t>> before;  // the guest bytes copied in (what the GPU did not change)
 };
 using Regions = std::map<const uint8_t*, Region>;
 using It = Regions::iterator;
@@ -128,6 +129,10 @@ Upload written_bind(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_
     r.up = alloc_anchored(r.cap, off);
     std::memcpy(r.up.ptr, lo, n);
     std::memset(r.up.ptr + n, 0, r.cap - n);
+    r.before = std::make_shared<std::vector<uint8_t>>(r.up.ptr, r.up.ptr + n);
+    for (It it : old)  // their parts: as they were before their own GPU writes
+        if (it->second.before)
+            std::memcpy(r.before->data() + (it->first - lo), it->second.before->data(), it->second.before->size());
     if (!old.empty()) {
         copy_regions(cb, old, lo, n, r.up);  // dispatch(): no render pass is open
         for (It it : old) g_regions.erase(it);
@@ -220,7 +225,7 @@ void written_cpu_write(const uint8_t* p, uint64_t size) {
 std::vector<WriteBack> written_take() {
     std::vector<WriteBack> v;
     v.reserve(g_regions.size());
-    for (auto& [p, r] : g_regions) v.push_back({r.up.ptr, const_cast<uint8_t*>(p), r.size});
+    for (auto& [p, r] : g_regions) v.push_back({r.up.ptr, const_cast<uint8_t*>(p), r.size, r.before});
     g_regions.clear();
     return v;
 }
@@ -236,3 +241,28 @@ void written_log() {
 }
 
 }  // namespace nx::nvn::replay
+
+namespace nx::nvn {
+
+// A bound storage range is often larger than what the shader writes, and the game's recording thread writes the
+// rest of those buffers while the submit is replayed. Copying the whole range back put stale bytes over them: meshes
+// exploded into beams and a band of stretched triangles at the horizon, for the rest of the run (DEBUG.md #56). Only
+// the words the GPU changed go back. NX_WRITE_BACK_WHOLE=1: the old whole-range copy.
+void apply_write_back(const WriteBack& w) {
+    static const bool whole = std::getenv("NX_WRITE_BACK_WHOLE") != nullptr;
+    if (whole || !w.before || w.before->size() < w.size) {
+        std::memcpy(w.to, w.from, w.size);
+        return;
+    }
+    const uint8_t* was = w.before->data();
+    uint64_t k = 0;
+    for (; k + 8 <= w.size; k += 8) {
+        if (std::memcmp(w.from + k, was + k, 8) == 0) continue;
+        for (uint64_t b = k; b < k + 8; b += 4)
+            if (std::memcmp(w.from + b, was + b, 4) != 0) std::memcpy(w.to + b, w.from + b, 4);
+    }
+    for (; k < w.size; k++)
+        if (w.from[k] != was[k]) w.to[k] = w.from[k];
+}
+
+}  // namespace nx::nvn

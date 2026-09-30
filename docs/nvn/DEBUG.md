@@ -586,7 +586,7 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
       pipeline key and `alphaToCoverageEnable` (`NX_NO_ALPHA_TO_COVERAGE=1`).
     - **Copies within one image.** A copy between two subresources of one image (two texture objects sharing it,
       #36) is no longer dropped; it runs in GENERAL layout with explicit barriers (`NX_COPY_NO_SAME_IMAGE=1`).
-    - "Too bad!" is still drawn hollow: not a masked clear (none happened). Next suspect: the glyph pass itself.
+    - "Too bad!" is drawn hollow by design (see #56): not a masked clear (none happened).
 53. **Compute results within a submit (GLITCH-PLAN G5, `nvn_written.cpp`).**
     - The problem:
       - a storage buffer a dispatch writes was a private copy of guest memory, written back only after the submit;
@@ -635,3 +635,30 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
     - The horizon band is not this: it still appeared in 1 of 3 runs. Up close it is stretched geometry with
       sparkles around it, and it lasts the whole run once it appears: a GPU-simulated effect whose state went bad.
       `NX_TRACE_NAN=1` logs non-finite or huge floats in compute write-backs, with the shader.
+56. **The game records frame N+1 while frame N is replayed: pool slots at the replay's mark, selective write-back.**
+    - Measured: 98.5% of `nvnTexturePoolRegisterTexture` calls (236 k of 240 k in a run) happen while another thread
+      replays a submit. Wonder has a recording thread and a submit thread, so our synchronous replay of frame N runs
+      while the next frame's textures are re-initialized and its pool slots registered.
+    - **Pool slots.**
+      - `texture_for` read the pools' maps with no lock, and as they were at that instant.
+      - Each registration now records the entry it replaces, with an epoch (`note_pool_change`).
+      - The replay reads the slot as it was at its mark (`pool_entry_at`), under the objects lock, like #55 does for
+        texture objects.
+      - In the test runs no lookup needed an older entry: the game registers the next frame in other slots. The lock
+        and the history stay for safety.
+    - **Write-backs.**
+      - A compute shader's storage range was copied back whole after the submit. The range is often larger than
+        what the shader writes, and the recording thread writes the rest of those buffers meanwhile, so stale bytes
+        went over them.
+      - Now each written range keeps the guest bytes it was made from, and only the words the GPU changed go back
+        (`apply_write_back`).
+      - `NX_WRITE_BACK_WHOLE=1` restores the old whole-range copy.
+    - **Still open: the horizon band.** It still appeared in 1 of 4 runs after both changes. One run showed the
+      fence stumps exploded into huge beams before the band, so it is mesh data, not a texture. Next:
+      `private/wonder/band_hunt.sh` snapshots every draw of the main pass, cropped to the band (`NX_SNAP_CROP`), to
+      name the draw.
+    - **"Too bad!" is hollow by design.**
+      - Its font (`fcpx/NewMarioFontOutlineLL`, face `NinNewSuperMarioBrosT53ou`) is an outline typeface: rasterised
+        with FreeType it gives the same ring letters.
+      - The Miss layout has nothing that fills the letters: two capture panes, one of them a blurred black shadow.
+      - Only the soft shadow may be weaker than on hardware (the blur chain, GLITCH-PLAN G10).

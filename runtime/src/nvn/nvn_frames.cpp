@@ -98,7 +98,7 @@ bool retire_oldest() {
     if (r == VK_ERROR_DEVICE_LOST) gpu_hung("vkWaitForFences");
     if (r != VK_SUCCESS) log("nvn/vk: vkWaitForFences failed (%d)", int(r));
     g_wait_ns += plat::monotonic_ns() - t0;
-    for (const WriteBack& w : s->write_backs) std::memcpy(w.to, w.from, w.size);
+    for (const WriteBack& w : s->write_backs) apply_write_back(w);
     s->write_backs.clear();
     if (s->descriptors_used) p_vkResetDescriptorPool(vk_device(), s->descriptors, 0);
     s->descriptors_used = false;

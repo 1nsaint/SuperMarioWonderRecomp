@@ -394,6 +394,18 @@ void debug_snapshot(VkCommandBuffer cb, GpuImage& img, uint64_t draw) {
     if (!img.image || !(img.aspect & VK_IMAGE_ASPECT_COLOR_BIT)) return;
     Snap snap;
     snap.w = img.width, snap.h = img.height, snap.draw = draw;
+    // NX_SNAP_CROP=x,y,w,h (fractions of the image): only that part (8 MB per whole 1080p snapshot otherwise).
+    static float crop[4] = {0, 0, 1, 1};
+    static const bool cropped = [] {
+        const char* e = std::getenv("NX_SNAP_CROP");
+        return e && std::sscanf(e, "%f,%f,%f,%f", &crop[0], &crop[1], &crop[2], &crop[3]) == 4;
+    }();
+    int32_t x0 = 0, y0 = 0;
+    if (cropped) {
+        x0 = int32_t(crop[0] * img.width), y0 = int32_t(crop[1] * img.height);
+        snap.w = std::max(1u, std::min(uint32_t(crop[2] * img.width), img.width - uint32_t(x0)));
+        snap.h = std::max(1u, std::min(uint32_t(crop[3] * img.height), img.height - uint32_t(y0)));
+    }
     if (!make_scratch(snap.s, snap.w, snap.h)) {
         snap.s.destroy(vk_device());
         return;
@@ -406,9 +418,10 @@ void debug_snapshot(VkCommandBuffer cb, GpuImage& img, uint64_t draw) {
     transition(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkImageBlit blit{};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.srcOffsets[1] = {int32_t(snap.w), int32_t(snap.h), 1};
+    blit.srcOffsets[0] = {x0, y0, 0};
+    blit.srcOffsets[1] = {x0 + int32_t(snap.w), y0 + int32_t(snap.h), 1};
     blit.dstSubresource = blit.srcSubresource;
-    blit.dstOffsets[1] = blit.srcOffsets[1];
+    blit.dstOffsets[1] = {int32_t(snap.w), int32_t(snap.h), 1};
     p_vkCmdBlitImage(cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, snap.s.image,
                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
     transition(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);

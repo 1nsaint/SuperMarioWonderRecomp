@@ -79,7 +79,7 @@ check and the fix. Order = expected visual impact per unit of work. Tracked in m
 
 ## G6. Clears ignore scissor and channel mask
 
-- **Effect.** Atlas tiles wiped, alpha-only clears destroy RGB. Suspect for the hollow "Too bad!".
+- **Effect.** Atlas tiles wiped, alpha-only clears destroy RGB. (The hollow "Too bad!" is by design: DEBUG #56.)
 - **Fix.**
   - Scissored clears: `vkCmdClearAttachments` with rect = scissor ∩ extent.
   - Masked clears: a small fullscreen draw with that write mask.

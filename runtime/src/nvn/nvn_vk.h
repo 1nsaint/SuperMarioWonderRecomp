@@ -74,7 +74,10 @@ struct WriteBack {
     uint8_t* from;
     uint8_t* to;
     uint64_t size;
+    // The guest bytes as they were when the copy was made: only what the GPU changed goes back (nvn_written.cpp).
+    std::shared_ptr<std::vector<uint8_t>> before;
 };
+void apply_write_back(const WriteBack& w);  // nvn_written.cpp
 std::vector<WriteBack> draw_take_write_backs();  // nvn_draw.cpp: this submit's, for an asynchronous submit
 void debug_dump_textures(uint64_t frame);  // nvn_debug.cpp: NX_DUMP_TEXTURES and the requested ones
 void debug_dump_requested(uint64_t n);      // nvn_debug.cpp: NX_DUMP_ON_TARGET / NX_DUMP_ON_FS

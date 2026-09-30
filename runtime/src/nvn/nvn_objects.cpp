@@ -584,8 +584,14 @@ void TexturePoolRegister(CPU& c) {
         if (auto* t = get<Texture>(c.x[2])) t->pool_swizzle = v.swizzle;
     if (auto* d = get<DescriptorPool>(c.x[0])) {
         std::lock_guard lk(objects_lock());
-        uint64_t old = d->textures.count(uint32_t(c.x[1])) ? d->textures[uint32_t(c.x[1])] : 0;
-        d->textures[uint32_t(c.x[1])] = c.x[2];
+        uint32_t id = uint32_t(c.x[1]);
+        PoolEntry before;  // what a replay in flight still has to see in this slot (nvn_incarnation.cpp)
+        if (auto it = d->textures.find(id); it != d->textures.end()) before.has = true, before.texture = it->second;
+        if (auto it = d->snapshots.find(id); it != d->snapshots.end()) before.snapshot = it->second;
+        if (auto it = d->views.find(id); it != d->views.end()) before.has_view = true, before.view = it->second;
+        note_pool_change(c.x[0], id, before);
+        uint64_t old = before.texture;
+        d->textures[id] = c.x[2];
         if (auto s = d->snapshots.find(uint32_t(c.x[1])); s != d->snapshots.end()) drop_snapshot(s->second);
         if (uint64_t snap = make_snapshot(c.x[2])) d->snapshots[uint32_t(c.x[1])] = snap;
         auto& slots = g_registered[c.x[2]];  // re-registered every frame: keep each slot once

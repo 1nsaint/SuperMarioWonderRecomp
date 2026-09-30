@@ -13,6 +13,7 @@
 // and see the current object; only gpu_submit sets one, for its own thread. Lock order is unchanged: the GPU lock,
 // then objects_lock; nothing here waits for the GPU lock.
 #include <cstdlib>
+#include <map>
 #include <utility>
 #include <vector>
 
@@ -63,7 +64,33 @@ Object* find_object(uint64_t guest, uint64_t mark) {
     return current;
 }
 
-void purge_incarnations() { g_retired.clear(); }
+namespace {
+// (pool, id) -> (epoch of the change, the entry before it), in epoch order. Under objects_lock.
+std::map<std::pair<uint64_t, uint32_t>, std::vector<std::pair<uint64_t, PoolEntry>>> g_pool_changes;
+std::atomic<uint64_t> g_pool_old{0};
+}  // namespace
+
+void note_pool_change(uint64_t pool, uint32_t id, const PoolEntry& before) {
+    if (texture_race_old()) return;
+    g_pool_changes[{pool, id}].push_back({g_epoch.fetch_add(1, std::memory_order_acq_rel) + 1, before});
+}
+
+bool pool_entry_at(uint64_t pool, uint32_t id, uint64_t mark, PoolEntry& out) {
+    if (!mark || g_pool_changes.empty()) return false;
+    auto h = g_pool_changes.find({pool, id});
+    if (h == g_pool_changes.end()) return false;
+    for (auto& [epoch, entry] : h->second)
+        if (epoch > mark) {
+            out = entry;
+            uint64_t n = g_pool_old.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n == 1 || n % 100000 == 0)
+                log("nvn: %llu replay lookups resolved a pool slot registered again mid-replay", (unsigned long long)n);
+            return true;
+        }
+    return false;
+}
+
+void purge_incarnations() { g_retired.clear(), g_pool_changes.clear(); }
 
 ReplayScope::ReplayScope() {
     drain_objects();

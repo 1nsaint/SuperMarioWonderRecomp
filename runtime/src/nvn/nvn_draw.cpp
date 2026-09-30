@@ -42,28 +42,37 @@ void texture_for(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, ViewI
     uint32_t tid = handle_texture(handle, &sid);
     texture = 0;
     if (view) *view = {};
-    if (auto* tp = get<DescriptorPool>(g_state.texture_pool)) {
-        auto it = tp->textures.find(tid);
-        if (it != tp->textures.end()) texture = it->second;
+    // The pools' maps are read under the objects lock, and at the replay's mark (nvn_incarnation.cpp): the game's
+    // recording thread registers the next frame's slots meanwhile (98% of the registrations, DEBUG.md #56).
+    auto* tp = get<DescriptorPool>(g_state.texture_pool);
+    auto* sp = get<DescriptorPool>(g_state.sampler_pool);
+    PoolEntry e;
+    {
+        std::shared_lock lk(objects_lock());
+        if (tp && !pool_entry_at(g_state.texture_pool, tid, t_replay_mark, e)) {
+            if (auto it = tp->textures.find(tid); it != tp->textures.end()) e.has = true, e.texture = it->second;
+            if (auto it = tp->snapshots.find(tid); it != tp->snapshots.end()) e.snapshot = it->second;
+            if (auto it = tp->views.find(tid); it != tp->views.end()) e.has_view = true, e.view = it->second;
+        }
+        if (sp)
+            if (auto it = sp->samplers.find(sid); it != sp->samplers.end()) sampler = it->second;
+    }
+    if (tp) {
+        texture = e.texture;
         // The slot's texture gone or re-initialized as another kind: the copy made at registration (nvn_objects.cpp).
         // NX_SNAPSHOT_SHAPE=1 also uses the copy when only the memory or size changed (the pool's descriptor copy):
         // it broke the course's foreground flowers (dynamic-resolution targets re-initialized every frame are meant
         // to be followed) and did not light the Goombas (docs/nvn/DEBUG.md #45).
         static const bool kind_only = std::getenv("NX_SNAPSHOT_SHAPE") == nullptr;
-        if (auto s = tp->snapshots.find(tid); texture && s != tp->snapshots.end()) {
+        if (texture && e.snapshot) {
             Texture* now = get<Texture>(texture);
-            Texture* then = get<Texture>(s->second);
+            Texture* then = get<Texture>(e.snapshot);
             bool moved = now && then && !kind_only &&
                          (now->memory != then->memory || now->width != then->width || now->height != then->height ||
                           now->depth != then->depth || now->levels != then->levels);
-            if (then && (!now || moved || now->target != then->target || now->format != then->format)) texture = s->second;
+            if (then && (!now || moved || now->target != then->target || now->format != then->format)) texture = e.snapshot;
         }
-        auto v = tp->views.find(tid);
-        if (view && v != tp->views.end()) *view = v->second;
-    }
-    if (auto* sp = get<DescriptorPool>(g_state.sampler_pool)) {
-        auto it = sp->samplers.find(sid);
-        if (it != sp->samplers.end()) sampler = it->second;
+        if (view && e.has_view) *view = e.view;
     }
 }
 
@@ -616,7 +625,7 @@ void draw_end_submit() {  // after the submit's fence: compute results to guest 
     debug_snapshots_write();
     for (const WriteBack& w : draw_take_write_backs()) {
         trace_nan_write_back(w.from, w.to, w.size);
-        std::memcpy(w.to, w.from, w.size);
+        apply_write_back(w);
     }
 }
 

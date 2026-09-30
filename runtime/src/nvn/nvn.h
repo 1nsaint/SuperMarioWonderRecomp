@@ -216,6 +216,17 @@ struct DescriptorPool : Object {  // an NVNtexturePool or NVNsamplerPool
     std::map<uint32_t, SamplerInfo> samplers;  // id -> sampler state
 };
 
+// A texture pool slot as a replay must see it (nvn_incarnation.cpp, DEBUG.md #56): the game registers the next
+// frame's slots from its recording thread while a submit is replayed, so each change records the entry it replaces.
+struct PoolEntry {
+    bool has = false, has_view = false;
+    uint64_t texture = 0, snapshot = 0;
+    ViewInfo view;
+};
+void note_pool_change(uint64_t pool, uint32_t id, const PoolEntry& before);  // objects_lock held exclusively
+// objects_lock held: the slot's entry at `mark` when it changed since (false: the current entry is the one).
+bool pool_entry_at(uint64_t pool, uint32_t id, uint64_t mark, PoolEntry& out);
+
 // NVNformat -> VkFormat, and whether it is color (0), depth (1), stencil (2) or both (3) (nvn_format.cpp).
 VkFormat vk_format(uint32_t format);
 uint32_t format_aspect(uint32_t format);
