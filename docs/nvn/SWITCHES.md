@@ -60,3 +60,4 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
 | `NX_FULLSCREEN=1` | start fullscreen (F11 / Alt+Enter toggle) | platform_win.cpp |
 | `NX_HANDHELD=1` | handheld mode: the game renders for 1280x720 | svc_am.cpp |
 | `NX_ASTC_DECODE=1` | ASTC decoded on the CPU even where the GPU has it (compare with the hardware decoder; DEBUG-2 #69) | nvn_vk.cpp, nvn_upload.cpp |
+| `NX_NO_PASS_BARRIER=1` | no barrier after render passes, as before DEBUG-2 #71 (bisecting) | nvn_draw.cpp |

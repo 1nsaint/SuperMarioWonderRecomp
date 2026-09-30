@@ -179,3 +179,16 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
     `NX_GPU=discrete|integrated|<index>|<name part>` chooses (`nvn_gpu_pick.cpp`); the default is the first discrete
     GPU. Every device and the choice are logged. `gpu_pick_test` covers the rule (it caught `NX_GPU=3050` being read
     as an index).
+
+71. **No barrier between render passes: the course HUD in blocks on NVIDIA, a black sky on Intel.**
+    - Symptoms: on the RTX 3050 the HUD (coins, lives) had rectangular holes that changed every frame; on the UHD 770
+      with `NX_ASTC_DECODE=1` the sky was black with green edges and a stretch of ground was garbage. Neither showed
+      synchronously on the Mac, nor on the UHD 770 with its own ASTC (timing).
+    - Cause: rendered images stay in `GENERAL` (they are sampled while rendered), so `transition()` records no
+      barrier, and `pass_end_only` ended a pass with none either. The next pass sampled, copied or loaded what the
+      last one wrote with no dependency. Metal (MoltenVK) tracks those hazards itself; NVIDIA overlaps passes and
+      read half-written tiles.
+    - Fix (`nvn_draw.cpp` `pass_end_only`): a memory barrier after every pass, from the graphics stages' attachment
+      and shader writes to all later reads and writes. `NX_NO_PASS_BARRIER=1`: none, as before.
+    - Cost: none measurable (course 58 fps headless on the RTX 3050, as before).
+    - Check: the HUD is whole in every frame of the course on both GPUs, and the sky is right with the CPU decoder.
