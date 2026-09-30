@@ -680,3 +680,29 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
     - Result: 4 course runs of 290 s, 28 course frames, no band, no exploded mesh, no white foreground (before:
       about 1 run in 3). 44.6-46.7 fps.
     - The 60 fps plan from the performance study is in docs/nvn/PERF-PLAN.md.
+58. **The character-select blur (GLITCH-PLAN G10, issue #42): the chain runs, and the game's own stream clears it.**
+    - Corrections to G10:
+      - The blur is a one-shot capture in the frame after the first button press (layout `TitleBlurBG`), not a
+        per-frame pass.
+      - `multi_filter_expand` is never bound because `Blur00.baglmf` disables every expand unit.
+      - The halftone dots and the grey mask are drawn. Only the blurred picture is missing.
+    - The chain, as replayed (`NX_TRACE_PASSES`, `NX_TRACE_CMDS`, snapshots):
+      1. `ClearColor` of the work target A (1920x1080 RGBA8);
+      2. a quad copies the framebuffer into A. A snapshot right after shows the whole title picture;
+      3. `SetRenderTargets(A)` again, then `ClearColor(0, 0, 0, 0)` with mask 0xF, in the same command list;
+      4. `multi_filter_reduce` samples A into 480x270, then the gaussian passes and the copy into the pane texture.
+         All of them come out black.
+    - Step 3 is in the game's recorded stream, and we replay it as recorded. The bound channel mask is 0xF too, and
+      the scissor is the whole target.
+    - Ruled out: uniforms (`NX_TRACE_UUB`), sampler and view (`NX_TRACE_SAMPLERS`), deferred clears, fresh-target
+      clears, image sharing, dedup.
+    - Open question: whether the hardware skips or restricts that clear (an NVN clear rule we do not know), or
+      whether the console's picture is sharp under the mask and dots too. It needs a capture from a real console.
+    - New switches:
+      - `NX_TRACE_PASSES=<draw>`: pass begins (load ops), ends (reason) and clears.
+      - `NX_TRACE_CMDS=<draw>`: every replayed op.
+      - `NX_TRACE_UUB=<draw>`: uniform updates.
+      - `NX_TRACE_SAMPLERS=1`: sampler and view of each sampled texture in `NX_TRACE_DRAWS`.
+    - In the `NX_TRACE_DRAWS` log, the detail lines printed after a `draw N:` line describe draw N+1.
+    - `NX_TRACE_GLYPHS` crashes on draws that are not text (it reads the glyph atlas at the draw's UVs): use it only
+      with `NX_TRACE_FS_HASH` of a text shader.

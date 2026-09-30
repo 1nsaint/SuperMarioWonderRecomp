@@ -113,6 +113,9 @@ check and the fix. Order = expected visual impact per unit of work. Tracked in m
 
 ## G10. Separate bugs
 
+Update (DEBUG #58): the character-select blur chain runs once and the game's own stream clears its capture; needs a
+console reference before any change. The items below are the original study.
+
 - **#30, character select blur + halftone.** Missing since before c41b534. The `multi_filter_expand` program is
   never bound.
   - `replay_copy` drops copies when `src == dst`; images are shared since #36, so same-image level copies vanish.

@@ -60,6 +60,9 @@ bool snap_follow(const Targets& t, const ShaderInfo* vs, const ShaderInfo* fs, c
 // NX_TRACE_NAN=1 (nvn_draw_trace.cpp): non-finite or huge floats in what compute shaders wrote, with the shader.
 void trace_nan_dispatch(const ShaderInfo* cs);
 void trace_nan_write_back(const uint8_t* from, const uint8_t* to, uint64_t size);
+// NX_TRACE_PASSES=<first draw> (nvn_draw_trace.cpp): 4000 pass events from that draw on (begin with its load ops,
+// end with its reason, clears deferred or done in the pass), each with its colour target 0 and depth.
+void trace_pass(const char* what, const Targets& t, uint32_t a, uint32_t b);
 using TexBindings = std::vector<std::pair<const ShaderInfo*, const DescriptorBinding*>>;
 // NX_TRACE_DRAWS & co (docs/nvn/DEBUG.md): logs a replayed draw with its state, when the switches select it.
 void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, const ShaderInfo* vs,

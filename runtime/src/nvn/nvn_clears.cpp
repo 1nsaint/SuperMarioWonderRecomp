@@ -191,6 +191,7 @@ void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
                 g_pending.ds |= a.aspectMask;
             }
             g_deferred++;
+            replay::trace_pass("clear deferred: slot, mask", t, color ? c.n : 8, c.mask);
             return;
         }
     }
@@ -220,6 +221,8 @@ void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
     }
     g_mask_fallback += masked;
     VkClearRect r{rect, 0, 1};  // unscissored: all of the target, which is the pass's area
+    replay::trace_pass("clear in pass: slot, mask | bound channel mask << 8", t, color ? c.n : 8,
+                       c.mask | (color ? uint32_t(replay::g_state.mask.mask[c.n]) << 8 : 0));
     p_vkCmdClearAttachments(cb, 1, &a, 1, &r);
     pass_mark_written(color ? 1u << c.n : 1u << 8);  // a later draw sampling it needs a fresh pass
 }

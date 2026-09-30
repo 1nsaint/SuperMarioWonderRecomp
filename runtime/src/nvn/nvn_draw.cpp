@@ -168,6 +168,7 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     p_vkCmdBeginRendering(cb, &ri);
     g_rendering = true;
     g_pass_written = cleared | fresh;  // as a clear inside the pass: sampling it needs it stored first
+    trace_pass("begin: cleared, fresh", t, cleared, fresh);
     g_pass = t;
     g_pass_extent = extent;
 }
@@ -668,7 +669,7 @@ void draw_log_stats() {
 
 void pass_end_only(VkCommandBuffer cb, int reason) {
     if (!g_rendering) return;
-    g_pass_ends[reason & 7]++;
+    g_pass_ends[reason & 7]++, trace_pass("end: reason", g_pass, uint32_t(reason), 0);
     p_vkCmdEndRendering(cb);
     g_rendering = false;
     gpu_profile_mark(cb, "outside passes (clears, uploads, copies)");

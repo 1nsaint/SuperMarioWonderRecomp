@@ -112,6 +112,18 @@ void trace_nan_write_back(const uint8_t* from, const uint8_t* to, uint64_t size)
         (unsigned long long)first, f[first], who.c_str());
 }
 
+void trace_pass(const char* what, const Targets& t, uint32_t a, uint32_t b) {
+    static const char* env = std::getenv("NX_TRACE_PASSES");
+    static const uint64_t from = env ? std::strtoull(env, nullptr, 10) : 0;
+    static int n = 0;
+    if (!env || g_stats.done < from || n++ >= 4000) return;
+    Texture* c0 = t.color_count && t.colors[0] ? get<Texture>(t.colors[0]) : nullptr;
+    log("pass: %s %x %x after draw %llu: %u colours, 0 = %llx (%ux%u f%x L%u l%u view f%x) depth %llx", what, a, b,
+        (unsigned long long)g_stats.done, t.color_count, (unsigned long long)t.colors[0], c0 ? c0->width : 0,
+        c0 ? c0->height : 0, c0 ? c0->format : 0, t.views.level[0], t.views.layer[0], t.views.format[0],
+        (unsigned long long)t.depth);
+}
+
 // NX_SNAP_FOLLOW=<fs hash>@<first draw>: from the first draw with that fragment shader, the next 48 draws into its
 // colour target 0 are logged (shaders, textures) and snapshotted after (frames/00000_<draw>.ppm): which draw of a
 // pass paints what.
@@ -172,13 +184,18 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
         for (size_t k = 0; k < tex_bindings.size(); k++) {
             uint64_t texture = 0;
             SamplerInfo si;
-            texture_for(handles[k], texture, si);
+            ViewInfo vw;
+            texture_for(handles[k], texture, si, &vw);
             Texture* tx = texture ? get<Texture>(texture) : nullptr;
             char b[96];
-            if (std::getenv("NX_TRACE_GLYPHS"))
-                log("  sampler for t%zu: min %u mag %u wrap %u/%u/%u compare %u/%u reduction %u lod %g..%g bias %g aniso %g",
+            if (std::getenv("NX_TRACE_GLYPHS") || std::getenv("NX_TRACE_SAMPLERS"))  // NX_TRACE_SAMPLERS: only these
+                log("  sampler for t%zu: min %u mag %u wrap %u/%u/%u compare %u/%u reduction %u lod %g..%g bias %g aniso %g; "
+                    "view levels %u+%u layers %u+%u swizzle %08x format %#x; texture levels %u swizzle %u%u%u%u pool %08x",
                     k, si.min_filter, si.mag_filter, si.wrap[0], si.wrap[1], si.wrap[2], si.compare_mode, si.compare_func,
-                    si.reduction, si.lod_min, si.lod_max, si.lod_bias, si.max_anisotropy);
+                    si.reduction, si.lod_min, si.lod_max, si.lod_bias, si.max_anisotropy, vw.base_level, vw.levels,
+                    vw.min_layer, vw.layers, vw.swizzle, vw.format, tx ? tx->levels : 0, tx ? tx->swizzle[0] : 0,
+                    tx ? tx->swizzle[1] : 0, tx ? tx->swizzle[2] : 0, tx ? tx->swizzle[3] : 0,
+                    tx ? tx->pool_swizzle.load() : 0);
             std::snprintf(b, sizeof b, " t%zu=%llx:%llx(%ux%u f%x%s)", k, (unsigned long long)handles[k],
                           (unsigned long long)texture, tx ? tx->width : 0, tx ? tx->height : 0, tx ? tx->format : 0,
                           tx && tx->image && tx->image->rendered ? " rt" : "");
