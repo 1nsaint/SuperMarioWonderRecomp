@@ -82,3 +82,36 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
       silhouettes were never seen headless).
 
     ![Course at 60 fps](../media/wonder/38-course-60fps-pipelined.png)
+
+## W8 (2026-09-30, night)
+
+65. **Button icons showed as "?" (issue #49): our own NintendoExtended font.**
+    - The game draws button icons as Private Use Area characters of shared font 5 (NintendoExtended). `hle_pl.cpp`
+      gave it Arial Unicode, which has none of them. The console's fonts (system archives 0100000000000810-814 of
+      firmware 23) are key generation 23, and our keys stop at `master_key_15`.
+    - The codepoints come from the game's own text (`Mals/*/Key.msbt` labels):
+      - E0E0-E0E9: A, B, X, Y, L, R, ZL, ZR, SL, SR;
+      - E0EF / E0F0: Plus / Minus;
+      - E0AB-E0AE, E0EA: the D-pad;
+      - E100 / E101: the sticks;
+      - E090-E097: the directions;
+      - also the older E0A0-E0A9 set and E145/E146 (seen in layouts only).
+    - The title is "Press <10.14:08cd> + <10.14:09cd> to Start": L + R.
+    - `tools/fonts/make_button_font.py` draws those glyphs (our own vector shapes; only the letters inside come from
+      the host font). It writes `private/wonder/fonts/shared_5.ttf` (git-ignored: it embeds the host font), which
+      `hle_pl.cpp` already loads first.
+    - Check: the title reads "Press [L] + [R] to Start", and menus show "(B) Back (A) Select".
+    - To build it: `private/venv/bin/python tools/fonts/make_button_font.py`.
+
+66. **Windowed stretches at 35-40 fps (issue #51): the GPU goes past the frame, headless does not.**
+    - In the play session log, the slow stretches in the course show:
+      - replay 8-10 ms;
+      - `fence wait` 13-15 ms: all of it the wait for the first part of the split submit, with no throttle waits;
+      - 60 of 60 submits split.
+      So the GPU takes ~25 ms per frame there.
+    - The same course headless: replay ~6 ms, fence ~4 ms, 60 fps. Audio is not the difference: the renderer runs
+      headless too, only the output is dropped.
+    - A windowed test run cannot measure it unattended. When the window is covered, SDL reports it hidden and
+      `gpu_present` stops (`window_minimized`).
+    - Next, with the window visible: `NX_GPU_PROFILE=1` in the slow stretch; `NX_PIPELINED=3`; and a check of whether
+      the compositor holds the 3 swapchain images (IMMEDIATE, 2560x1440).
