@@ -177,6 +177,9 @@ struct Texture : Object {
         std::vector<uint8_t> data;  // rows of whole blocks, tightly packed
     };
     std::vector<TexelWrite> writes;  // under objects_lock()
+    // Whether `writes` holds anything: set and cleared with it, under objects_lock() alone, and read without the lock
+    // (every sampled texture of every replayed draw asks; docs/nvn/PERF-PLAN.md).
+    std::atomic<bool> has_writes{false};
     // The CPU wrote the texture's memory (nvnMemoryPoolFlushMappedRange over it, e.g. a glyph cache): upload again.
     std::atomic<bool> dirty{false};
     // The swizzle of the texture-pool view it is registered with (4 NVNtextureSwizzle bytes, 0: none).

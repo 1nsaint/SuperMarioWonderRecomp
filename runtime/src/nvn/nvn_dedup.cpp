@@ -5,6 +5,7 @@
 // dispatch writes are read from their written copy, nvn_written.cpp, and invalidated here): a copy made once can
 // serve every later draw of the submit that binds the same bytes.
 #include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -23,6 +24,18 @@ struct Entry {
 std::map<const uint8_t*, Entry> g_copies;
 uint64_t g_saved = 0, g_copied = 0;
 
+// In front of the map (a tree walk per bound buffer of every draw, and most are hits): a slot per address hash with a
+// copy of that address's entry in g_copies. A slot of the current generation always equals the map's entry: both are
+// written together, dedup_invalidate clears the slot of each entry it erases, dedup_reset starts a new generation.
+struct Front {
+    const uint8_t* p = nullptr;
+    uint64_t generation = 0;
+    Entry entry;
+};
+Front g_front[1024];
+uint64_t g_generation = 1;
+Front& front_of(const uint8_t* p) { return g_front[(uintptr_t(p) >> 4 ^ uintptr_t(p) >> 14) & 1023]; }
+
 }  // namespace
 
 Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align) {
@@ -32,21 +45,28 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
         return u;
     }
     static const bool off = std::getenv("NX_NO_DEDUP") != nullptr;  // bisecting: a fresh copy every time
-    auto it = off ? g_copies.end() : g_copies.find(p);
-    if (it != g_copies.end() && it->second.size == size && it->second.padded == padded &&
-        it->second.upload.offset % align == 0) {
+    Front& f = front_of(p);
+    const Entry* e = nullptr;
+    if (!off && f.generation == g_generation && f.p == p) {
+        e = &f.entry;  // the map's entry for p
+    } else if (auto it = off ? g_copies.end() : g_copies.find(p); it != g_copies.end()) {
+        f = {p, g_generation, it->second};
+        e = &f.entry;
+    }
+    if (e && e->size == size && e->padded == padded && e->upload.offset % align == 0) {
         g_saved += padded;
-        return it->second.upload;
+        return e->upload;
     }
     Upload u = upload_alloc(padded, align);
     std::memcpy(u.ptr, p, size);
     if (padded > size) std::memset(u.ptr + size, 0, padded - size);
     g_copies[p] = {size, padded, u};
+    f = {p, g_generation, {size, padded, u}};
     g_copied += padded;
     return u;
 }
 
-void dedup_reset() { g_copies.clear(); }
+void dedup_reset() { g_copies.clear(), g_generation++; }
 
 void dedup_invalidate(const uint8_t* p, uint64_t size) {
     // Entries starting before p may still reach into it: look back over the few that can.
@@ -57,6 +77,7 @@ void dedup_invalidate(const uint8_t* p, uint64_t size) {
             if (p - it->first > (64ll << 20)) break;  // nothing larger than 64 MB is copied
             continue;
         }
+        if (Front& f = front_of(it->first); f.p == it->first) f.generation = 0;
         it = g_copies.erase(it);
     }
 }

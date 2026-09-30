@@ -1,8 +1,8 @@
 // NVN sampler states as Vulkan samplers (split from nvn_pipeline.cpp).
 #include <algorithm>
 #include <cstdlib>
-#include <map>
-#include <string>
+#include <cstring>
+#include <unordered_map>
 
 #include "nvn_pipeline.h"
 
@@ -29,9 +29,13 @@ VkSamplerAddressMode vk_wrap(uint32_t w) {  // NVN: 0 clamp, 1 repeat, 2 mirror 
 // ---- samplers -------------------------------------------------------------------------------------------------------
 
 VkSampler sampler_for(const SamplerInfo& s, bool shadow) {
-    static std::map<std::string, VkSampler> cache;
-    std::string key(reinterpret_cast<const char*>(&s), sizeof s);
-    key += shadow ? '1' : '0';
+    // Asked per texture binding of every draw: the key is the state's bytes and the flag (what the std::string key
+    // of before held, compared the same way), hashed; no allocation on a hit.
+    using Key = ByteKey<sizeof(SamplerInfo) + 1>;
+    static std::unordered_map<Key, VkSampler, ByteKeyHash> cache;
+    Key key;
+    std::memcpy(key.b, &s, sizeof s);
+    key.b[sizeof s] = shadow ? '1' : '0';
     auto& v = cache[key];
     if (v) return v;
     VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};

@@ -21,6 +21,7 @@ namespace {
 
 std::mutex g_gpu_lock;
 std::map<uint64_t, MemoryPool*> g_pools_by_gpu;  // gpu start -> pool
+std::atomic<uint64_t> g_pools_generation{1};     // bumped with every change of the map, under g_gpu_lock
 uint64_t g_gpu_next = 0x100000000ull;  // NVN GPU addresses are 40-bit; keep 0 and low values invalid
 
 }  // namespace
@@ -34,21 +35,32 @@ uint64_t gpu_alloc(uint64_t size) {
 
 void pool_register(MemoryPool* p) {
     std::lock_guard lk(g_gpu_lock);
-    g_pools_by_gpu[p->gpu] = p;
+    g_pools_by_gpu[p->gpu] = p, g_pools_generation.fetch_add(1);
 }
 
 void pool_unregister(MemoryPool* p) {
     std::lock_guard lk(g_gpu_lock);
-    g_pools_by_gpu.erase(p->gpu);
+    g_pools_by_gpu.erase(p->gpu), g_pools_generation.fetch_add(1);
 }
 
+// Asked for every buffer a replayed draw binds, mostly in the same few pools: each thread keeps the last ranges it
+// found, good until a pool is registered or unregistered (a pool's address and size are final when it registers).
 MemoryPool* pool_at_gpu(uint64_t gpu, uint64_t* offset) {
+    thread_local struct { uint64_t generation, start, size; MemoryPool* pool; } hits[8] = {};
+    thread_local uint32_t next = 0;
+    uint64_t generation = g_pools_generation.load(std::memory_order_acquire);
+    for (const auto& h : hits)
+        if (h.generation == generation && gpu - h.start < h.size) {
+            if (offset) *offset = gpu - h.start;
+            return h.pool;
+        }
     std::lock_guard lk(g_gpu_lock);
     auto it = g_pools_by_gpu.upper_bound(gpu);
     if (it == g_pools_by_gpu.begin()) return nullptr;
     --it;
     MemoryPool* p = it->second;
     if (gpu - p->gpu >= p->size) return nullptr;
+    hits[next++ & 7] = {g_pools_generation.load(std::memory_order_relaxed), p->gpu, p->size, p};
     if (offset) *offset = gpu - p->gpu;
     return p;
 }
@@ -529,6 +541,7 @@ void write_texels(CPU& c, uint64_t row_stride, uint64_t image_stride) {
         log("nvn: WriteTexels #%llu into %llx (%ux%u fmt %#x): %ux%ux%u at %u,%u,%u level %u", (unsigned long long)n,
             (unsigned long long)c.x[0], t->width, t->height, t->format, w.w, w.h, w.d, w.x, w.y, w.z, w.level);
     t->writes.push_back(std::move(w));
+    t->has_writes.store(true, std::memory_order_release);
 }
 
 void TextureWriteTexels(CPU& c) { write_texels(c, 0, 0); }
