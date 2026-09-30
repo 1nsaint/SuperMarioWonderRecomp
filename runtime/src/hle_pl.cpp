@@ -54,6 +54,8 @@ const Font& font(uint32_t type) {
 #if defined(__APPLE__)
     candidates.push_back("/System/Library/Fonts/Supplemental/Arial Unicode.ttf");
     candidates.push_back("/System/Library/Fonts/Supplemental/Arial.ttf");
+#elif defined(__ANDROID__)
+    candidates.push_back("/system/fonts/Roboto-Regular.ttf");
 #endif
     std::vector<uint8_t> ttf;
     for (const auto& path : candidates) {

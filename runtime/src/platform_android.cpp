@@ -541,6 +541,20 @@ extern "C" void android_main(android_app* app) {
         }
     }
     g_root = has_data(own) ? own : shared;
+    // config.txt's NX_* lines become environment variables (the NVN layer reads its switches with getenv), without
+    // overriding a variable already set. Android defaults: handheld (720p, the lighter GPU load).
+    {
+        std::ifstream f(g_root + "/config.txt");
+        std::string line;
+        while (std::getline(f, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            auto eq = line.find('=');
+            if (line.rfind("NX_", 0) == 0 && eq != std::string::npos)
+                setenv(line.substr(0, eq).c_str(), line.substr(eq + 1).c_str(), 0);
+        }
+        setenv("NX_HANDHELD", "1", 0);
+    }
+    start_memory_guard();
     app->onAppCmd = on_cmd;
     app->onInputEvent = on_input;
     ANativeActivity_setWindowFlags(app->activity, AWINDOW_FLAG_KEEP_SCREEN_ON | AWINDOW_FLAG_FULLSCREEN, 0);

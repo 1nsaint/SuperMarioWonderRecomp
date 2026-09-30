@@ -38,7 +38,9 @@ foreach(mod main sdk)
     target_include_directories(game_${mod} PRIVATE runtime/include "${NX_GEN_DIR}/${mod}")
     if(ANDROID)
         # Hidden visibility: calls between recompiled functions are direct, not through the PLT.
-        target_compile_options(game_${mod} PRIVATE -O2 -fPIC -fvisibility=hidden -fno-semantic-interposition)
+        # armv8.2-a+crypto: cpu.h's AES/SHA paths need __ARM_FEATURE_AES/SHA2 (the NDK default armv8-a has neither).
+        target_compile_options(game_${mod} PRIVATE -O2 -fPIC -fvisibility=hidden -fno-semantic-interposition
+                               -march=armv8.2-a+crypto)
     elseif(APPLE)
         target_compile_options(game_${mod} PRIVATE -O2 -fvisibility=hidden)
     endif()
@@ -117,16 +119,16 @@ if(ANDROID)
     # NativeActivity app: lib<game>.so, entry android_main (android_native_app_glue).
     set(GLUE "${ANDROID_NDK}/sources/android/native_app_glue")
     add_library(${NX_GAME} SHARED ${NX_RUNTIME_SOURCES} runtime/src/platform_android.cpp
-        runtime/src/platform_android_input.cpp runtime/src/platform_android_audio.cpp
+        runtime/src/platform_android_input.cpp runtime/src/platform_android_audio.cpp runtime/src/memguard_android.cpp
         "${GLUE}/android_native_app_glue.c")
     target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}" "${NX_VULKAN_SDK}/Include" "${GLUE}")
     # Our ANativeActivity_onCreate (platform_android.cpp) runs first, on the UI thread, then calls the glue's.
     set_source_files_properties("${GLUE}/android_native_app_glue.c" PROPERTIES
         COMPILE_DEFINITIONS "ANativeActivity_onCreate=glue_ANativeActivity_onCreate")
     target_link_libraries(${NX_GAME} PRIVATE game_main game_sdk android log aaudio)
-    target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden -fno-semantic-interposition)
-    # The glue's ANativeActivity_onCreate must be exported.
-    target_link_options(${NX_GAME} PRIVATE -u ANativeActivity_onCreate)
+    target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden -fno-semantic-interposition -march=armv8.2-a+crypto)
+    # The glue's ANativeActivity_onCreate must be exported. 16 KB page alignment: Android 15+ devices with 16 KB pages.
+    target_link_options(${NX_GAME} PRIVATE -u ANativeActivity_onCreate -Wl,-z,max-page-size=16384)
 elseif(APPLE)
     # macOS: SDL3 (window, input, audio) and the Vulkan loader + MoltenVK from Homebrew
     # (brew install sdl3 vulkan-headers vulkan-loader molten-vk).
