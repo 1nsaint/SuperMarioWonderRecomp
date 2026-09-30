@@ -44,6 +44,8 @@ VkSurfaceKHR g_surface = VK_NULL_HANDLE;
 VkSwapchainKHR g_swapchain = VK_NULL_HANDLE;
 std::vector<VkImage> g_sc_images;
 VkExtent2D g_sc_extent{};
+VkExtent2D g_sc_current{};  // the surface's currentExtent when the swapchain was made (SUBOPTIMAL: did it change?)
+VkSurfaceTransformFlagBitsKHR g_sc_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
 VkFormat g_sc_format = VK_FORMAT_B8G8R8A8_UNORM;
 VkSemaphore g_acquired = VK_NULL_HANDLE, g_rendered = VK_NULL_HANDLE;
 VkBool32 g_depth_clip_control = VK_FALSE;
@@ -269,6 +271,7 @@ bool make_swapchain() {
     if (g_swapchain) {
         if (async_gpu()) frame_wait_all();
         p_vkDeviceWaitIdle(g_device);
+        present_pass_release();
         p_vkDestroySwapchainKHR(g_device, g_swapchain, nullptr);
         g_swapchain = VK_NULL_HANDLE;
     }
@@ -295,9 +298,14 @@ bool make_swapchain() {
     // The present pass (nvn_present.cpp) draws the picture pre-rotated: the images are in the display's own
     // orientation (portrait on a phone held sideways). Without it the images stay upright (the Mac: identity).
     bool sideways = caps.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR);
-    if (present_pass_wanted() && sideways && extent.width > extent.height) std::swap(extent.width, extent.height);
-    if (!present_pass_wanted() && (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR))
+    bool pass = present_pass_wanted() && !present_pass_failed();
+    g_sc_current = caps.currentExtent;
+    if (pass && sideways && extent.width > extent.height) std::swap(extent.width, extent.height);
+    if (!pass && (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR))
         ci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    // Some drivers report maxImageExtent in the other orientation: the larger side bounds both.
+    uint32_t most = std::max(caps.maxImageExtent.width, caps.maxImageExtent.height);
+    if (most) extent.width = std::min(extent.width, most), extent.height = std::min(extent.height, most);
     ci.imageExtent = extent;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     if (!(caps.supportedCompositeAlpha & ci.compositeAlpha))
@@ -336,9 +344,15 @@ bool make_swapchain() {
     g_sc_images.resize(n);
     p_vkGetSwapchainImagesKHR(g_device, g_swapchain, &n, g_sc_images.data());
     g_sc_extent = extent;
-    bool pass = present_pass_targets(g_sc_format, g_sc_images, extent, ci.preTransform);
+    g_sc_transform = ci.preTransform;
+    if (n > 8) log("nvn/vk: %u swapchain images: more than the 8 present semaphores (nvn_frames.cpp)", n);
+    bool drawn = pass && present_pass_targets(g_sc_format, g_sc_images, extent, ci.preTransform);
+    if (pass && !drawn && present_pass_failed()) {  // the pass is out: an upright swapchain for the blit
+        log("nvn/vk: present pass failed: swapchain made again for the blit");
+        return make_swapchain();
+    }
     log("nvn/vk: swapchain %ux%u, %u images, transform %u, %s", extent.width, extent.height, n,
-        unsigned(ci.preTransform), pass ? "drawn by the present pass" : "blitted");
+        unsigned(ci.preTransform), drawn ? "drawn by the present pass" : "blitted");
     return true;
 }
 
@@ -573,6 +587,7 @@ void present_headless(uint64_t texture) {
 }
 
 void gpu_present(uint64_t texture, const int32_t* crop) {
+    plat::perf_hint_thread();  // the thread that presents takes part in the frame (perf_hint.cpp)
     std::lock_guard lk(g_gpu);
     PresentTimer timer;
     drain_objects();  // under the GPU lock, as in gpu_submit
@@ -583,6 +598,7 @@ void gpu_present(uint64_t texture, const int32_t* crop) {
     if (plat::window_generation() != g_window_gen) {  // Android: a new window after home or the lock screen
         if (async_gpu()) frame_wait_all();
         p_vkDeviceWaitIdle(g_device);
+        present_pass_release();
         if (g_swapchain) p_vkDestroySwapchainKHR(g_device, g_swapchain, nullptr);
         g_swapchain = VK_NULL_HANDLE;
         log("nvn/vk: new window: surface and swapchain re-made");
@@ -650,11 +666,11 @@ void gpu_present(uint64_t texture, const int32_t* crop) {
     // SUBOPTIMAL re-makes the swapchain only when the surface size changed: Android returns it for every present when
     // the swapchain's transform is not the display's (a Galaxy S23 did for Hades), a rebuild per frame.
     bool remake = r == VK_ERROR_OUT_OF_DATE_KHR;
-    if (r == VK_SUBOPTIMAL_KHR) {
+    if (r == VK_SUBOPTIMAL_KHR) {  // compared with what the swapchain was made from (its extent may be turned)
         VkSurfaceCapabilitiesKHR caps{};
         p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_physical, g_surface, &caps);
-        remake = caps.currentExtent.width != UINT32_MAX && (caps.currentExtent.width != g_sc_extent.width ||
-                                                           caps.currentExtent.height != g_sc_extent.height);
+        remake = caps.currentExtent.width != g_sc_current.width || caps.currentExtent.height != g_sc_current.height ||
+                 (present_pass_wanted() && !present_pass_failed() && caps.currentTransform != g_sc_transform);
     }
     if (remake) make_swapchain();
 }

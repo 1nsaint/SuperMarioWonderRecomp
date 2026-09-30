@@ -50,6 +50,8 @@ bool present_pass_wanted();
 bool present_pass_targets(VkFormat format, const std::vector<VkImage>& images, VkExtent2D extent,
                           VkSurfaceTransformFlagBitsKHR transform);
 bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop, uint32_t index);
+void present_pass_release();  // its views of the swapchain images, before the swapchain is destroyed
+bool present_pass_failed();   // the pass could not be made: frames are blitted, upright
 GpuImage* present_pass_test_target();
 // nvn_bc.cpp: BC textures decoded on the CPU where the GPU has no textureCompressionBC (NX_FORCE_BC_DECODE=1 anyway).
 bool bc_host_decode(uint32_t nvn_format);         // a BC format this device cannot sample (BC6H excepted)

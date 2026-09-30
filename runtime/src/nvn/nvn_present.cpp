@@ -193,14 +193,8 @@ struct Pass {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkSampler sampler = VK_NULL_HANDLE;
-    VkDescriptorPool pool = VK_NULL_HANDLE;
-    std::vector<VkDescriptorSet> sets;  // one per swapchain image
     std::vector<VkImageView> views;
     std::vector<VkFramebuffer> framebuffers;
-    // Per swapchain image: the touch controls' circles (binding 1), host visible, written before each draw.
-    std::vector<VkBuffer> overlay;
-    std::vector<VkDeviceMemory> overlay_memory;
-    std::vector<void*> overlay_map;
     VkExtent2D extent{};
     VkSurfaceTransformFlagBitsKHR transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     bool failed = false;
@@ -220,11 +214,6 @@ void destroy_targets() {
     for (VkFramebuffer f : g.framebuffers) p_vkDestroyFramebuffer(d, f, nullptr);
     for (VkImageView v : g.views) p_vkDestroyImageView(d, v, nullptr);
     g.framebuffers.clear(), g.views.clear();
-    for (VkBuffer b : g.overlay) p_vkDestroyBuffer(d, b, nullptr);
-    for (VkDeviceMemory m : g.overlay_memory) p_vkFreeMemory(d, m, nullptr);  // unmapped by the free
-    g.overlay.clear(), g.overlay_memory.clear(), g.overlay_map.clear();
-    if (g.pool) p_vkDestroyDescriptorPool(d, g.pool, nullptr);
-    g.pool = VK_NULL_HANDLE, g.sets.clear();
 }
 
 bool make_pipeline(VkFormat format) {
@@ -317,6 +306,9 @@ bool present_pass_wanted() {
     return on;
 }
 
+void present_pass_release() { destroy_targets(); }  // before the swapchain whose images they view is destroyed
+bool present_pass_failed() { return g.failed; }
+
 bool present_pass_targets(VkFormat format, const std::vector<VkImage>& images, VkExtent2D extent,
                           VkSurfaceTransformFlagBitsKHR transform) {
     if (!present_pass_wanted() || g.failed) return false;
@@ -333,40 +325,6 @@ bool present_pass_targets(VkFormat format, const std::vector<VkImage>& images, V
         return false;
     }
     VkDevice d = vk_device();
-    uint32_t n = uint32_t(images.size());
-    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, n}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, n}};
-    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpi.maxSets = n, dpi.poolSizeCount = 2, dpi.pPoolSizes = sizes;
-    if (p_vkCreateDescriptorPool(d, &dpi, nullptr, &g.pool) != VK_SUCCESS) return false;
-    std::vector<VkDescriptorSetLayout> layouts(n, g.set_layout);
-    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dai.descriptorPool = g.pool, dai.descriptorSetCount = n, dai.pSetLayouts = layouts.data();
-    g.sets.resize(n);
-    if (p_vkAllocateDescriptorSets(d, &dai, g.sets.data()) != VK_SUCCESS) return false;
-    for (uint32_t k = 0; k < n; k++) {
-        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bi.size = sizeof(float) * 4 * kOverlayMax, bi.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-        VkBuffer buf = VK_NULL_HANDLE;
-        if (p_vkCreateBuffer(d, &bi, nullptr, &buf) != VK_SUCCESS) return false;
-        VkMemoryRequirements req{};
-        p_vkGetBufferMemoryRequirements(d, buf, &req);
-        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        ai.allocationSize = req.size;
-        ai.memoryTypeIndex =
-            memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        VkDeviceMemory mem = VK_NULL_HANDLE;
-        void* map = nullptr;
-        if (p_vkAllocateMemory(d, &ai, nullptr, &mem) != VK_SUCCESS) return false;
-        p_vkBindBufferMemory(d, buf, mem, 0);
-        p_vkMapMemory(d, mem, 0, VK_WHOLE_SIZE, 0, &map);
-        std::memset(map, 0, size_t(bi.size));
-        g.overlay.push_back(buf), g.overlay_memory.push_back(mem), g.overlay_map.push_back(map);
-        VkDescriptorBufferInfo info{buf, 0, bi.size};
-        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        w.dstSet = g.sets[k], w.dstBinding = 1, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        w.pBufferInfo = &info;
-        p_vkUpdateDescriptorSets(d, 1, &w, 0, nullptr);
-    }
     for (VkImage img : images) {
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vi.image = img, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = format;
@@ -390,11 +348,20 @@ bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop,
         src.view_type != VK_IMAGE_VIEW_TYPE_2D || !(src.aspect & VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
     transition(cb, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // The set and the circles' uniform data come from this submit's slot (descriptor pool and upload ring, reset when
+    // the slot is retired): nothing a frame still in flight reads is written. Per swapchain image they were not safe
+    // (MAILBOX can hand an image back before the frame that last drew into it finished; review of DEBUG-2.md #78).
+    VkDescriptorSet set = descriptor_set(g.set_layout);
+    Upload ubo = upload_alloc(sizeof(float) * 4 * kOverlayMax, 256);
+    std::memset(ubo.ptr, 0, sizeof(float) * 4 * kOverlayMax);
     VkDescriptorImageInfo ii{g.sampler, src.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    w.dstSet = g.sets[index], w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    w.pImageInfo = &ii;
-    p_vkUpdateDescriptorSets(vk_device(), 1, &w, 0, nullptr);
+    VkDescriptorBufferInfo bi{ubo.buffer, ubo.offset, sizeof(float) * 4 * kOverlayMax};
+    VkWriteDescriptorSet w[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+    w[0].dstSet = set, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[0].pImageInfo = &ii;
+    w[1].dstSet = set, w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    w[1].pBufferInfo = &bi;
+    p_vkUpdateDescriptorSets(vk_device(), 2, w, 0, nullptr);
 
     Push p{};
     // Host uv -> upright uv, undoing the clockwise turn the display applies (as vk_present.cpp).
@@ -419,7 +386,7 @@ bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop,
     // The touch controls (platform_android_input.cpp), in upright uv; none elsewhere.
     plat::OverlayShape shapes[kOverlayMax];
     size_t count = plat::touch_overlay(shapes, kOverlayMax);
-    auto* dst = static_cast<float*>(g.overlay_map[index]);
+    auto* dst = reinterpret_cast<float*>(ubo.ptr);
     for (size_t k = 0; k < count; k++)
         dst[4 * k] = shapes[k].x, dst[4 * k + 1] = shapes[k].y, dst[4 * k + 2] = shapes[k].r, dst[4 * k + 3] = shapes[k].alpha;
     p.off[2] = float(count), p.off[3] = tw / th;
@@ -432,7 +399,7 @@ bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop,
     p_vkCmdSetViewport(cb, 0, 1, &v);
     p_vkCmdSetScissor(cb, 0, 1, &sc);
     p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipeline);
-    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &g.sets[index], 0, nullptr);
+    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &set, 0, nullptr);
     p_vkCmdPushConstants(cb, g.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof p, &p);
     p_vkCmdDraw(cb, 3, 1, 0, 0);
     p_vkCmdEndRenderPass(cb);

@@ -257,3 +257,25 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
     - The first session's stretches had a 13-15 ms fence wait, the GPU past its frame. Likely causes, not isolated:
       other load on the Mac then, and the pipelines compiled on the fly (the cache, #73, came later).
     - Closed; reopen with a log if it shows again.
+
+78. **Independent review of the Android present path, and its fixes (before the phone test).** The review hunted for
+    what MoltenVK tolerates and Adreno or Mali would not. Fixed:
+    - **Descriptor set and overlay data per swapchain image.** They were written after acquire, but with MAILBOX an
+      image can come back while the frame that last drew into it is still in flight (more so with 3+ submits in
+      flight). They now come from the submit's slot (the descriptor pool and the upload ring, reset when the slot
+      retires).
+    - **SUBOPTIMAL compared the turned swapchain extent with the unturned currentExtent.** On a phone held sideways
+      it re-made the swapchain at every present. It now compares with the currentExtent and transform the swapchain
+      was made from.
+    - **A failed present pass fell back to the blit on a pre-rotated, portrait swapchain:** a sideways picture. The
+      swapchain is now made again upright for the blit.
+    - **Swapchain destroyed while the pass's views and framebuffers still referenced its images.** They are released
+      first.
+    - Smaller fixes:
+      - the swapchain extent is bounded by the surface's maximum (either orientation);
+      - more than 8 swapchain images is logged (the present semaphores are 8);
+      - the presenting thread joins the ADPF session.
+    - Checked again on the Mac: the portrait self-test (`NX_PRESENT_TEST=1080x2340:90` with the touch layout) and a
+      windowed run through the pass.
+    - Left as is: a failed `begin()` right after acquire leaves the image unpresented (rare), and after
+      `APP_CMD_TERM_WINDOW` the surface lives until the next window (the window is kept acquired).
