@@ -270,6 +270,9 @@ A0, 2026-09-30:
 - `tools/pack_phone_wonder.py` makes `Wonder-data.zip`: 31,766 files, 3.92 GB, stored. The SPIR-V stays loose files
   for now; the single-file pack is moved to A2, where its loading time can be measured.
 - All 62 runtime objects, the NVN layer included, compile with NDK 28.2. The Mac build is unchanged.
+- **Exit met (build side):** `android/build_apk.sh --game wonder` produces `private/wonder/apk/wonder.apk`: 58 MB
+  (libwonder.so 187 MB stripped), package `io.github.belmantegu.wonderrecomp`, min SDK 29, signature verified. A clean
+  NDK build at `-j4` took about 2 hours on the M1 (1,332 objects, with `-g`). Installing it waits for a phone (A1).
 
 Total: about 12-16 weeks. A0-A2 can start while the Mac track finishes W7. They share no files with the glitch work
 except `nvn_vk.cpp` (present and swapchain) and `nvn_format.cpp`, where the Android changes are per-device branches
