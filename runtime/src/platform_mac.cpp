@@ -9,6 +9,7 @@
 // Settings: NX_<KEY> environment variables, as on Windows.
 #include <dlfcn.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <sched.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -133,6 +134,9 @@ struct ThreadStart {
 static void* thread_entry(void* p) {
     ThreadStart s = *static_cast<ThreadStart*>(p);
     delete static_cast<ThreadStart*>(p);
+    // The game's threads (render, jobs, audio) are latency critical: default QoS lets macOS run them on the M1's
+    // efficiency cores and stretch their sleeps and wakeups.
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     s.fn(s.arg);
     return nullptr;
 }

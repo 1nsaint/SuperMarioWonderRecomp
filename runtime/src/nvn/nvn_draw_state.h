@@ -1,6 +1,7 @@
 // The draw replay's bound state (nvn_draw.cpp), shared with its debug traces (nvn_draw_trace.cpp).
 #pragma once
 
+#include <array>
 #include <utility>
 #include <vector>
 
@@ -32,11 +33,17 @@ struct State {
     bool rasterizer_discard = false, render_enable = true;  // SetRasterizerDiscard / SetRenderEnable: draws skipped
     bool has_viewport = false, has_scissor = false;
     float depth_near = 0, depth_far = 1;
+    // Command-buffer rasterizer state (nvn_raster.cpp), per face 0 front, 1 back. NVN's defaults: masks 0xFF, ref 0.
+    uint8_t stencil_ref[2] = {0, 0}, stencil_compare_mask[2] = {0xFF, 0xFF}, stencil_write_mask[2] = {0xFF, 0xFF};
+    float bias_factor = 0, bias_units = 0, bias_clamp = 0;  // SetPolygonOffsetClamp
+    bool depth_bounds = false, depth_clamp = false;
+    float depth_bounds_range[2] = {0, 1};
 };
 
 struct Stats {
     uint64_t total = 0, no_program = 0, no_vertex = 0, no_pipeline = 0, no_indices = 0, done = 0, to_window = 0;
     uint64_t dispatches = 0;
+    uint64_t breaks_textures = 0, breaks_targets = 0;  // render passes ended by a draw: uploads/layouts, new targets
 };
 
 extern State g_state;
@@ -51,6 +58,32 @@ using TexBindings = std::vector<std::pair<const ShaderInfo*, const DescriptorBin
 // NX_TRACE_DRAWS & co (docs/nvn/DEBUG.md): logs a replayed draw with its state, when the switches select it.
 void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, const ShaderInfo* vs,
                 const ShaderInfo* fs, const TexBindings& tex_bindings, const std::vector<uint64_t>& handles);
+
+}  // namespace nx::nvn::replay
+
+namespace nx::nvn {
+bool draw_call(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, const Cmd& c);
+void dispatch_call(VkCommandBuffer cb, const Cmd& c);
+}  // namespace nx::nvn
+
+namespace nx::nvn::replay {
+
+// nvn_dedup.cpp: one copy per submit of the same guest bytes (padded to `padded` with zeros).
+Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align);
+void dedup_reset();                                     // at each submit
+void dedup_invalidate(const uint8_t* p, uint64_t size);  // guest bytes written during the replay
+void dedup_log();
+// c[0], the NVN driver constants of a stage (nvn_dedup.cpp).
+std::array<uint8_t, 0x1000> driver_constants(ShaderStage stage, int st);
+
+bool debug_shader_overrides(const std::vector<const ShaderInfo*>*& shaders, const ShaderInfo*& fs,
+                            std::vector<const ShaderInfo*>& swapped);
+// nvn_raster.cpp: the stencil, polygon offset, depth bounds and depth clamp commands into g_state (false for other
+// commands), and their dynamic state for the next draw (stencil reference and masks, depth bias).
+bool raster_command(const Cmd& c);
+void raster_dynamic(VkCommandBuffer cb);
+
+void trace_compute_once(const ShaderInfo* cs, uint32_t x, uint32_t y, uint32_t z);
 
 // NX_TRACE_SKIN: skinned draws' inputs, vertex uniform blocks and the bone rows they select.
 void trace_skin(bool indexed, const Cmd& c, const ShaderInfo* vs, const ShaderInfo* fs);

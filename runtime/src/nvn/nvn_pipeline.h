@@ -36,6 +36,7 @@ struct PipelineKey {
     VkFormat color_formats[8] = {};
     uint32_t color_count = 0;
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
+    uint32_t depth_clamp = 0;  // SetDepthClamp (applied only where the device has the depthClamp feature)
 };
 VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout);
 
@@ -46,6 +47,8 @@ bool patch_int_inputs(const std::vector<uint32_t>& in, const uint8_t kinds[16], 
 // Constant buffer reads with a computed index (c[k][index]) are clamped to the 64 KB a bank can hold, and the
 // set 0 bindings read that way are returned: those are bound zero-padded to 64 KB (nvn_spirv_patch.cpp).
 bool clamp_uniform_indices(const std::vector<uint32_t>& in, std::vector<uint32_t>& out, uint64_t* bindings);
+// Storage buffer bindings the shader writes (nvn_spirv_patch.cpp).
+uint64_t written_storage_bindings(const ShaderInfo* s);
 uint64_t dynamic_uniform_bindings(const ShaderInfo* s);
 // Compute: the shared memory array redeclared with the control section's size (the translator declares 48 KB, past
 // Metal's 32 KB). Fragment: the input locations in `locations` (bit mask) that the vertex stage does not write become
@@ -74,6 +77,7 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
 // null for an unknown texture. Records transfers: outside render passes.
 GpuImage* ensure_contents(VkCommandBuffer cb, uint64_t texture);
 // A single level and layer of an image, for rendering to.
+void sampled_ready_log();
 VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer, VkFormat format = VK_FORMAT_UNDEFINED);
 // The Vulkan format of a view with NVN format `nvn` (0: the image's own) of `img`: the image's when the view's is not
 // a same-size colour format it can be viewed as.

@@ -175,13 +175,13 @@ uint64_t real_proc(CPU& c, const char* name) {
     return real;
 }
 
-std::mutex& objects_lock() {
-    static std::mutex m;
+std::shared_mutex& objects_lock() {
+    static std::shared_mutex m;
     return m;
 }
 
-std::map<uint64_t, std::unique_ptr<Object>>& objects() {
-    static std::map<uint64_t, std::unique_ptr<Object>> m;
+std::unordered_map<uint64_t, std::unique_ptr<Object>>& objects() {
+    static std::unordered_map<uint64_t, std::unique_ptr<Object>> m;
     return m;
 }
 

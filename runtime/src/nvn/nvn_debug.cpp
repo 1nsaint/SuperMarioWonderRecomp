@@ -193,6 +193,86 @@ void debug_dump_textures(uint64_t frame) {
     }
 }
 
+// ---- presented frames (NX_DUMP_FRAMES=N) ----------------------------------------------------------------------------
+// Every Nth presented texture is read back and written to <data root>/frames/NNNNN.ppm (what the game drew,
+// independent of the window). The copy is recorded into the present's command buffer, written after its fence.
+
+uint32_t frame_dump_every() {
+    static uint32_t n = [] {
+        const char* e = std::getenv("NX_DUMP_FRAMES");
+        return e ? uint32_t(std::strtoul(e, nullptr, 10)) : 0u;
+    }();
+    return n;
+}
+
+namespace {
+
+struct Readback {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint64_t size = 0;
+};
+
+Readback g_readback;
+
+}  // namespace
+
+bool frame_dump_record(VkCommandBuffer cb, GpuImage& img) {
+    VkDevice d = vk_device();
+    uint64_t size = uint64_t(img.width) * img.height * 4;
+    if (img.format != VK_FORMAT_R8G8B8A8_UNORM && img.format != VK_FORMAT_R8G8B8A8_SRGB &&
+        img.format != VK_FORMAT_B8G8R8A8_UNORM)
+        return false;
+    if (g_readback.size < size) {
+        if (g_readback.buffer) p_vkDestroyBuffer(d, g_readback.buffer, nullptr);
+        if (g_readback.memory) p_vkFreeMemory(d, g_readback.memory, nullptr);
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = size;
+        bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        p_vkCreateBuffer(d, &bi, nullptr, &g_readback.buffer);
+        VkMemoryRequirements req{};
+        p_vkGetBufferMemoryRequirements(d, g_readback.buffer, &req);
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex =
+            memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        p_vkAllocateMemory(d, &ai, nullptr, &g_readback.memory);
+        p_vkBindBufferMemory(d, g_readback.buffer, g_readback.memory, 0);
+        g_readback.size = size;
+    }
+    VkBufferImageCopy r{};
+    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.imageExtent = {img.width, img.height, 1};
+    p_vkCmdCopyImageToBuffer(cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_readback.buffer, 1, &r);
+    return true;
+}
+
+void frame_dump_write(const GpuImage& img, uint64_t frame) {
+    void* p = nullptr;
+    if (p_vkMapMemory(vk_device(), g_readback.memory, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) return;
+    std::string dir = plat::data_root() + "/frames";
+    plat::make_dirs(dir);
+    char name[64];
+    std::snprintf(name, sizeof name, "/%05llu.ppm", (unsigned long long)frame);
+    if (FILE* f = plat::fopen_utf8(dir + name, "wb")) {
+        std::fprintf(f, "P6\n%u %u\n255\n", img.width, img.height);
+        const uint8_t* px = static_cast<const uint8_t*>(p);
+        bool bgra = img.format == VK_FORMAT_B8G8R8A8_UNORM;
+        std::vector<uint8_t> row(size_t(img.width) * 3);
+        for (uint32_t y = 0; y < img.height; y++) {
+            for (uint32_t x = 0; x < img.width; x++) {
+                const uint8_t* s = px + (size_t(y) * img.width + x) * 4;
+                row[x * 3 + 0] = bgra ? s[2] : s[0];
+                row[x * 3 + 1] = s[1];
+                row[x * 3 + 2] = bgra ? s[0] : s[2];
+            }
+            std::fwrite(row.data(), 1, row.size(), f);
+        }
+        std::fclose(f);
+    }
+    p_vkUnmapMemory(vk_device(), g_readback.memory);
+}
+
 // ---- GPU profile (NX_GPU_PROFILE=1) --------------------------------------------------------------------------------
 // A timestamp at the start of every render pass and at the end of each submit; the time between two marks goes to
 // the first one's label ("<target WxH> fs <hash>"). Totals per label are logged every 60 presents, largest first.
@@ -318,6 +398,8 @@ void debug_snapshot(VkCommandBuffer cb, GpuImage& img, uint64_t draw) {
     if (back != VK_IMAGE_LAYOUT_UNDEFINED) transition(cb, img, back);
     g_snaps.push_back(snap);
 }
+
+bool debug_snapshots_pending() { return !g_snaps.empty(); }
 
 void debug_snapshots_write() {  // after the submit's fence
     for (Snap& snap : g_snaps) {

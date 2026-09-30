@@ -445,4 +445,41 @@ uint64_t dynamic_uniform_bindings(const ShaderInfo* s) {
     return cache[s] = mask;
 }
 
+// Bindings (set 0..1, binding < 64) of storage buffers the shader writes: OpStore or an atomic through a pointer into
+// them. Compute results are copied back to guest memory after the submit only for these, and a submit with
+// write-backs is waited for before the next replay (NX_ASYNC_GPU): read-only storage counted too (DEBUG.md #32).
+uint64_t written_storage_bindings(const ShaderInfo* s) {
+    static std::mutex lock;
+    static std::map<const ShaderInfo*, uint64_t> cache;
+    std::lock_guard lk(lock);
+    if (auto it = cache.find(s); it != cache.end()) return it->second;
+    const std::vector<uint32_t>& in = s->spirv;
+    std::map<uint32_t, uint32_t> binding, base;  // variable -> binding; pointer -> the variable it points into
+    for (size_t i = 5; i < in.size();) {
+        uint32_t len = in[i] >> 16, op = in[i] & 0xffff;
+        if (!len || i + len > in.size()) break;
+        const uint32_t* w = &in[i];
+        if (op == 71 && len >= 4 && w[2] == 33) binding[w[1]] = w[3];  // OpDecorate Binding
+        if (op == 59 && len >= 4) base[w[2]] = w[2];                    // OpVariable
+        if ((op == 65 || op == 66 || op == 67) && len >= 4 && base.count(w[3])) base[w[2]] = base[w[3]];
+        i += len;
+    }
+    uint64_t mask = 0;
+    auto mark = [&](uint32_t ptr) {
+        auto b = base.find(ptr);
+        if (b == base.end()) mask = ~0ull;  // a pointer not traced to a variable: assume every binding is written
+        else if (binding.count(b->second) && binding[b->second] < 64) mask |= 1ull << binding[b->second];
+    };
+    for (size_t i = 5; i < in.size();) {
+        uint32_t len = in[i] >> 16, op = in[i] & 0xffff;
+        if (!len || i + len > in.size()) break;
+        const uint32_t* w = &in[i];
+        if ((op == 62 || op == 63 || op == 228) && len >= 3) mark(w[1]);  // OpStore, OpCopyMemory, OpAtomicStore
+        else if (((op >= 229 && op <= 242) || op == 5614 || op == 5615 || op == 6035) && len >= 4)
+            mark(w[3]);  // read-modify-write atomics (float ones too)
+        i += len;
+    }
+    return cache[s] = mask;
+}
+
 }  // namespace nx::nvn

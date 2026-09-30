@@ -1,13 +1,15 @@
-#include <cstdlib>
-// NVN queues, command buffers, windows and syncs (docs/NVN.md, N3). Without the Vulkan side every command
-// completes at submit: fences are signaled right away, the window hands out its textures in turn, and presents are
-// counted. Return values follow the SDK driver (nvnSyncWait sdk+45a960: 0 once the fence has passed;
-// nvnWindowAcquireTexture sdk+45e050: 0 on success).
+// NVN queues, command buffers, windows and syncs (docs/NVN.md, N3). Synchronously every command completes at
+// submit: fences are signaled right away, the window hands out its textures in turn, and presents are counted. With
+// NX_ASYNC_GPU a fence is the submit it follows, and waiting for it waits for that submit (nvn_frames.cpp). Return
+// values follow the SDK driver (nvnSyncWait sdk+45a960: 0 once the fence has passed; nvnWindowAcquireTexture
+// sdk+45e050: 0 on success).
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <vector>
 
 #include "nvn.h"
+#include "platform.h"
 
 namespace nx::nvn {
 
@@ -17,6 +19,7 @@ namespace {
 
 struct Sync : Object {
     std::atomic<bool> signaled{false};
+    std::atomic<uint64_t> serial{0};  // NX_ASYNC_GPU: the submit it waits for (0: none)
 };
 
 void SyncInitialize(CPU& c) {  // NVNboolean (NVNsync*, NVNdevice*)
@@ -27,10 +30,16 @@ void SyncInitialize(CPU& c) {  // NVNboolean (NVNsync*, NVNdevice*)
 void SyncFinalize(CPU& c) { destroy(c.x[0]); }
 
 void signal_sync(uint64_t guest) {
-    if (auto* s = get<Sync>(guest)) s->signaled = true;
+    if (auto* s = get<Sync>(guest)) s->serial = 0, s->signaled = true;
 }
 
-void SyncWait(CPU& c) { c.x[0] = 0; }  // NVNsyncWaitResult (const NVNsync*, u64 timeout): already signaled
+// NVNsyncWaitResult (const NVNsync*, u64 timeout). Always 0 (already signaled), as before: a fenced submit is waited
+// for whatever the timeout, 2 s at most (then the GPU hung and the process ends). Correct results before latency.
+void SyncWait(CPU& c) {
+    auto* s = get<Sync>(c.x[0]);
+    if (uint64_t serial = s ? s->serial.load() : 0) gpu_wait(serial);
+    c.x[0] = 0;
+}
 
 // ---- queues -----------------------------------------------------------------------------------------------------
 
@@ -59,9 +68,12 @@ void QueueSubmitCommands(CPU& c) {  // (NVNqueue*, int count, const NVNcommandHa
     gpu_submit(c, lists);
 }
 void QueueFlush(CPU&) {}
-void QueueFinish(CPU&) {}
-void QueueFenceSync(CPU& c) { signal_sync(c.x[1]); }  // (NVNqueue*, NVNsync*, NVNsyncCondition, int flags)
-void QueueWaitSync(CPU& c) { c.x[0] = 1; }            // NVNboolean (NVNqueue*, const NVNsync*)
+void QueueFinish(CPU&) { gpu_wait(gpu_serial()); }
+// (NVNqueue*, NVNsync*, NVNsyncCondition, int flags): every condition taken as "all previous work complete".
+void QueueFenceSync(CPU& c) {
+    if (auto* s = get<Sync>(c.x[1])) s->serial = gpu_serial(), s->signaled = true;
+}
+void QueueWaitSync(CPU& c) { c.x[0] = 1; }  // NVNboolean (NVNqueue*, const NVNsync*): one queue, in order
 
 // ---- windows ----------------------------------------------------------------------------------------------------
 
@@ -116,9 +128,25 @@ void WindowSetPresentInterval(CPU& c) {
 }
 
 // (NVNqueue*, NVNwindow*, int textureIndex)
+// Frame pacing: a present returns no earlier than the window's present interval (in 60 Hz vsyncs) after the previous
+// one. On the Switch the texture-available sync of the next acquire does this; ours is signaled at once, so without
+// it the game runs as fast as it can once it is faster than 60 fps. A late frame is not snapped to the next vsync
+// (an 18 ms frame stays 18 ms, not 33). NX_NO_FRAME_LIMIT=1: unpaced.
+void pace_present(int interval) {
+    static const bool off = std::getenv("NX_NO_FRAME_LIMIT") != nullptr;
+    static uint64_t next = 0;
+    if (off || interval <= 0) return;
+    uint64_t now = plat::monotonic_ns();
+    if (next > now) plat::sleep_ns(next - now), now = plat::monotonic_ns();
+    uint64_t period = uint64_t(interval) * 16'666'667ull;
+    next = (next > now || now - next < period ? next : now) + period;
+}
+
 void QueuePresentTexture(CPU& c) {
-    if (auto* w = get<Window>(c.x[1]))
+    if (auto* w = get<Window>(c.x[1])) {
         if (int(c.x[2]) >= 0 && size_t(c.x[2]) < w->textures.size()) gpu_present(w->textures[size_t(c.x[2])]);
+        pace_present(w->interval);
+    }
     uint64_t n = ++g_presents;
     if (n == 1 || (n & (n - 1)) == 0) log("nvn: present #%llu (texture %d)", (unsigned long long)n, int(c.x[2]));
     g_frame++;

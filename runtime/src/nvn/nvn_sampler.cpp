@@ -1,125 +1,63 @@
-// NVN samplers (docs/NVN.md, N4): sampler objects and sampler-pool entries, decoded into SamplerInfo from the
-// builder through the SDK driver's getters. The sampler objects' own getters (nvnSamplerGetMinMagFilter, ... the
-// game reads them back) answer from the decoded state. Getter shapes from the game's call sites:
-//   GetMinMagFilter(s, &min, &mag)   GetWrapMode(s, &s, &t, &r)   GetLodClamp(s, &min, &max)   GetLodBias(s) -> float
-//   GetCompare(s, &mode, &func)      GetBorderColor(s, float[4])  GetMaxAnisotropy(s) -> float
-//   GetReductionFilter(s) -> enum
-#include <cstring>
+// NVN sampler states as Vulkan samplers (split from nvn_pipeline.cpp).
+#include <algorithm>
+#include <map>
+#include <string>
 
-#include "nvn.h"
+#include "nvn_pipeline.h"
 
 namespace nx::nvn {
 
+using namespace nx::vk;
+
 namespace {
 
-struct Sampler : Object {
-    SamplerInfo info;
-};
-
-SamplerInfo decode_builder(CPU& c, uint64_t b) {
-    SamplerInfo s;
-    uint64_t tmp = scratch(c, 32);
-    driver(c, "nvnSamplerBuilderGetMinMagFilter", {b, tmp, tmp + 4});
-    s.min_filter = ld<uint32_t>(tmp), s.mag_filter = ld<uint32_t>(tmp + 4);
-    driver(c, "nvnSamplerBuilderGetWrapMode", {b, tmp, tmp + 4, tmp + 8});
-    for (int k = 0; k < 3; k++) s.wrap[k] = ld<uint32_t>(tmp + 4 * k);
-    driver(c, "nvnSamplerBuilderGetLodClamp", {b, tmp, tmp + 4});
-    s.lod_min = ld<float>(tmp), s.lod_max = ld<float>(tmp + 4);
-    s.lod_bias = guest_call_f(c, real_proc(c, "nvnSamplerBuilderGetLodBias"), {b});
-    driver(c, "nvnSamplerBuilderGetCompare", {b, tmp, tmp + 4});
-    s.compare_mode = ld<uint32_t>(tmp), s.compare_func = ld<uint32_t>(tmp + 4);
-    driver(c, "nvnSamplerBuilderGetBorderColor", {b, tmp});
-    std::memcpy(s.border, reinterpret_cast<const void*>(tmp), 16);
-    s.max_anisotropy = guest_call_f(c, real_proc(c, "nvnSamplerBuilderGetMaxAnisotropy"), {b});
-    s.reduction = uint32_t(driver(c, "nvnSamplerBuilderGetReductionFilter", {b}));
-    return s;
-}
-
-void log_sampler(const SamplerInfo& s) {
-    static const bool on = std::getenv("NX_NVN_STATES") != nullptr;
-    if (on)
-        log("nvn state sampler: filter %u/%u wrap %u %u %u lod %g..%g bias %g compare %u/%u aniso %g reduction %u",
-            s.min_filter, s.mag_filter, s.wrap[0], s.wrap[1], s.wrap[2], double(s.lod_min), double(s.lod_max),
-            double(s.lod_bias), s.compare_mode, s.compare_func, double(s.max_anisotropy), s.reduction);
-}
-
-void SamplerInitialize(CPU& c) {  // NVNboolean (NVNsampler*, const NVNsamplerBuilder*)
-    uint64_t guest = c.x[0], builder = c.x[1];
-    SamplerInfo info = decode_builder(c, builder);
-    make<Sampler>(guest).info = info;
-    log_sampler(info);
-    c.x[0] = 1;
-}
-
-void SamplerFinalize(CPU& c) { destroy(c.x[0]); }
-
-void register_info(uint64_t pool, uint32_t id, const SamplerInfo& info) {
-    if (auto* d = get<DescriptorPool>(pool)) {
-        std::lock_guard lk(objects_lock());
-        d->samplers[id] = info;
+VkSamplerAddressMode vk_wrap(uint32_t w) {  // NVN: 0 clamp, 1 repeat, 2 mirror clamp, 3 mirror clamp to edge,
+    switch (w) {                            // 4 mirror clamp to border, 5 clamp to border, 6 mirrored repeat, 7 edge
+        case 1: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        case 2:
+        case 3:
+        case 4: return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+        case 5: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+        case 6: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+        default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     }
-}
-
-void RegisterSampler(CPU& c) {  // (NVNsamplerPool*, int id, const NVNsampler*)
-    if (auto* s = get<Sampler>(c.x[2])) register_info(c.x[0], uint32_t(c.x[1]), s->info);
-}
-
-void RegisterSamplerBuilder(CPU& c) {  // (NVNsamplerPool*, int id, const NVNsamplerBuilder*)
-    SamplerInfo info = decode_builder(c, c.x[2]);
-    register_info(c.x[0], uint32_t(c.x[1]), info);
-}
-
-const SamplerInfo& info_of(uint64_t guest) {
-    static const SamplerInfo none;
-    auto* s = get<Sampler>(guest);
-    return s ? s->info : none;
-}
-
-void GetMinMagFilter(CPU& c) {
-    const SamplerInfo& s = info_of(c.x[0]);
-    if (c.x[1]) st<uint32_t>(c.x[1], s.min_filter);
-    if (c.x[2]) st<uint32_t>(c.x[2], s.mag_filter);
-}
-
-void GetWrapMode(CPU& c) {
-    const SamplerInfo& s = info_of(c.x[0]);
-    for (int k = 0; k < 3; k++)
-        if (c.x[1 + k]) st<uint32_t>(c.x[1 + k], s.wrap[k]);
-}
-
-void GetLodClamp(CPU& c) {
-    const SamplerInfo& s = info_of(c.x[0]);
-    if (c.x[1]) st<float>(c.x[1], s.lod_min);
-    if (c.x[2]) st<float>(c.x[2], s.lod_max);
-}
-
-void GetLodBias(CPU& c) { c.v[0].f32[0] = info_of(c.x[0]).lod_bias; }
-void GetMaxAnisotropy(CPU& c) { c.v[0].f32[0] = info_of(c.x[0]).max_anisotropy; }
-void GetReductionFilter(CPU& c) { c.x[0] = info_of(c.x[0]).reduction; }
-
-void GetCompare(CPU& c) {
-    const SamplerInfo& s = info_of(c.x[0]);
-    if (c.x[1]) st<uint32_t>(c.x[1], s.compare_mode);
-    if (c.x[2]) st<uint32_t>(c.x[2], s.compare_func);
-}
-
-void GetBorderColor(CPU& c) {
-    if (c.x[1]) std::memcpy(reinterpret_cast<void*>(c.x[1]), info_of(c.x[0]).border, 16);
 }
 
 }  // namespace
 
-NX_HLE("nvnSamplerInitialize", SamplerInitialize);
-NX_HLE("nvnSamplerFinalize", SamplerFinalize);
-NX_HLE("nvnSamplerPoolRegisterSampler", RegisterSampler);
-NX_HLE("nvnSamplerPoolRegisterSamplerBuilder", RegisterSamplerBuilder);
-NX_HLE("nvnSamplerGetMinMagFilter", GetMinMagFilter);
-NX_HLE("nvnSamplerGetWrapMode", GetWrapMode);
-NX_HLE("nvnSamplerGetLodClamp", GetLodClamp);
-NX_HLE("nvnSamplerGetLodBias", GetLodBias);
-NX_HLE("nvnSamplerGetMaxAnisotropy", GetMaxAnisotropy);
-NX_HLE("nvnSamplerGetReductionFilter", GetReductionFilter);
-NX_HLE("nvnSamplerGetCompare", GetCompare);
-NX_HLE("nvnSamplerGetBorderColor", GetBorderColor);
+// ---- samplers -------------------------------------------------------------------------------------------------------
+
+VkSampler sampler_for(const SamplerInfo& s, bool shadow) {
+    static std::map<std::string, VkSampler> cache;
+    std::string key(reinterpret_cast<const char*>(&s), sizeof s);
+    key += shadow ? '1' : '0';
+    auto& v = cache[key];
+    if (v) return v;
+    VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    // NVN min filter: 0 nearest, 1 linear, 2 nearest mip nearest, 3 linear mip nearest, 4 nearest mip linear,
+    // 5 linear mip linear; mag: 0 nearest, 1 linear.
+    uint32_t m = s.min_filter;
+    ci.minFilter = (m == 1 || m == 3 || m == 5) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    ci.magFilter = s.mag_filter == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    ci.mipmapMode = (m == 4 || m == 5) ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    ci.addressModeU = vk_wrap(s.wrap[0]);
+    ci.addressModeV = vk_wrap(s.wrap[1]);
+    ci.addressModeW = vk_wrap(s.wrap[2]);
+    ci.mipLodBias = s.lod_bias;
+    // Games pass lod_min -1000 ("no limit"); Metal wants lodMinClamp >= 0, and a negative one made the glyph
+    // sampler return 0 (all text invisible).
+    ci.minLod = m <= 1 ? 0.0f : std::max(0.0f, s.lod_min);
+    ci.maxLod = m <= 1 ? 0.25f : std::max(ci.minLod, s.lod_max);  // no mipmapping: level 0 only
+    ci.anisotropyEnable = s.max_anisotropy > 1.0f;
+    ci.maxAnisotropy = std::min(s.max_anisotropy, 16.0f);
+    ci.compareEnable = shadow;
+    ci.compareOp = shadow ? vk_compare(s.compare_func) : VK_COMPARE_OP_ALWAYS;
+    bool white = s.border[3] > 0.5f && s.border[0] > 0.5f;
+    ci.borderColor = white ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE
+                     : s.border[3] > 0.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK
+                                          : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    p_vkCreateSampler(vk_device(), &ci, nullptr, &v);
+    return v;
+}
 
 }  // namespace nx::nvn

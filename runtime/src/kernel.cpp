@@ -81,12 +81,24 @@ CPU& current_cpu() { return t_self->ctx; }
 
 uint64_t system_tick() { return plat::monotonic_ns() * 192 / 10000; }  // 19.2 MHz
 
+// The spin throttles below (a 0.5 ms nap for threads spinning on the tick or on yields) were made for Hades on phones.
+// Wonder's job system joins its workers by yielding in a loop: every join became >= 1 ms and the main thread spent
+// ~18% of its time in forced naps, holding the game near 26 fps (docs/nvn/DEBUG.md #37). NX_SPIN_NAPS=0/1 overrides.
+static bool spin_naps() {
+    static const bool on = [] {
+        if (const char* e = std::getenv("NX_SPIN_NAPS")) return e[0] == '1';
+        return std::strcmp(nx::game::kInfo.id, "hades") == 0;
+    }();
+    return on;
+}
+
 // nn::os::GetSystemTick. Hades' main loop (nnMain, main+2496fc) polls it without pause until its fixed step is
 // due: on the Switch that thread owns a core, on a phone it pins a big core at 100% (80% of that thread's time was
 // clock reads) and the heat lowers everyone's clocks. A thread asking again within 20 us, 50 times in a row, is
 // spinning: let it sleep 0.5 ms (the loop keeps sub-millisecond precision against a 16.6 ms step).
+// Hades only (spin_naps()): Wonder's job loops read the tick legitimately.
 static void hle_get_system_tick(CPU& c) {
-    if (KThread* t = t_self) {
+    if (KThread* t = spin_naps() ? t_self : nullptr) {
         uint64_t now = plat::monotonic_ns();
         if (now - t->last_tick_call < 20'000) {
             if (++t->tick_spins >= 50) {
@@ -663,7 +675,7 @@ void svc(CPU& c, uint32_t imm, uint64_t pc) {
             KThread* t = t_self;
             uint64_t now = plat::monotonic_ns();
             if (now - t->last_yield > 2'000'000) t->yields = 0;
-            if (++t->yields <= 32)
+            if (!spin_naps() || ++t->yields <= 32)
                 plat::yield();
             else
                 plat::sleep_ns(500'000);

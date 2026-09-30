@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 
 #include "nvn_draw_state.h"
@@ -253,6 +254,46 @@ void trace_skin(bool indexed, const Cmd& c, const ShaderInfo* vs, const ShaderIn
     }
     log("skin:  max bone index %u (c8 needs %u bytes, bound %llu); %u vertices outside their buffer", max_bone,
         (max_bone + 1) * 48, (unsigned long long)bank_size[8], missing);
+}
+
+// The first dispatch of each compute shader: its groups and what its bindings point at.
+void trace_compute_once(const ShaderInfo* cs, uint32_t x, uint32_t y, uint32_t z) {
+        static std::set<std::string> seen;
+        if (seen.insert(cs->hash).second) {
+            std::string res;
+            for (const DescriptorBinding& b : cs->refl.bindings)
+                res += " " + b.name + "(s" + std::to_string(b.set) + ")";
+            log("nvn: compute %s groups %ux%ux%u local %ux%ux%u:%s", cs->hash.c_str(), x, y, z, cs->local_size[0],
+                cs->local_size[1], cs->local_size[2], res.c_str());
+            for (const DescriptorBinding& b : cs->refl.bindings) {
+                const Range* r = b.nvn.source == NvnSource::StorageBuffer && b.nvn.index >= 0 && b.nvn.index < 16
+                                     ? &g_state.storage[5][b.nvn.index]
+                                 : (b.nvn.source == NvnSource::UniformBlock || b.nvn.source == NvnSource::UniformAsStorage) &&
+                                         b.nvn.index >= 0 && b.nvn.index < 18
+                                     ? &g_state.uniforms[5][b.nvn.index]
+                                     : nullptr;
+                log("  %s: %s %d -> %llx+%llx", b.name.c_str(), source_name(b.nvn.source), b.nvn.index,
+                    (unsigned long long)(r ? r->address : 0), (unsigned long long)(r ? r->size : 0));
+            }
+        }
+}
+
+// Debug overrides of a draw's fragment shader; false: drop the draw.
+bool debug_shader_overrides(const std::vector<const ShaderInfo*>*& shaders, const ShaderInfo*& fs,
+                            std::vector<const ShaderInfo*>& swapped) {
+    // NX_SWAP_FS=<from>:<to>: draws with fragment shader <from> use <to> instead (loaded already), to see what a
+    // shader's geometry covers or what its textures hold.
+    static const std::string swap = std::getenv("NX_SWAP_FS") ? std::getenv("NX_SWAP_FS") : "";
+    if (!swap.empty() && fs && swap.compare(0, 16, fs->hash) == 0 && swap.size() > 17)
+        if (const ShaderInfo* to = shader_by_hash(swap.substr(17))) {
+            swapped = *shaders;
+            std::replace(swapped.begin(), swapped.end(), fs, to);
+            shaders = &swapped;
+            fs = to;
+        }
+    // NX_SKIP_FS=<hash>,<hash>: draws with those fragment shaders are dropped (to measure what they cost).
+    static const std::string skip = std::getenv("NX_SKIP_FS") ? std::getenv("NX_SKIP_FS") : "";
+    return skip.empty() || !fs || skip.find(fs->hash) == std::string::npos;
 }
 
 }  // namespace nx::nvn::replay

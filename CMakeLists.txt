@@ -74,9 +74,15 @@ set(NX_RUNTIME_SOURCES
     runtime/src/nvn/nvn_format.cpp
     runtime/src/nvn/nvn_enums.cpp
     runtime/src/nvn/nvn_sampler.cpp
+    runtime/src/nvn/nvn_draw_state.cpp
+    runtime/src/nvn/nvn_raster.cpp
     runtime/src/nvn/nvn_shaders.cpp
     runtime/src/nvn/nvn_tiling.cpp
     runtime/src/nvn/nvn_vk.cpp
+    runtime/src/nvn/nvn_frames.cpp
+    runtime/src/nvn/nvn_dedup.cpp
+    runtime/src/nvn/nvn_replay.cpp
+    runtime/src/nvn/nvn_sampler.cpp
     runtime/src/nvn/nvn_debug.cpp
     runtime/src/nvn/nvn_binds.cpp
     runtime/src/nvn/nvn_copy.cpp

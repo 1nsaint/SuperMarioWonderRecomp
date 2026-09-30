@@ -3,6 +3,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "nvn.h"
 #include "vk_gen.h"
@@ -30,6 +31,8 @@ struct GpuImage {
 
 VkDevice vk_device();
 bool vk_depth_clip_control();
+// The core features the device was created with (all the GPU has): depthClamp, depthBiasClamp, depthBounds, ...
+const VkPhysicalDeviceFeatures& vk_features();
 VkPhysicalDevice vk_physical();
 uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want);
 
@@ -49,6 +52,43 @@ Upload upload(const void* data, uint64_t size, uint64_t align);
 
 // Descriptor sets for this submit (freed when it completes).
 VkDescriptorSet descriptor_set(VkDescriptorSetLayout layout);
+VkDescriptorPool make_descriptor_pool();
+
+// A lost device or a submit running past 2 s: the process ends at once (docs/nvn/DEBUG.md #22).
+[[noreturn]] void gpu_hung(const char* why);
+
+// A compute shader's storage buffer, copied back to guest memory once the submit completed: (upload copy, guest
+// address, size).
+struct WriteBack {
+    uint8_t* from;
+    uint8_t* to;
+    uint64_t size;
+};
+std::vector<WriteBack> draw_take_write_backs();  // nvn_draw.cpp: this submit's, for an asynchronous submit
+
+// nvn_frames.cpp: asynchronous submission (NX_ASYNC_GPU). Slots of command buffer, fence, descriptor pool and ring
+// stretch; retired (fence waited, write-backs copied) on reuse, when the ring is full, or when the game waits.
+bool async_gpu();
+void frame_init(VkCommandPool pool, VkBuffer ring, uint8_t* ring_ptr, uint64_t ring_size);
+VkCommandBuffer frame_begin(bool replay);  // replay: submits with write-backs retired first
+VkSemaphore frame_acquire_semaphore();
+VkSemaphore frame_rendered_semaphore(uint32_t image);
+void frame_submit(VkSemaphore wait, VkSemaphore signal, std::vector<WriteBack> write_backs, bool wait_done);
+void frame_wait_all();
+uint64_t frame_upload_used();
+uint64_t frame_take_wait_ns();
+Upload frame_upload_alloc(uint64_t size, uint64_t align);
+VkDescriptorSet frame_descriptor_set(VkDescriptorSetLayout layout);
+void free_retired_images(uint64_t completed);
+// A GPU-written image of a destroyed texture with the same memory and shape (nvn_frames.cpp), or null.
+std::shared_ptr<GpuImage> reuse_image(const Texture& t);  // images of textures destroyed before submit `completed` + 1
+
+// nvn_debug.cpp: NX_DUMP_FRAMES, the presented texture read back (recorded into the present's command buffer, written
+// after its fence).
+uint32_t frame_dump_every();
+bool frame_dump_record(VkCommandBuffer cb, GpuImage& img);
+void frame_dump_write(const GpuImage& img, uint64_t frame);
+bool debug_snapshots_pending();  // NX_SNAP_*: this submit recorded snapshots (it is then waited for)
 
 // nvn_draw.cpp: replays one draw-related command; ends the render pass it may have open when asked.
 struct Targets {
@@ -62,6 +102,10 @@ void draw_end_submit();  // after the GPU finished the submit
 void draw_log_stats();
 void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const Targets& targets);
 void draw_end_rendering(VkCommandBuffer cb);  // before transfers (clears, copies, present) and at the end
+// ClearColor / ClearDepthStencil inside the render pass of the current targets (nvn_draw.cpp).
+void draw_clear(VkCommandBuffer cb, const Targets& targets, const Cmd& c);
+// nvn_replay.cpp: a command list into `cb` (`depth`: CallList nesting).
+void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth);
 
 void replay_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list);  // nvn_copy.cpp: texture copies
 void forget_image_views(const GpuImage& img);
@@ -83,5 +127,9 @@ void gpu_profile_begin(VkCommandBuffer cb);
 void gpu_profile_mark(VkCommandBuffer cb, const std::string& label);
 void gpu_profile_collect();
 void gpu_profile_log(uint64_t frames);
+
+namespace replay {
+void dedup_reset();  // nvn_dedup.cpp
+}
 
 }  // namespace nx::nvn

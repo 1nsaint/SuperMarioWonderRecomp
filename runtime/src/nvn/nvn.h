@@ -13,6 +13,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -45,12 +47,14 @@ struct Object {
     virtual ~Object() = default;
 };
 
-std::mutex& objects_lock();
-std::map<uint64_t, std::unique_ptr<Object>>& objects();
+// Looked up for every command recorded and every draw replayed, from several threads: a hash map under a
+// reader/writer lock (lookups share it; make/destroy take it alone).
+std::shared_mutex& objects_lock();
+std::unordered_map<uint64_t, std::unique_ptr<Object>>& objects();
 
 template <typename T>
 T* get(uint64_t guest) {
-    std::lock_guard lk(objects_lock());
+    std::shared_lock lk(objects_lock());
     auto it = objects().find(guest);
     return it == objects().end() ? nullptr : dynamic_cast<T*>(it->second.get());
 }
@@ -116,6 +120,7 @@ struct Texture : Object {
     // is hashed at most once per submit that samples them, and a change means an upload.
     uint64_t content_hash = 0, hashed_submit = 0;
     std::shared_ptr<GpuImage> image;  // made on first use by the GPU
+    std::atomic<uint64_t> last_sampled{0};  // host ns of the last draw that sampled it (kept textures, nvn_objects.cpp)
     ~Texture();  // nvn_vk.cpp: the image is freed once the GPU is done with it
 };
 
@@ -175,6 +180,7 @@ struct Cmd {
         BindDepthStencilState, BindPolygonState, SetBlendColor, UpdateUniformBuffer, SetTexturePool, SetSamplerPool,
         DrawArrays, DrawElements, ReportCounter, SetRasterizerDiscard, SetRenderEnable, CopyTextureToTexture,
         BindImage, DispatchCompute,
+        SetStencilRef, SetStencilMask, SetStencilValueMask, SetPolygonOffsetClamp, SetDepthBounds, SetDepthClamp,
     } op;
     uint32_t n = 0, mask = 0;
     uint64_t a[9] = {};  // textures (render targets: colors then depth), handles, GPU addresses, sizes, ...
@@ -233,6 +239,11 @@ void record(uint64_t cmdbuf, Cmd cmd, const void* blob = nullptr, size_t size = 
 
 void gpu_submit(CPU& c, const std::vector<std::shared_ptr<CmdList>>& lists);
 void gpu_present(uint64_t texture);  // guest NVNtexture* of a window texture
+// With NX_ASYNC_GPU submits run while the game goes on (nvn_frames.cpp): the serial of the last one, and a wait until
+// it completed with its results in guest memory (true if it had to wait). Synchronous: 0, and nothing to wait for.
+uint64_t gpu_serial();
+bool gpu_wait(uint64_t serial);
+uint64_t gpu_write_back_serial();  // the last submit that writes guest memory (compute results)
 
 // Programs: the translated stages bound by nvnProgramSetShaders (nvn_program.cpp; ShaderInfo in nvn_shaders.h).
 struct ShaderInfo;

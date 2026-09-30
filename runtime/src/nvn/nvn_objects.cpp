@@ -1,9 +1,11 @@
 // NVN objects, CPU side (docs/NVN.md, N3): memory pools and GPU addresses, buffers, textures, samplers, texture and
 // sampler pools. Signatures come from the game's call sites (nvn_trace.txt); builder state is read back
 // through the SDK driver's getters (nvn.h). The Vulkan side hangs off these objects.
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <set>
 
 #include "nvn.h"
@@ -96,6 +98,7 @@ void MemoryPoolInitialize(CPU& c) {
 }
 
 void MemoryPoolFinalize(CPU& c) {
+    gpu_wait(gpu_write_back_serial());  // NX_ASYNC_GPU: no compute result lands in freed memory
     if (auto* p = get<MemoryPool>(c.x[0])) pool_unregister(p);
     destroy(c.x[0]);
 }
@@ -168,7 +171,8 @@ void MemoryPoolFlushMappedRange(CPU& c) {
         if (t->image) t->dirty = true;  // rendered images ignore it (nvn_pipeline.cpp)
     }
 }
-void MemoryPoolInvalidateMappedRange(CPU&) {}
+// The CPU is about to read what the GPU wrote: with NX_ASYNC_GPU, compute results still in flight are waited for.
+void MemoryPoolInvalidateMappedRange(CPU&) { gpu_wait(gpu_write_back_serial()); }
 
 // ---- buffers ----------------------------------------------------------------------------------------------------
 
@@ -277,12 +281,84 @@ void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBu
     c.x[0] = 1;
 }
 
+// Pool registrations by texture: {pool, id} slots that named it (a slot re-registered since is skipped when read).
+std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, uint32_t>>> g_registered;
+uint64_t g_next_kept = 0, g_released_kept = 0;
+std::deque<std::pair<uint64_t, uint64_t>> g_kept_order;  // (host key, kept at ns), oldest first
+constexpr uint64_t kKeptTexture = 0xF000000000000000ull;  // host keys of finalized textures a pool still names
+
+// NVN pools hold a copy of the texture's descriptor: a texture may be finalized while registered and stay sampleable
+// through the pool (Wonder does it for most course objects: Goombas, trees, bushes drew black with the dummy, and
+// every such draw ended the render pass; docs/nvn/DEBUG.md #38). The object moves to a host key the pool slots are
+// pointed at, and is destroyed once no slot names it.
 void TextureFinalize(CPU& c) {
+    uint64_t guest = c.x[0];
     {
         std::lock_guard lk(objects_lock());
-        for (auto& [pool, set] : pool_textures()) set.erase(c.x[0]);
+        auto reg = g_registered.find(guest);
+        uint64_t kept = 0;
+        if (reg != g_registered.end()) {
+            for (auto [pool, id] : reg->second) {
+                auto po = objects().find(pool);
+                auto* d = po == objects().end() ? nullptr : dynamic_cast<DescriptorPool*>(po->second.get());
+                auto slot = d ? d->textures.find(id) : decltype(d->textures.end()){};
+                if (!d || slot == d->textures.end() || slot->second != guest) continue;
+                if (!kept) {
+                    kept = kKeptTexture | ++g_next_kept;
+                    static uint64_t released_seen = 0;
+                    if (g_next_kept % 2000 == 0)
+                        log("nvn: %llu finalized textures kept for their pool slots, %llu released",
+                            (unsigned long long)g_next_kept, (unsigned long long)(released_seen = g_released_kept));
+                    objects()[kept] = std::move(objects()[guest]);
+                    g_registered[kept];
+                }
+                slot->second = kept;
+                g_registered[kept].push_back({pool, id});
+                if (g_registered[kept].size() == 1) g_kept_order.push_back({kept, plat::monotonic_ns()});
+            }
+            g_registered.erase(guest);
+        }
+        for (auto& [pool, set] : pool_textures())
+            if (set.erase(guest) && kept) set.insert(kept);
+        // The game rarely re-registers those slots: a kept texture nothing sampled for 2 s goes (its slots then
+        // sample the dummy, as before). Without this they piled up at ~70 per second (6 GB in two minutes).
+        uint64_t now = plat::monotonic_ns();
+        for (int n = 0; n < 8 && !g_kept_order.empty(); n++) {
+            auto [key, since] = g_kept_order.front();
+            auto o = objects().find(key);
+            auto* t = o == objects().end() ? nullptr : dynamic_cast<Texture*>(o->second.get());
+            // Never sampled: 250 ms (a course load finalizes thousands); sampled: 2 s after the last use.
+            uint64_t sampled = t ? t->last_sampled.load() : 0;
+            if (t && (sampled ? std::max(since, sampled) + 2'000'000'000ull : since + 250'000'000ull) > now) break;
+            g_kept_order.pop_front();
+            if (!t) continue;
+            g_registered.erase(key);
+            for (auto& [pool, set] : pool_textures()) set.erase(key);
+            objects().erase(key);
+            g_released_kept++;
+        }
+        if (kept) {
+            objects().erase(guest);
+            return;
+        }
     }
-    destroy(c.x[0]);
+    destroy(guest);
+}
+
+// A kept texture no slot names any more is destroyed (under objects_lock).
+void release_kept(uint64_t key) {
+    if (!(key & kKeptTexture)) return;
+    auto reg = g_registered.find(key);
+    if (reg != g_registered.end())
+        for (auto [pool, id] : reg->second) {
+            auto po = objects().find(pool);
+            auto* d = po == objects().end() ? nullptr : dynamic_cast<DescriptorPool*>(po->second.get());
+            if (d && d->textures.count(id) && d->textures[id] == key) return;  // still named
+        }
+    g_registered.erase(key);
+    for (auto& [pool, set] : pool_textures()) set.erase(key);
+    objects().erase(key);
+    g_released_kept++;
 }
 
 // nvnTextureWriteTexels(const NVNtexture*, const NVNtextureView*, const NVNcopyRegion*, const void* data) and the
@@ -367,8 +443,14 @@ void TexturePoolRegister(CPU& c) {
         if (auto* t = get<Texture>(c.x[2])) t->pool_swizzle = v.swizzle;
     if (auto* d = get<DescriptorPool>(c.x[0])) {
         std::lock_guard lk(objects_lock());
+        uint64_t old = d->textures.count(uint32_t(c.x[1])) ? d->textures[uint32_t(c.x[1])] : 0;
         d->textures[uint32_t(c.x[1])] = c.x[2];
-        if (v.levels || v.layers || v.swizzle)
+        auto& slots = g_registered[c.x[2]];  // re-registered every frame: keep each slot once
+        std::pair<uint64_t, uint32_t> slot{c.x[0], uint32_t(c.x[1])};
+        if (std::find(slots.begin(), slots.end(), slot) == slots.end()) slots.push_back(slot);
+        if (old && old != c.x[2]) release_kept(old);
+        // A view setting only a base level, first layer or format counts too (it was dropped: level 0 sampled).
+        if (v.base_level || v.levels || v.min_layer || v.layers || v.swizzle || v.format)
             d->views[uint32_t(c.x[1])] = v;
         else
             d->views.erase(uint32_t(c.x[1]));

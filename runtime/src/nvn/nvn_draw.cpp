@@ -62,6 +62,8 @@ namespace {
 
 bool g_rendering = false;
 Targets g_pass;           // what the open pass renders to
+uint32_t g_pass_written = 0;
+uint64_t g_submit_ns = 0;  // when the submit being replayed started  // targets the open pass's draws wrote: bit c colour c, bit 8 depth
 VkExtent2D g_pass_extent{};
 
 int api_stage(ShaderStage s) { return s == ShaderStage::Fragment ? 1 : s == ShaderStage::Compute ? 5 : 0; }
@@ -110,27 +112,33 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     }
     p_vkCmdBeginRendering(cb, &ri);
     g_rendering = true;
+    g_pass_written = 0;
     g_pass = t;
     g_pass_extent = extent;
 }
 
 // The buffer a descriptor points to: `bytes` copied into the upload buffer (at least 16 bytes, zero padded).
 // Storage buffers written by compute shaders go back to guest memory after the submit (the GPU's writes are what the
-// game and later work read): (upload copy, guest address, size).
-struct WriteBack {
-    uint8_t* from;
-    uint8_t* to;
-    uint64_t size;
-};
+// game and later work read; WriteBack in nvn_vk.h).
 std::vector<WriteBack> g_write_backs;
+bool all_write_backs() {  // NX_WRITE_BACK_ALL=1: every compute storage binding, written or not (bisecting)
+    static const bool on = std::getenv("NX_WRITE_BACK_ALL") != nullptr;
+    return on;
+}
 
-VkDescriptorBufferInfo buffer_of(const void* bytes, uint64_t size, uint64_t min_size = 16, bool write_back = false) {
+// guest: the bytes are guest memory (a copy is shared by later draws of the submit); host scratch data (the support
+// buffer, c[0]: on the stack, at the same address for every draw) is copied every time (docs/nvn/DEBUG.md #30).
+VkDescriptorBufferInfo buffer_of(const void* bytes, uint64_t size, uint64_t min_size = 16, bool write_back = false,
+                                 bool guest = true) {
     uint64_t n = std::max<uint64_t>((size + 15) & ~15ull, min_size);
+    if (!write_back && guest) {
+        Upload u = dedup_upload(static_cast<const uint8_t*>(bytes), size, n, 256);
+        return {u.buffer, u.offset, n};
+    }
     Upload u = upload_alloc(n, 256);
     std::memset(u.ptr, 0, n);
     if (bytes && size) std::memcpy(u.ptr, bytes, size);
-    if (write_back && bytes && size)
-        g_write_backs.push_back({u.ptr, const_cast<uint8_t*>(static_cast<const uint8_t*>(bytes)), size});
+    if (bytes && size) g_write_backs.push_back({u.ptr, const_cast<uint8_t*>(static_cast<const uint8_t*>(bytes)), size});
     return {u.buffer, u.offset, n};
 }
 
@@ -144,29 +152,6 @@ struct Resolved {
 
 
 uint64_t g_dump_draws = 0, g_dump_request = 0;
-
-// c[0], the NVN driver's constants, as far as shaders read them (docs/nvn/TRANSLATOR.md): buffer descriptors
-// {u64 GPU address; u32 size} of what is bound, which compute shaders search to find the buffer an address falls in
-// (they wrote garbage with a zero table), and the maximum point size.
-std::array<uint8_t, 0x1000> driver_constants(ShaderStage stage, int st) {
-    std::array<uint8_t, 0x1000> c0{};
-    auto put = [&](uint32_t at, const Range& r) {
-        if (at + 12 > c0.size()) return;
-        std::memcpy(c0.data() + at, &r.address, 8);
-        uint32_t size = uint32_t(std::min<uint64_t>(r.size, 0xFFFFFFFFu));
-        std::memcpy(c0.data() + at + 8, &size, 4);
-    };
-    if (stage == ShaderStage::Compute) {
-        for (int n = 0; n < 16; n++) put(0x210 + 0x10 * n, g_state.uniforms[st][n]);
-        for (int n = 0; n < 16; n++) put(0x310 + 0x10 * n, g_state.storage[st][n]);
-    } else {
-        int hw = stage == ShaderStage::Fragment ? 4 : 0;  // Maxwell stage numbers: vertex 0, fragment 4
-        for (int n = 0; n < 16; n++) put(0x110 + 0x100 * hw + 0x10 * n, g_state.storage[st][n]);
-        float max_point = 64.0f;
-        std::memcpy(c0.data() + 0x610, &max_point, 4);
-    }
-    return c0;
-}
 
 // Descriptor sets for a program's stages from the bound state: buffers (sets 0/1), textures (set 2, the bindings
 // `tex_bindings` with their resolved `handles`), storage images (set 3). Records uploads and layout changes, so it
@@ -197,7 +182,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
             if (b.set >= 2) continue;
             VkDescriptorBufferInfo info{};
             switch (b.nvn.source) {
-                case NvnSource::SupportBuffer: info = buffer_of(&sb, sizeof sb); break;
+                case NvnSource::SupportBuffer: info = buffer_of(&sb, sizeof sb, 16, false, false); break;
                 case NvnSource::ConstantData: info = buffer_of(s->constants.data(), s->constants.size()); break;
                 case NvnSource::UniformBlock:
                 case NvnSource::UniformAsStorage: {
@@ -217,15 +202,16 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
                     // At least 64 KB: Metal does not bound-check, and a shader writing past a small or missing
                     // buffer overwrote the next data in the upload buffer (garbage everywhere after a compute).
                     info = buffer_of(p, p ? std::min<uint64_t>(r.size, 16ull << 20) : 0, 0x10000,
-                                     s->stage == ShaderStage::Compute);
+                                     s->stage == ShaderStage::Compute &&
+                                         (all_write_backs() || (b.binding < 64 && written_storage_bindings(s) >> b.binding & 1)));
                     break;
                 }
                 case NvnSource::DriverConstants: {
                     auto c0 = driver_constants(s->stage, st);
-                    info = buffer_of(c0.data(), c0.size());
+                    info = buffer_of(c0.data(), c0.size(), 16, false, false);
                     break;
                 }
-                default: info = buffer_of(nullptr, 0x1000); break;
+                default: info = buffer_of(nullptr, 0x1000, 16, false, false); break;
             }
             buffers.push_back(info);
             VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -309,7 +295,24 @@ bool gather_textures(const std::vector<const ShaderInfo*>& shaders,
         uint64_t texture = 0;
         SamplerInfo si;
         texture_for(handle, texture, si);
+        // A pool entry naming a texture that no longer exists samples the dummy, like no texture: it ended the
+        // render pass at every draw (~1.4M times in a run, docs/nvn/DEBUG.md #34).
+        if (Texture* sampled = texture ? get<Texture>(texture) : nullptr)
+            sampled->last_sampled = g_submit_ns;
+        else
+            texture = 0;
         if (texture ? !sampled_ready(texture) : !dummy_ready(b->image)) need_break = true;
+        // Sampling one of the open pass's targets (a depth buffer read back by the character lighting) needs what
+        // was rendered stored first: a fresh pass. SetRenderTargets used to end every pass, which did this by chance
+        // (docs/nvn/DEBUG.md #35).
+        // Only when a draw of this pass wrote it (g_pass_written: bit c colour target c, bit 8 depth).
+        if (texture && g_rendering) {
+            GpuImage* img = image_of(texture);
+            uint32_t hit = img && g_pass.depth && image_of(g_pass.depth) == img ? 1u << 8 : 0;
+            for (uint32_t c = 0; c < g_pass.color_count && img; c++)
+                if (g_pass.colors[c] && image_of(g_pass.colors[c]) == img) hit |= 1u << c;
+            if (hit & g_pass_written) need_break = true;
+        }
     }
     return need_break;
 }
@@ -332,26 +335,7 @@ void dispatch(VkCommandBuffer cb, const Cmd& c) {
         std::memcpy(&x, p, 4), std::memcpy(&y, p + 4, 4), std::memcpy(&z, p + 8, 4);
     }
     if (!x || !y || !z) return;
-    {
-        static std::set<std::string> seen;
-        if (seen.insert(cs->hash).second) {
-            std::string res;
-            for (const DescriptorBinding& b : cs->refl.bindings)
-                res += " " + b.name + "(s" + std::to_string(b.set) + ")";
-            log("nvn: compute %s groups %ux%ux%u local %ux%ux%u:%s", cs->hash.c_str(), x, y, z, cs->local_size[0],
-                cs->local_size[1], cs->local_size[2], res.c_str());
-            for (const DescriptorBinding& b : cs->refl.bindings) {
-                const Range* r = b.nvn.source == NvnSource::StorageBuffer && b.nvn.index >= 0 && b.nvn.index < 16
-                                     ? &g_state.storage[5][b.nvn.index]
-                                 : (b.nvn.source == NvnSource::UniformBlock || b.nvn.source == NvnSource::UniformAsStorage) &&
-                                         b.nvn.index >= 0 && b.nvn.index < 18
-                                     ? &g_state.uniforms[5][b.nvn.index]
-                                     : nullptr;
-                log("  %s: %s %d -> %llx+%llx", b.name.c_str(), source_name(b.nvn.source), b.nvn.index,
-                    (unsigned long long)(r ? r->address : 0), (unsigned long long)(r ? r->size : 0));
-            }
-        }
-    }
+    trace_compute_once(cs, x, y, z);
     std::vector<const ShaderInfo*> stages{cs};
     const ProgramLayout& layout = program_layout(stages);
     VkPipeline pipeline = compute_pipeline(cs, layout);
@@ -365,7 +349,9 @@ void dispatch(VkCommandBuffer cb, const Cmd& c) {
     p_vkUpdateDescriptorSets(vk_device(), uint32_t(d.writes.size()), d.writes.data(), 0, nullptr);
     p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout.layout, 0, 4, d.sets, 0, nullptr);
+    if (gpu_profile_on()) gpu_profile_mark(cb, "compute " + cs->hash);
     p_vkCmdDispatch(cb, x, y, z);
+    if (gpu_profile_on()) gpu_profile_mark(cb, "outside passes (clears, uploads, copies)");
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -392,20 +378,8 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         g_stats.no_vertex++;
         return false;
     }
-    // NX_SWAP_FS=<from>:<to>: draws with fragment shader <from> use <to> instead (loaded already), to see what a
-    // shader's geometry covers or what its textures hold.
-    static const std::string swap = std::getenv("NX_SWAP_FS") ? std::getenv("NX_SWAP_FS") : "";
-    std::vector<const ShaderInfo*> swapped;
-    if (!swap.empty() && fs && swap.compare(0, 16, fs->hash) == 0 && swap.size() > 17)
-        if (const ShaderInfo* to = shader_by_hash(swap.substr(17))) {
-            swapped = *shaders;
-            std::replace(swapped.begin(), swapped.end(), fs, to);
-            shaders = &swapped;
-            fs = to;
-        }
-    // NX_SKIP_FS=<hash>,<hash>: draws with those fragment shaders are dropped (to measure what they cost).
-    static const std::string skip = std::getenv("NX_SKIP_FS") ? std::getenv("NX_SKIP_FS") : "";
-    if (!skip.empty() && fs && skip.find(fs->hash) != std::string::npos) return false;
+    std::vector<const ShaderInfo*> swapped;  // NX_SWAP_FS / NX_SKIP_FS (nvn_draw_trace.cpp)
+    if (!debug_shader_overrides(shaders, fs, swapped)) return false;
     const ProgramLayout& layout = program_layout(*shaders);
 
     // NX_SNAP_FS_BEFORE=<hash>[@<first draw>]: snapshot colour target 0 before draws with that fragment shader
@@ -429,7 +403,10 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     std::vector<uint64_t> handles;
     bool need_break = gather_textures(*shaders, tex_bindings, handles);
     bool targets_changed = !g_rendering || std::memcmp(&g_pass, &t, sizeof t) != 0;
-    if (g_rendering && (need_break || targets_changed)) draw_end_rendering(cb);
+    if (g_rendering && (need_break || targets_changed)) {
+        (targets_changed ? g_stats.breaks_targets : g_stats.breaks_textures)++;
+        draw_end_rendering(cb);
+    }
 
     Descriptors d;
     build_sets(cb, *shaders, layout, tex_bindings, handles, d);
@@ -455,7 +432,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     std::copy_n(g_state.streams.begin(), key.stream_count, key.streams);
     std::copy_n(g_state.blend, 8, key.blend);
     key.color = g_state.color, key.mask = g_state.mask, key.depth = g_state.depth, key.polygon = g_state.polygon;
-    key.color_count = t.color_count;
+    key.color_count = t.color_count, key.depth_clamp = g_state.depth_clamp;
     for (uint32_t k = 0; k < t.color_count; k++) {
         GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
         key.color_formats[k] = img ? view_format(*img, t.views.format[k]) : VK_FORMAT_R8G8B8A8_UNORM;
@@ -472,12 +449,18 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.layout, 0, 4, d.sets, 0, nullptr);
 
-    // Vertex buffers: the bound ranges of the streams in use, plus the zero stream (binding 15).
-    uint32_t max_vertex = 0;
+    // Vertex buffers: the bound ranges of the streams the vertex shader reads (the pipeline declares no others),
+    // plus the zero stream (binding 15).
+    uint32_t max_vertex = 0, used = 0;
+    for (const ShaderIo& in : vs->refl.inputs)
+        if (in.location < g_state.attribs.size() && g_state.attribs[in.location].stream < 15)
+            used |= 1u << g_state.attribs[in.location].stream;
     for (uint32_t s = 0; s < 15; s++) {
+        if (!(used >> s & 1)) continue;
         const Range& r = g_state.vertex_buffers[s];
         const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
-        Upload u = upload(p, p ? std::min<uint64_t>(r.size, 64ull << 20) : 0, 16);
+        uint64_t size = p ? std::min<uint64_t>(r.size, 64ull << 20) : 0;
+        Upload u = dedup_upload(p, size, std::max<uint64_t>((size + 15) & ~15ull, 16), 16);
         VkDeviceSize off = u.offset;
         p_vkCmdBindVertexBuffers(cb, s, 1, &u.buffer, &off);
     }
@@ -506,7 +489,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     p_vkCmdSetViewport(cb, 0, 1, &vp);
     p_vkCmdSetScissor(cb, 0, 1, &sc);
     p_vkCmdSetBlendConstants(cb, g_state.blend_color);
-    p_vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+    raster_dynamic(cb);  // stencil reference and masks, depth bias (nvn_raster.cpp)
 
     trace_skin(indexed, c, vs, fs);
     if (indexed) {
@@ -538,6 +521,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         if (q) zero_draws_end(cb);
     }
     g_stats.done++;
+    g_pass_written |= ((1u << t.color_count) - 1) | (g_state.depth.depth_write || g_state.depth.stencil_test ? 1u << 8 : 0);
     // NX_SNAP_FS=<hash>,<hash>[@<first draw>]: also snapshot after draws with those fragment shaders (8 at most).
     static const std::string snap_fs = std::getenv("NX_SNAP_FS") ? std::getenv("NX_SNAP_FS") : "";
     static const uint64_t snap_from = snap_fs.find('@') != std::string::npos
@@ -566,19 +550,31 @@ void draw_end_submit() {  // after the submit's fence: compute results to guest 
     g_write_backs.clear();
 }
 
+std::vector<WriteBack> draw_take_write_backs() {  // an asynchronous submit copies them when it is retired
+    std::vector<WriteBack> v;
+    v.swap(g_write_backs);
+    return v;
+}
+
 void draw_begin_submit() {
     g_rendering = false;
+    g_submit_ns = plat::monotonic_ns();
+    dedup_reset();
     pipeline_begin_submit();
 }
 
 uint64_t recorded_draws();
 
 void draw_log_stats() {
+    dedup_log();
+    sampled_ready_log();
     Stats& t = g_stats;
     log("nvn draws: %llu recorded, %llu replayed:", (unsigned long long)recorded_draws(), (unsigned long long)t.total);
     log("nvn draws: %llu total, %llu done, %llu no program, %llu no vertex shader, %llu no pipeline, %llu no indices",
         (unsigned long long)t.total, (unsigned long long)t.done, (unsigned long long)t.no_program,
         (unsigned long long)t.no_vertex, (unsigned long long)t.no_pipeline, (unsigned long long)t.no_indices);
+    log("nvn passes: %llu ended by a draw's texture uploads or layout changes, %llu by new targets, %llu dispatches",
+        (unsigned long long)t.breaks_textures, (unsigned long long)t.breaks_targets, (unsigned long long)t.dispatches);
 }
 
 void draw_end_rendering(VkCommandBuffer cb) {
@@ -588,91 +584,51 @@ void draw_end_rendering(VkCommandBuffer cb) {
     gpu_profile_mark(cb, "outside passes (clears, uploads, copies)");
 }
 
-void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const Targets& targets) {
-    State& s = g_state;
-    auto blob = [&](size_t size) -> const uint8_t* {
-        return c.blob < list.blobs.size() && list.blobs[c.blob].size() >= size ? list.blobs[c.blob].data() : nullptr;
-    };
-    switch (c.op) {
-        case Cmd::SetViewport:
-            std::memcpy(s.viewport, c.i, sizeof s.viewport), s.has_viewport = true;
-            break;
-        case Cmd::SetRasterizerDiscard: s.rasterizer_discard = c.n != 0; break;
-        case Cmd::BindImage:
-            if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 16) s.images[c.i[0]][c.i[1]] = c.a[0];
-            break;
-        case Cmd::DispatchCompute: dispatch(cb, c); break;
-        case Cmd::SetRenderEnable: s.render_enable = c.n != 0; break;
-        case Cmd::SetScissor:
-            std::memcpy(s.scissor, c.i, sizeof s.scissor), s.has_scissor = true;
-            break;
-        case Cmd::SetDepthRange:
-            s.depth_near = c.f[0], s.depth_far = c.f[1];
-            break;
-        case Cmd::BindProgram: s.program = c.a[0]; break;
-        case Cmd::BindUniformBuffer:
-            if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 18) s.uniforms[c.i[0]][c.i[1]] = {c.a[0], c.a[1]};
-            break;
-        case Cmd::BindStorageBuffer:
-            if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 16) s.storage[c.i[0]][c.i[1]] = {c.a[0], c.a[1]};
-            break;
-        case Cmd::BindTexture:
-            if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 32) s.textures[c.i[0]][c.i[1]] = c.a[0];
-            break;
-        case Cmd::BindVertexBuffer:
-            if (c.i[0] >= 0 && c.i[0] < 16) s.vertex_buffers[c.i[0]] = {c.a[0], c.a[1]};
-            break;
-        case Cmd::SetTexturePool: s.texture_pool = c.a[0]; break;
-        case Cmd::SetSamplerPool: s.sampler_pool = c.a[0]; break;
-        case Cmd::BindVertexAttribs:
-            if (auto* p = blob(c.n * sizeof(VertexAttrib)))
-                s.attribs.assign(reinterpret_cast<const VertexAttrib*>(p), reinterpret_cast<const VertexAttrib*>(p) + c.n);
-            break;
-        case Cmd::BindVertexStreams:
-            if (auto* p = blob(c.n * sizeof(VertexStream)))
-                s.streams.assign(reinterpret_cast<const VertexStream*>(p), reinterpret_cast<const VertexStream*>(p) + c.n);
-            break;
-        case Cmd::BindBlendState:
-            if (auto* p = blob(sizeof(BlendTarget))) {
-                BlendTarget b;
-                std::memcpy(&b, p, sizeof b);
-                if (b.target < 8) s.blend[b.target] = b;
-            }
-            break;
-        case Cmd::BindColorState:
-            if (auto* p = blob(sizeof(ColorStateInfo))) std::memcpy(&s.color, p, sizeof s.color);
-            break;
-        case Cmd::BindChannelMaskState:
-            if (auto* p = blob(sizeof(ChannelMaskInfo))) std::memcpy(&s.mask, p, sizeof s.mask);
-            break;
-        case Cmd::BindDepthStencilState:
-            if (auto* p = blob(sizeof(DepthStencilInfo))) std::memcpy(&s.depth, p, sizeof s.depth);
-            break;
-        case Cmd::BindPolygonState:
-            if (auto* p = blob(sizeof(PolygonInfo))) std::memcpy(&s.polygon, p, sizeof s.polygon);
-            break;
-        case Cmd::SetBlendColor: std::memcpy(s.blend_color, c.f, sizeof s.blend_color); break;
-        case Cmd::UpdateUniformBuffer: {  // (buffer address, size, offset, data): written in order, like the GPU
-            uint64_t off = c.a[2];
-            if (c.blob < list.blobs.size())
-                if (uint8_t* p = const_cast<uint8_t*>(guest_bytes(c.a[0] + off)))
-                    std::memcpy(p, list.blobs[c.blob].data(), list.blobs[c.blob].size());
-            break;
-        }
-        case Cmd::ReportCounter: {  // {value, timestamp}: the work before it is done when the replay gets here
-            static uint64_t reports = 0, types_seen = 0;
-            if (c.n < 64 && !(types_seen >> c.n & 1)) types_seen |= 1ull << c.n, log("nvn: first counter report of type %u", c.n);
-            if (uint8_t* p = const_cast<uint8_t*>(guest_bytes(c.a[0]))) {
-                uint64_t v[2] = {++reports, plat::monotonic_ns()};
-                std::memcpy(p, v, sizeof v);
-            }
-            break;
-        }
-        case Cmd::DrawArrays: draw(cb, targets, c.n, false, c); break;
-        case Cmd::DrawElements: draw(cb, targets, c.n, true, c); break;
-        default: break;
+// Clears run inside the render pass of the current targets (vkCmdClearAttachments). A transfer clear between passes
+// was a Metal encoder of its own and made the next pass reload its targets: most of the ~25 ms per frame of GPU time
+// "outside passes" (docs/nvn/DEBUG.md #31). Depth and stencil clears honour the call's masks.
+void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
+    bool color = c.op == Cmd::ClearColor;
+    uint64_t guest = color ? (c.n < 8 ? t.colors[c.n] : 0) : t.depth;
+    GpuImage* img = guest ? image_of(guest) : nullptr;
+    if (!img || color != (img->aspect == VK_IMAGE_ASPECT_COLOR_BIT)) return;
+    if (color && !(c.mask & 0xF)) return;  // no channel enabled
+    VkClearAttachment a{};
+    if (color) {
+        a.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, a.colorAttachment = c.n;
+        std::memcpy(a.clearValue.color.float32, c.f, 16);
+    } else {
+        if ((c.mask & 1) && (img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) a.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+        if ((c.mask >> 8 & 0xFF) && (img->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) a.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        if (!a.aspectMask) return;
+        a.clearValue.depthStencil = {c.f[0], uint32_t(c.i[0])};
     }
+    if (g_rendering && std::memcmp(&g_pass, &t, sizeof t) != 0) draw_end_rendering(cb);
+    if (!g_rendering) begin_rendering(cb, t);
+    uint32_t level = color ? t.views.level[c.n] : t.views.level[8];
+    VkExtent2D full{std::max(1u, img->width >> level), std::max(1u, img->height >> level)};
+    if (full.width > g_pass_extent.width || full.height > g_pass_extent.height) {
+        // The pass is smaller than this target (a larger shared depth buffer): clear all of it, outside the pass.
+        draw_end_rendering(cb);
+        transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);
+        VkImageSubresourceRange r{a.aspectMask, std::min<uint32_t>(level, img->levels - 1), 1,
+                                  std::min<uint32_t>(color ? t.views.layer[c.n] : t.views.layer[8], img->layers - 1), 1};
+        if (color)
+            p_vkCmdClearColorImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &a.clearValue.color, 1, &r);
+        else
+            p_vkCmdClearDepthStencilImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &a.clearValue.depthStencil, 1, &r);
+        return;
+    }
+    VkClearRect r{{{0, 0}, g_pass_extent}, 0, 1};
+    p_vkCmdClearAttachments(cb, 1, &a, 1, &r);
+    g_pass_written |= color ? 1u << c.n : 1u << 8;  // a later draw sampling it needs a fresh pass
 }
+
+// Entry points of the draws and dispatches for draw_command (nvn_draw_state.cpp).
+bool draw_call(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, const Cmd& c) {
+    return draw(cb, t, mode, indexed, c);
+}
+void dispatch_call(VkCommandBuffer cb, const Cmd& c) { dispatch(cb, c); }
 
 uint64_t draw_take_dump_request() {
     uint64_t r = g_dump_request;

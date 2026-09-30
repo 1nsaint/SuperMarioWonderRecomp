@@ -77,20 +77,6 @@ VkDescriptorSetLayout set_layout(const std::vector<VkDescriptorSetLayoutBinding>
     return l;
 }
 
-// ---- samplers -------------------------------------------------------------------------------------------------------
-
-VkSamplerAddressMode vk_wrap(uint32_t w) {  // NVN: 0 clamp, 1 repeat, 2 mirror clamp, 3 mirror clamp to edge,
-    switch (w) {                            // 4 mirror clamp to border, 5 clamp to border, 6 mirrored repeat, 7 edge
-        case 1: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        case 2:
-        case 3:
-        case 4: return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
-        case 5: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-        case 6: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
-        default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    }
-}
-
 // ---- images ---------------------------------------------------------------------------------------------------------
 
 VkImageViewType view_type(const ImageShape& s) {  // SPIR-V Dim: 0 1D, 1 2D, 2 3D, 3 Cube
@@ -173,6 +159,7 @@ VkImageView view_of(GpuImage& img, VkImageViewType type, const ViewInfo& view) {
 // Untiles the texture's pool memory and copies it into the image (every level and layer).
 void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
     img.uploaded = true;
+    if (gpu_profile_on()) gpu_profile_mark(cb, "texture uploads");
     if (!t.memory || !t.storage_size) return;
     if (std::getenv("NX_TRACE_UPLOADS") && t.storage_size >= (1u << 20)) {
         const uint8_t* m = reinterpret_cast<const uint8_t*>(t.memory);
@@ -351,6 +338,14 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     // upper-left-origin mapping, so windings match NVN's.
     rs.frontFace = key.polygon.front == 0 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.0f;
+    // SetDepthClamp: clamps instead of clipping at the near and far planes, like depthClampEnable (a device feature;
+    // nvn_vk.cpp enables every core feature the GPU has, and MoltenVK has it through Metal's depth clip mode).
+    rs.depthClampEnable = key.depth_clamp && vk_features().depthClamp ? VK_TRUE : VK_FALSE;
+    // Polygon offset: NVNpolygonOffsetEnable has a bit per polygon mode (POINT 1, LINE 2, FILL 4; modes are POINT 0,
+    // LINE 1, FILL 2), and the bit of the mode drawn with decides. Factor, units and clamp are dynamic (SetDepthBias
+    // at each draw, nvn_raster.cpp): the game sets them on the command buffer, not in the state object.
+    uint32_t offset_bit = key.polygon.mode <= 2 ? 1u << key.polygon.mode : 4u;
+    rs.depthBiasEnable = key.polygon.offset_enables & offset_bit ? VK_TRUE : VK_FALSE;
 
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
@@ -371,7 +366,7 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
         faces[f]->depthFailOp = vk_stencil_op(key.depth.depth_fail[f]);
         faces[f]->passOp = vk_stencil_op(key.depth.depth_pass[f]);
         faces[f]->compareOp = vk_compare(key.depth.stencil_func[f]);
-        faces[f]->compareMask = faces[f]->writeMask = 0xFF;
+        faces[f]->compareMask = faces[f]->writeMask = 0xFF;  // dynamic: SetStencilValueMask / SetStencilMask
     }
 
     VkPipelineColorBlendAttachmentState att[8]{};
@@ -390,8 +385,11 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     cb.attachmentCount = key.color_count;
     cb.pAttachments = att;
 
+    // Stencil reference and masks and depth bias values come from command-buffer calls (nvn_raster.cpp), so they are
+    // dynamic: one pipeline for every value the game uses.
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-                            VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+                            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+                            VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_DEPTH_BIAS};
     VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dy.dynamicStateCount = uint32_t(sizeof dyn / sizeof dyn[0]);
     dy.pDynamicStates = dyn;
@@ -422,41 +420,6 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     else if (g_trace)
         log("nvn/vk: pipeline %zu: %s + %s", cache.size() + 1, key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
     return cache[k] = p;
-}
-
-// ---- samplers -------------------------------------------------------------------------------------------------------
-
-VkSampler sampler_for(const SamplerInfo& s, bool shadow) {
-    static std::map<std::string, VkSampler> cache;
-    std::string key(reinterpret_cast<const char*>(&s), sizeof s);
-    key += shadow ? '1' : '0';
-    auto& v = cache[key];
-    if (v) return v;
-    VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    // NVN min filter: 0 nearest, 1 linear, 2 nearest mip nearest, 3 linear mip nearest, 4 nearest mip linear,
-    // 5 linear mip linear; mag: 0 nearest, 1 linear.
-    uint32_t m = s.min_filter;
-    ci.minFilter = (m == 1 || m == 3 || m == 5) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    ci.magFilter = s.mag_filter == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    ci.mipmapMode = (m == 4 || m == 5) ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    ci.addressModeU = vk_wrap(s.wrap[0]);
-    ci.addressModeV = vk_wrap(s.wrap[1]);
-    ci.addressModeW = vk_wrap(s.wrap[2]);
-    ci.mipLodBias = s.lod_bias;
-    // Games pass lod_min -1000 ("no limit"); Metal wants lodMinClamp >= 0, and a negative one made the glyph
-    // sampler return 0 (all text invisible).
-    ci.minLod = m <= 1 ? 0.0f : std::max(0.0f, s.lod_min);
-    ci.maxLod = m <= 1 ? 0.25f : std::max(ci.minLod, s.lod_max);  // no mipmapping: level 0 only
-    ci.anisotropyEnable = s.max_anisotropy > 1.0f;
-    ci.maxAnisotropy = std::min(s.max_anisotropy, 16.0f);
-    ci.compareEnable = shadow;
-    ci.compareOp = shadow ? vk_compare(s.compare_func) : VK_COMPARE_OP_ALWAYS;
-    bool white = s.border[3] > 0.5f && s.border[0] > 0.5f;
-    ci.borderColor = white ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE
-                     : s.border[3] > 0.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK
-                                          : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-    p_vkCreateSampler(vk_device(), &ci, nullptr, &v);
-    return v;
 }
 
 // ---- sampled textures -------------------------------------------------------------------------------------------------
@@ -511,18 +474,29 @@ void check_linear_content(Texture& t) {
 
 void pipeline_begin_submit() { g_submit_serial++; }
 
+uint64_t g_not_ready[6];  // why sampled_ready said no: no image, dirty, texel writes, rendered, not uploaded, layout
+
 bool sampled_ready(uint64_t texture) {
     Texture* t = get<Texture>(texture);
-    if (!t || !t->image) return false;
+    if (!t || !t->image) return g_not_ready[0]++, false;  // no image yet (missing textures are the caller's)
     check_linear_content(*t);
-    if (t->dirty && !t->image->rendered) return false;
+    if (t->dirty && !t->image->rendered) return g_not_ready[1]++, false;
     {
         std::lock_guard lk(objects_lock());
-        if (!t->writes.empty()) return false;
+        if (!t->writes.empty()) return g_not_ready[2]++, false;
     }
     const GpuImage& img = *t->image;
-    return img.rendered ? img.layout == VK_IMAGE_LAYOUT_GENERAL
-                        : img.uploaded && img.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    bool ok = img.rendered ? img.layout == VK_IMAGE_LAYOUT_GENERAL
+                           : img.uploaded && img.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    if (!ok) g_not_ready[img.rendered ? 3 : !img.uploaded ? 4 : 5]++;
+    return ok;
+}
+
+void sampled_ready_log() {
+    log("nvn passes: textures not ready: %llu no image, %llu dirty, %llu texel writes, %llu rendered not GENERAL, "
+        "%llu not uploaded, %llu uploaded in another layout",
+        (unsigned long long)g_not_ready[0], (unsigned long long)g_not_ready[1], (unsigned long long)g_not_ready[2],
+        (unsigned long long)g_not_ready[3], (unsigned long long)g_not_ready[4], (unsigned long long)g_not_ready[5]);
 }
 
 VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer, VkFormat format) {
@@ -568,12 +542,20 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
                          VkImageLayout* layout) {
     *layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     GpuImage* img = ensure_contents(cb, texture);
-    if (!img) return dummy_view(cb, shape);
+    static uint64_t no_image = 0, incompatible = 0;
+    if (!img) {
+        if (++no_image % 100000 == 1) log("nvn/vk: dummy sampled: %llu with no image, %llu with an incompatible view",
+                                          (unsigned long long)no_image, (unsigned long long)incompatible);
+        return dummy_view(cb, shape);
+    }
     *layout = img->rendered ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     transition(cb, *img, *layout);
     VkImageView v = view_of(*img, view_type(shape), view ? *view : ViewInfo{});
     if (!v) {
         *layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        if (++incompatible % 1000 == 1)
+            log("nvn/vk: texture %llx (%ux%u x%u, view type %d) sampled as view type %d: dummy", (unsigned long long)texture,
+                img->width, img->height, img->layers, int(img->view_type), int(view_type(shape)));
         return dummy_view(cb, shape);
     }
     return v;
@@ -629,6 +611,7 @@ VkImageView dummy_view(VkCommandBuffer cb, const ImageShape& shape) {
         p_vkCmdClearDepthStencilImage(cb, d.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
     } else {
         VkClearColorValue v{};
+        if (std::getenv("NX_DUMMY_MAGENTA")) v = {{1.0f, 0.0f, 1.0f, 1.0f}};  // debug: where the dummy is sampled
         p_vkCmdClearColorImage(cb, d.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
     }
     transition(cb, d, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -697,18 +680,16 @@ VkImageView storage_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
 }
 
 void forget_image_views(const GpuImage& img) {
-    auto drop = [&](auto& cache) {
-        for (auto it = cache.begin(); it != cache.end();) {
-            if (std::get<0>(it->first) == img.image) {
-                if (it->second && it->second != img.view) p_vkDestroyImageView(vk_device(), it->second, nullptr);
-                it = cache.erase(it);
-            } else {
-                ++it;
-            }
+    // The caches are ordered by image first: its views are one run from the smallest key with that image (this was
+    // a scan of every cached view per destroyed texture, a visible share of the replay time).
+    auto drop = [&](auto& cache, auto lowest) {
+        for (auto it = cache.lower_bound(lowest); it != cache.end() && std::get<0>(it->first) == img.image;) {
+            if (it->second && it->second != img.view) p_vkDestroyImageView(vk_device(), it->second, nullptr);
+            it = cache.erase(it);
         }
     };
-    drop(g_sampled_views);
-    drop(g_attachment_views);
+    drop(g_sampled_views, std::make_tuple(img.image, VkImageViewType(0), 0u, uint64_t(0), uint64_t(0)));
+    drop(g_attachment_views, std::make_tuple(img.image, 0u, 0u, VkFormat(0)));
 }
 
 }  // namespace nx::nvn

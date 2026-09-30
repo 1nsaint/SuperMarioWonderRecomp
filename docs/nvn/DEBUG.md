@@ -263,3 +263,69 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
     - Result: ceremony mean luma 0.756, 5th percentile 0.366, saturation 0.332 (the real game: 0.748 / 0.380 /
       0.314). See docs/media/wonder/26-colours-before-after.png and 22-25.
     - Left: the disc behind the Wonder emblem is still dark red (study G4). Issue #17.
+30. **50-70 MB of uploads per frame (~130 KB per draw).** Every draw copied its uniform banks, storage buffers and
+    all 15 vertex streams from guest memory into the upload ring, even when the previous draw had just copied the
+    same bytes.
+    - Fix (nvn_dedup.cpp): within a submit, one copy per guest address and size serves every later draw. Guest memory
+      only changes during a replay through `UpdateUniformBuffer` and `ReportCounter` (both invalidate what they
+      overlap) and compute results (written back after the submit, so every draw reads the same pre-dispatch bytes
+      either way). Only the vertex streams the shader reads are uploaded.
+    - A first version also shared the support buffer and c[0]. Those are host scratch data on the stack, at the same
+      address for every draw, so every draw got the first draw's viewport and buffer table; the review caught it.
+      Now only guest memory is shared.
+    - Result: ~12 MB per frame in the course, 19 GB reused against 2.5 GB copied in one run.
+31. **Clears were transfer operations between render passes**, each a Metal encoder of its own that made the next
+    pass reload its targets. `draw_clear()` (nvn_draw.cpp) clears inside the pass with `vkCmdClearAttachments`:
+    - it honours the depth and stencil masks, and a colour mask of 0;
+    - it falls back to a transfer clear when the target is larger than the pass;
+    - the cleared target counts as written for #35.
+32. **Compute write-backs for read-only storage.** Every storage binding of a compute shader was copied back to guest
+    memory after the submit. That forced the async path to wait before every replay, and a read-only binding's stale
+    copy could overwrite real results. `written_storage_bindings()` (nvn_spirv_patch.cpp) scans the SPIR-V for stores
+    and atomics through each binding; a pointer it cannot trace marks every binding. `NX_WRITE_BACK_ALL=1` restores
+    the old behaviour.
+33. **Two clocks.** The game paces on its vsync event (60 Hz host timer), and the FIFO swapchain also waited for the
+    display. The swapchain now uses MAILBOX when the driver has it (`NX_FIFO=1` for FIFO).
+34. **~300 render passes per frame, each reloading and storing its targets.**
+    - Counters (`nvn passes:` log lines) showed 1.2 M passes ended by a draw whose texture was "not ready", against
+      3.2 M draws. The texture was nearly always a pool entry naming a destroyed NVNtexture (see #38): it sampled the
+      dummy anyway, but ended the pass first.
+    - GPU "outside passes" went from 24.5 to ~12 ms per frame, and GPU wait from ~32 to ~13 ms per frame.
+    - Also:
+      - `SetRenderTargets` no longer ends the pass by itself (see #35);
+      - `forget_image_views` is a range erase instead of a scan of every cached view;
+      - the object registry is a hash map under a reader/writer lock.
+    - Reusing the images of destroyed render targets for new textures over the same memory is implemented but off by
+      default (`NX_IMAGE_REUSE=1`): the review found that a CPU-written texture placed there would sample the old
+      render.
+35. **Characters turned into dark silhouettes** after `SetRenderTargets` stopped ending the pass.
+    - The character lighting samples a target of the open pass (the depth buffer) after drawing to it. That needs
+      what was rendered to be stored first, and the old pass break did it by chance.
+    - Found with bisect switches: `NX_TARGETS_BREAK=1` restored the colours, `NX_NO_IMAGE_REUSE` and
+      `NX_WRITE_BACK_ALL` did not.
+    - Fix: a draw that samples an image that is one of the open pass's targets and was written in this pass (by a draw
+      or a clear) starts a new pass.
+36. **Two NVNtextures over the same memory had separate images.** The game renders through one texture object and
+    samples the same memory through another (UI capture and blur chains, agl filters), so the sampled image was a
+    stale upload. Live textures with the same memory and shape now share one image (image_of, nvn_vk.cpp). The
+    graveyard frees an image only when no other texture holds it. Pool views that set only a base level, a layer or a
+    format are kept too (they were dropped, so level 0 was sampled).
+37. **Near 26 fps everywhere, menus included.**
+    - The kernel's spin throttles (a 0.5 ms nap for a thread yielding more than 32 times in a row or spinning on
+      GetSystemTick) were made for Hades on phones.
+    - Wonder's job system joins its workers by yielding in a loop, so every join took over 1 ms. The main thread spent
+      ~18% of its time in those naps, and its own work was only ~8%.
+    - The throttles are now Hades-only (`NX_SPIN_NAPS=0/1` overrides).
+    - Game threads run at `QOS_CLASS_USER_INTERACTIVE`, so macOS keeps them off the efficiency cores.
+    - A frame limiter paces presents to the window's present interval (a late frame is not snapped to the next vsync;
+      `NX_NO_FRAME_LIMIT=1` for unpaced).
+    - Title and menus now run at 58-60 fps.
+38. **Goombas, trees and bushes of the course drew black.**
+    - NVN texture pools keep a copy of the descriptor, so a game may finalize an NVNtexture while it stays registered
+      and sampleable. Wonder does it for most course objects.
+    - The runtime kept only the pointer: those draws sampled the dummy (black) and ended the render pass (#34).
+    - Fix (nvn_objects.cpp): a finalized texture that a pool slot still names moves to a host key, and the slots point
+      at it. It is released when its slot is re-registered, 2 s after its last sample, or 250 ms after being kept if
+      never sampled. Without the expiry they piled up at ~450 per second (6 GB in two minutes).
+    - Stencil reference, compare and write masks, polygon offset (depth bias) and depth clamp are now recorded and
+      applied (nvn_raster.cpp). Depth bounds are recorded only, since MoltenVK has no depthBounds.
