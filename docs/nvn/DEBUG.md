@@ -662,3 +662,21 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
         with FreeType it gives the same ring letters.
       - The Miss layout has nothing that fills the letters: two capture panes, one of them a blurred black shadow.
       - Only the soft shadow may be weaker than on hardware (the blur chain, GLITCH-PLAN G10).
+57. **The replay's mark is the end of the lists' recording, not the start of the submit.**
+    - #55 took the mark when the submit started. But the recording thread runs ahead of the submit thread, by more
+      than a frame when our replay is slower than 60 fps (the course: 45 fps). By the time a submit starts, the next
+      frames' textures and pool slots are already there, and the mark included them.
+    - How often that phase was bad depended on the run, which is why the glitches were intermittent:
+      - a band of stretched geometry at the horizon;
+      - exploded meshes;
+      - a white or striped foreground layer.
+    - Now:
+      - `nvnCommandBufferEndRecording` stamps each list with the epoch;
+      - `gpu_submit` marks the replay with the newest stamp of its lists (`ReplayScope(lists_epoch)`);
+      - the mark never goes back;
+      - deferred objects carry the epoch at which they were retired, and `drain_objects` frees only those at or
+        before the last mark, with their records.
+    - `NX_MARK_AT_SUBMIT=1` restores #55's mark.
+    - Result: 4 course runs of 290 s, 28 course frames, no band, no exploded mesh, no white foreground (before:
+      about 1 run in 3). 44.6-46.7 fps.
+    - The 60 fps plan from the performance study is in docs/nvn/PERF-PLAN.md.

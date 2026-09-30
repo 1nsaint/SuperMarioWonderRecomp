@@ -73,10 +73,13 @@ inline thread_local uint64_t t_replay_mark = 0;  // the replaying thread's mark;
 bool texture_race_old();
 Object* find_object(uint64_t guest, uint64_t mark);  // under objects_lock (shared)
 void note_replaced(uint64_t guest);                  // under objects_lock (alone): guest's object is about to change
-void purge_incarnations();                           // under objects_lock (alone), from drain_objects
-// A submit's replay (gpu_submit, under the GPU lock): drains the deferred objects, then takes the mark.
+void purge_incarnations(uint64_t upto);              // under objects_lock (alone), from drain_objects: records <= upto
+uint64_t current_epoch();                            // the epoch of the last recorded change
+uint64_t replay_floor();                             // the last replay's mark: objects retired up to it can go
+// A submit's replay (gpu_submit, under the GPU lock): takes the mark, then drains the deferred objects no replay
+// needs any more. `lists_epoch`: the newest epoch at which the submit's command lists ended recording (0: unknown).
 struct ReplayScope {
-    ReplayScope();
+    explicit ReplayScope(uint64_t lists_epoch);
     ~ReplayScope();
 };
 
@@ -274,6 +277,7 @@ struct CmdList {
     std::vector<Cmd> cmds;
     std::vector<std::vector<uint8_t>> blobs;
     uint64_t handle = 0;     // its NVNcommandHandle
+    uint64_t epoch = 0;      // the texture epoch when its recording ended (nvn_incarnation.cpp): what its draws name
     uint32_t skinned = 0;    // NX_TRACE_SKINLISTS: binds of skinned programs (a vertex input at location 6) in it
 };
 // NX_TRACE_SKINLISTS (nvn_cmd.cpp): follows the lists that bind skinned programs, from recording to replay.

@@ -578,7 +578,9 @@ const DeferredValues* current_deferred() { return g_deferred.get(); }
 void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_ptr<const DeferredValues> deferred) {
     g_deferred = std::move(deferred);
     std::lock_guard lk(g_gpu);
-    ReplayScope replay;  // drain_objects (nothing replays now, under the GPU lock, #50), then the texture mark (#55)
+    uint64_t lists_epoch = 0;
+    for (auto& l : lists) lists_epoch = std::max(lists_epoch, l->epoch);
+    ReplayScope replay(lists_epoch);  // the texture mark (#55, #57), then drain_objects (under the GPU lock, #50)
     if (!init()) return;
     bool async = async_gpu();
     if (!async) {  // the previous submit was waited for: all of it is free
@@ -603,8 +605,7 @@ void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_
     else
         end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);
     draw_end_submit();  // asynchronous: snapshots only (the write-backs went with the submit)
-    gpu_profile_collect();
-    zero_draws_collect();
+    gpu_profile_collect(), zero_draws_collect();
     debug_dump_requested(draw_take_dump_request());
 }
 

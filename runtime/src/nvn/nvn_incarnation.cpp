@@ -12,7 +12,9 @@
 // Thread roles: game threads (HLE procs: Initialize/Finalize, getters, pool registration, recording) never set a mark
 // and see the current object; only gpu_submit sets one, for its own thread. Lock order is unchanged: the GPU lock,
 // then objects_lock; nothing here waits for the GPU lock.
+#include <algorithm>
 #include <cstdlib>
+#include <iterator>
 #include <map>
 #include <utility>
 #include <vector>
@@ -90,13 +92,45 @@ bool pool_entry_at(uint64_t pool, uint32_t id, uint64_t mark, PoolEntry& out) {
     return false;
 }
 
-void purge_incarnations() { g_retired.clear(), g_pool_changes.clear(); }
+void purge_incarnations(uint64_t upto) {
+    auto trim = [upto](auto& map) {
+        for (auto it = map.begin(); it != map.end();) {
+            auto& v = it->second;
+            v.erase(std::remove_if(v.begin(), v.end(), [upto](auto& r) { return r.first <= upto; }), v.end());
+            it = v.empty() ? map.erase(it) : std::next(it);
+        }
+    };
+    trim(g_retired), trim(g_pool_changes);
+}
 
-ReplayScope::ReplayScope() {
+namespace {
+std::atomic<uint64_t> g_floor{UINT64_MAX};  // the last replay's mark (everything, until a replay sets one)
+}
+uint64_t current_epoch() { return g_epoch.load(std::memory_order_acquire); }
+uint64_t replay_floor() { return g_floor.load(std::memory_order_acquire); }
+
+// The mark is the epoch at which the submit's command lists ended recording, not the submit's start: the game's
+// recording thread runs ahead of the submit thread (by more than a frame when our replay is slower than 60 fps), so by
+// the time a submit starts, the next frames' textures and pool slots are already there (DEBUG.md #57).
+// NX_MARK_AT_SUBMIT=1: the mark at the submit's start (#55's).
+ReplayScope::ReplayScope(uint64_t lists_epoch) {
+    if (texture_race_old()) {
+        g_floor = UINT64_MAX;
+        drain_objects();
+        return;
+    }
+    static const bool at_submit = std::getenv("NX_MARK_AT_SUBMIT") != nullptr;
+    uint64_t now;
+    {
+        std::shared_lock lk(objects_lock());  // orders the mark against the recorded changes (made under the lock alone)
+        now = g_epoch.load(std::memory_order_acquire);
+    }
+    uint64_t mark = lists_epoch && !at_submit ? std::min(lists_epoch, now) : now;
+    uint64_t floor = g_floor.load();
+    if (floor != UINT64_MAX && mark < floor) mark = floor;  // never back: older records are gone
+    g_floor = mark;
     drain_objects();
-    if (texture_race_old()) return;
-    std::shared_lock lk(objects_lock());  // orders the mark against the recorded changes (made under the lock alone)
-    t_replay_mark = g_epoch.load(std::memory_order_acquire);
+    t_replay_mark = mark;
 }
 
 ReplayScope::~ReplayScope() { t_replay_mark = 0; }
