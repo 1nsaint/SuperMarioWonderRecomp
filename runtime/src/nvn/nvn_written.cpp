@@ -33,6 +33,7 @@ using Regions = std::map<const uint8_t*, Region>;
 using It = Regions::iterator;
 Regions g_regions;
 bool g_read = false;  // a copy was bound for reading since the last write_after_read
+uint64_t g_binds = 0;  // written_bind calls, ever (nvn_frames.cpp: did a dispatch write storage after the split)
 uint64_t g_shared = 0, g_merged = 0, g_composed = 0, g_indirect = 0;  // for written_log
 
 // The regions overlapping [p, p + size), in address order.
@@ -111,7 +112,11 @@ bool written_separate() {
     return on;
 }
 
+uint64_t written_bind_count() { return g_binds; }
+void written_count_bind() { g_binds++; }
+
 Upload written_bind(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_t padded) {
+    g_binds++;
     std::vector<It> old = overlapping(p, size);
     if (It it = containing(p, size, padded, bind_align(), old); it != g_regions.end()) {
         write_after_read(cb);

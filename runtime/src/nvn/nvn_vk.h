@@ -83,19 +83,37 @@ void debug_dump_textures(uint64_t frame);  // nvn_debug.cpp: NX_DUMP_TEXTURES an
 void debug_dump_requested(uint64_t n);      // nvn_debug.cpp: NX_DUMP_ON_TARGET / NX_DUMP_ON_FS
 void debug_dump_add(uint64_t texture);  // nvn_debug.cpp: read back at the end of this submit
 
-// nvn_frames.cpp: asynchronous submission (NX_ASYNC_GPU). Slots of command buffer, fence, descriptor pool and ring
-// stretch; retired (fence waited, write-backs copied) on reuse, when the ring is full, or when the game waits.
-bool async_gpu();
+// nvn_frames.cpp: submits that are not waited for (NX_PIPELINED, NX_ASYNC_GPU). Slots of command buffers, fences,
+// descriptor pool and ring stretch; retired (fences waited, write-backs copied if not yet) on reuse, when the ring is
+// full, or when something waits for them.
+bool async_gpu();  // the slots are in use (either mode)
+bool pipelined();  // NX_PIPELINED: fences not waited for, write-backs copied before gpu_submit returns
 void frame_init(VkCommandPool pool, VkBuffer ring, uint8_t* ring_ptr, uint64_t ring_size);
-VkCommandBuffer frame_begin(bool replay);  // replay: submits with write-backs retired first
+VkCommandBuffer frame_begin(bool replay);  // NX_ASYNC_GPU, replay: submits with write-backs retired first
 VkSemaphore frame_acquire_semaphore();
 VkSemaphore frame_rendered_semaphore(uint32_t image);
 void frame_submit(VkSemaphore wait, VkSemaphore signal, std::vector<WriteBack> write_backs, bool wait_done);
 void frame_wait_all();
 uint64_t frame_upload_used();
-uint64_t frame_take_wait_ns();
+uint64_t frame_completed();  // the serial of the last retired submit (for free_retired_images)
 Upload frame_upload_alloc(uint64_t size, uint64_t align);
 VkDescriptorSet frame_descriptor_set(VkDescriptorSetLayout layout);
+// Pipelined: a submit with dispatches is split after the last one; its first part is queued at once and carries the
+// write-backs. frame_plan_split counts the submit's DispatchCompute commands and returns the last top-level list that
+// has one (SIZE_MAX: no split). frame_split ends the first part and returns the command buffer of the rest (once per
+// submit; outside the mode it returns `cb`). frame_after_dispatch is for replay_list, after each DispatchCompute: it
+// splits right after the last one. frame_cb: the command buffer to go on with (after a call that may have split).
+size_t frame_plan_split(const std::vector<std::shared_ptr<CmdList>>& lists);
+VkCommandBuffer frame_split(VkCommandBuffer cb);
+VkCommandBuffer frame_after_dispatch(VkCommandBuffer cb);
+VkCommandBuffer frame_cb(VkCommandBuffer cb);
+// Host time inside vkQueueSubmit (with vkEndCommandBuffer: Metal encoding) and inside vkWaitForFences, running
+// totals in every mode (the synchronous path adds its own).
+struct FrameTimes {
+    uint64_t encode_ns = 0, fence_ns = 0;
+};
+FrameTimes& frame_times();
+void frame_log(uint64_t frames);  // the mode's counters, with the timing log
 void free_retired_images(uint64_t completed);
 // A GPU-written image of a destroyed texture with the same memory and shape (nvn_frames.cpp), or null.
 std::shared_ptr<GpuImage> reuse_image(const Texture& t);  // images of textures destroyed before submit `completed` + 1
@@ -177,6 +195,9 @@ void gpu_profile_log(uint64_t frames);
 
 namespace replay {
 void dedup_reset();  // nvn_dedup.cpp
+bool written_separate();         // nvn_written.cpp (nvn_draw_state.h)
+uint64_t written_bind_count();   // nvn_written.cpp: written_bind calls so far (a dispatch bound storage it writes)
+void trace_nan_write_back(const uint8_t* from, const uint8_t* to, uint64_t size);  // nvn_draw_trace.cpp
 }
 
 }  // namespace nx::nvn

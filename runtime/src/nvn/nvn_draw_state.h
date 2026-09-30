@@ -91,6 +91,9 @@ Upload written_bind(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_
 bool written_read(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align, Upload& out);
 Upload read_upload(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align);  // or dedup
 bool written_overlaps(const uint8_t* p, uint64_t size);
+// A draw's storage binding over a written region (it may write the copy): counted as written_bind calls are, so a
+// pipelined split (nvn_frames.cpp) does not copy the region back before that draw ran.
+void written_count_bind();
 bool written_indirect(VkCommandBuffer cb, const uint8_t* p);  // vkCmdDispatchIndirect when a dispatch wrote {x, y, z}
 // A draw's vertex buffers (the streams `vs` reads) and index buffer; false: its indices are not in guest memory.
 struct DrawInputs {

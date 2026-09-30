@@ -317,6 +317,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
                     const uint8_t* p;
                     uint64_t size;
                     bool written = storage(s, b, st, p, size);
+                    if (!written && s->stage != ShaderStage::Compute && written_overlaps(p, size)) written_count_bind();
                     // At least 64 KB: Metal does not bound-check, and a shader writing past a small or missing
                     // buffer overwrote the next data in the upload buffer (garbage everywhere after a compute).
                     info = buffer_of(cb, p, size, 0x10000, written);

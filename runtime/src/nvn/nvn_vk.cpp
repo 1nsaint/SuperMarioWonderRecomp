@@ -1,10 +1,10 @@
 // NVN's GPU side on Vulkan (docs/NVN.md, N3): the host device, a VkImage per NVN texture the GPU touches, the
 // replay of recorded command lists, and presenting a window texture on the host swapchain.
 //
-// First version: every submit is recorded into one Vulkan command buffer and waited for (NX_ASYNC_GPU: into a
-// slot's, not waited for, nvn_frames.cpp); image layouts are tracked per image, in submission order; clears and render
-// targets only (draws come with shaders, N5/N6). On macOS this is MoltenVK: the instance enumerates portability
-// drivers and the device enables VK_KHR_portability_subset.
+// First version: every submit is recorded into one Vulkan command buffer and waited for (NX_PIPELINED, NX_ASYNC_GPU:
+// into a slot's, not waited for, nvn_frames.cpp); image layouts are tracked per image, in submission order. The image
+// behind a texture is nvn_image.cpp. On macOS this is MoltenVK: the instance enumerates portability drivers and the
+// device enables VK_KHR_portability_subset.
 #include <unistd.h>
 
 #include <cstdio>
@@ -299,156 +299,6 @@ uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
     return 0;
 }
 
-// The VkImage behind an NVN texture, made on first use. NVN texture targets (GL order): 0 1D, 1 2D, 2 3D, 3 1D array,
-// 4 2D array, 5 2D multisample, 6 2D multisample array, 7 rectangle, 8 cube map, 9 cube map array, 10 buffer.
-// Arrays and cube maps keep their layer count in the builder's depth.
-// Live textures over the same storage share one image: the game renders through one NVNtexture and samples the same
-// memory through another (UI capture and blur chains, agl filters). With an image per object the sampled one was a
-// stale upload of guest memory: no blur behind the menus, missing UI masks (docs/nvn/DEBUG.md #36).
-struct StorageKey {
-    uint64_t memory = 0;
-    uint32_t format = 0, width = 0, height = 0, depth = 0, levels = 0, target = 0, samples = 0, swizzle = 0;
-    bool operator<(const StorageKey& o) const {
-        return std::tie(memory, format, width, height, depth, levels, target, samples, swizzle) <
-               std::tie(o.memory, o.format, o.width, o.height, o.depth, o.levels, o.target, o.samples, o.swizzle);
-    }
-};
-std::map<StorageKey, std::weak_ptr<GpuImage>> g_live_images;
-
-GpuImage* image_of(uint64_t guest) {
-    Texture* t = get<Texture>(guest);
-    if (!t) return nullptr;
-    if (t->image) return t->image.get();
-    uint32_t swizzle = uint32_t(t->swizzle[0]) | uint32_t(t->swizzle[1]) << 8 | uint32_t(t->swizzle[2]) << 16 |
-                  uint32_t(t->swizzle[3]) << 24;
-    // Swizzles apply when sampling (sampled_view, #44): neither the key's nor a pool view's keeps textures from sharing.
-    // With them, the shadow map and the UI's text strips were sampled as stale uploads (#46). Env: bisecting.
-    static const bool key_swizzle = std::getenv("NX_KEY_SWIZZLE") != nullptr;
-    if (!key_swizzle) swizzle = 0;
-    StorageKey key{t->memory, t->format, t->width, t->height, t->depth, t->levels, t->target, t->samples, swizzle};
-    static const bool share = std::getenv("NX_NO_IMAGE_SHARE") == nullptr;  // bisecting
-    // An R8 image widened for alpha-from-red keeps its own.
-    static const bool old_rule = std::getenv("NX_SHARE_NO_POOL_SWIZZLE") != nullptr;  // bisecting
-    bool widened = t->format == 0x1 && t->pool_swizzle == 0x02010101u;
-    if (share && t->memory && (old_rule ? t->pool_swizzle == 0 : !widened))
-        if (auto it = g_live_images.find(key); it != g_live_images.end())
-            if (auto shared = it->second.lock(); shared && shared->image && !shared->alpha_from_r) {
-                static uint64_t shares = 0;
-                if (++shares % 1000 == 1) log("nvn/vk: %llu textures shared an image with another", (unsigned long long)shares);
-                t->image = shared;
-                return shared.get();
-            }
-    if ((t->image = reuse_image(*t))) return t->image.get();
-    auto img = std::make_shared<GpuImage>();
-    img->format = vk_format(t->format);
-    img->nvn_format = t->format;
-    if (t->format == 0x1 && t->pool_swizzle == 0x02010101u) {
-        img->format = VK_FORMAT_R8G8B8A8_UNORM;
-        img->alpha_from_r = true;
-    }
-    uint32_t aspect = format_aspect(t->format);
-    img->aspect = aspect == 0 ? VK_IMAGE_ASPECT_COLOR_BIT
-                  : aspect == 1 ? VK_IMAGE_ASPECT_DEPTH_BIT
-                  : aspect == 2 ? VK_IMAGE_ASPECT_STENCIL_BIT
-                                : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-    bool one_d = vk_1d_images() && (t->target == 0 || t->target == 3);  // else 2D images of height 1 (G8)
-    img->width = std::max(1u, t->width);
-    img->height = (t->target == 0 || t->target == 3) && !one_d ? 1u : std::max(1u, t->height);
-    img->levels = std::max(1u, t->levels);
-    uint32_t depth = std::max(1u, t->target == 3 && !one_d && t->depth <= 1 ? t->height : t->depth);  // GL-style layers
-    bool is3d = t->target == 2, cube = t->target == 8 || t->target == 9;
-    bool array = t->target == 3 || t->target == 4 || t->target == 6 || t->target == 9;
-    img->layers = is3d ? 1 : (array || cube) ? depth : 1;
-    img->depth = is3d ? depth : 1;
-    if (cube && img->layers < 6) img->layers = 6;
-    // NVN takes more levels than the size allows (a 1x1 texture with 5), Metal aborts on it (DEBUG.md #27).
-    uint32_t largest = std::max({img->width, img->height, img->depth}), fit = 1;
-    while (largest >>= 1) fit++;
-    img->levels = std::min(img->levels, fit);
-    img->view_type = is3d             ? VK_IMAGE_VIEW_TYPE_3D
-                     : t->target == 9 ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
-                     : cube           ? VK_IMAGE_VIEW_TYPE_CUBE
-                     : one_d          ? (t->target == 0 ? VK_IMAGE_VIEW_TYPE_1D : VK_IMAGE_VIEW_TYPE_1D_ARRAY)
-                     : array          ? VK_IMAGE_VIEW_TYPE_2D_ARRAY  // 1D array (G8), 2D array, 2D MS array
-                                      : VK_IMAGE_VIEW_TYPE_2D;
-    if (img->format == VK_FORMAT_UNDEFINED) {
-        log("nvn/vk: texture %llx has format %#x with no Vulkan equivalent", (unsigned long long)guest, t->format);
-        img->format = VK_FORMAT_R8G8B8A8_UNORM;
-        img->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-        aspect = 0;
-    }
-    bool compressed = false;
-    {
-        uint32_t bw = 1, bh = 1, bytes = 4;
-        format_block(t->format, bw, bh, bytes);
-        compressed = bw > 1 || bh > 1;
-    }
-    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    // 3D textures are rendered one slice at a time (a colour-grading LUT): 2D views of a slice need this flag
-    // (Metal otherwise refuses a 2D view of a 3D texture).
-    ci.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : is3d ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0;
-    // Colour images may be viewed in another format of the same size (an sRGB view of RGBA8, docs/nvn/DEBUG.md #29).
-    if (aspect == 0 && !img->alpha_from_r) ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-    ci.imageType = is3d ? VK_IMAGE_TYPE_3D : one_d ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
-    ci.format = img->format;
-    ci.extent = {img->width, ci.imageType == VK_IMAGE_TYPE_1D ? 1 : img->height, is3d ? depth : 1};
-    ci.mipLevels = img->levels;
-    ci.arrayLayers = img->layers;
-    ci.samples = VK_SAMPLE_COUNT_1_BIT;
-    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (!compressed) ci.usage |= aspect ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    {
-        VkFormatProperties fp{};
-        p_vkGetPhysicalDeviceFormatProperties(g_physical, ci.format, &fp);
-        img->storage = !compressed && !aspect && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
-        if (img->storage) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-    }
-    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (!check(p_vkCreateImage(g_device, &ci, nullptr, &img->image), "vkCreateImage")) return nullptr;
-    VkMemoryRequirements req{};
-    p_vkGetImageMemoryRequirements(g_device, img->image, &req);
-    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = req.size;
-    ai.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (!check(p_vkAllocateMemory(g_device, &ai, nullptr, &img->memory), "vkAllocateMemory")) return nullptr;
-    p_vkBindImageMemory(g_device, img->image, img->memory, 0);
-    constexpr VkComponentSwizzle kSwizzle[] = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_R,
-                                               VK_COMPONENT_SWIZZLE_G,    VK_COMPONENT_SWIZZLE_B,   VK_COMPONENT_SWIZZLE_A};
-    img->swizzle = {kSwizzle[t->swizzle[0]], kSwizzle[t->swizzle[1]], kSwizzle[t->swizzle[2]], kSwizzle[t->swizzle[3]]};
-    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vi.image = img->image;
-    vi.viewType = img->view_type;
-    vi.format = img->format;
-    // A sampled depth/stencil view reads depth.
-    vi.subresourceRange = {aspect == 3 ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT) : img->aspect, 0, img->levels, 0,
-                           img->layers};
-    check(p_vkCreateImageView(g_device, &vi, nullptr, &img->view), "vkCreateImageView");
-    static uint64_t created = 0;
-    if (g_trace || ++created % 1000 == 0)  // a sample of what keeps being created
-        log("nvn/vk: image %llu for texture %llx (memory %llx): %ux%u x%u layers, %u levels, target %u format %#x -> %d",
-            (unsigned long long)created, (unsigned long long)guest, (unsigned long long)t->memory,
-            img->width, img->height, img->layers, img->levels, t->target, t->format, int(img->format));
-    t->image = img;
-    if (t->memory) g_live_images[key] = img;
-    return img.get();
-}
-
-void transition(VkCommandBuffer cb, GpuImage& img, VkImageLayout to) {
-    if (img.layout == to) return;
-    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    b.oldLayout = img.layout;
-    b.newLayout = to;
-    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = img.image;
-    b.subresourceRange = {img.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
-    p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
-                           nullptr, 1, &b);
-    img.layout = to;
-}
-
 Upload upload_alloc(uint64_t size, uint64_t align) {
     if (async_gpu()) return frame_upload_alloc(size, align);
     uint64_t at = (g_upload_used + align - 1) & ~(align - 1);
@@ -520,10 +370,11 @@ bool begin(bool replay = false) {
     return check(p_vkBeginCommandBuffer(g_cb, &bi), "vkBeginCommandBuffer");
 }
 
-// Where GPU time goes, logged with the draw stats: submits, host time replaying them, time waiting for the GPU,
-// bytes through the upload buffer.
+// Where the submitting thread's time goes, logged with the draw stats, per presented frame: the replay (recording
+// into Vulkan), vkQueueSubmit (Metal encoding happens inside it), fences waited for, the rest of gpu_submit (object
+// drain, image frees, write-backs), and gpu_present as a whole; bytes through the upload buffer.
 struct Timing {
-    uint64_t submits = 0, replay_ns = 0, wait_ns = 0, present_wait_ns = 0, upload_bytes = 0;
+    uint64_t submits = 0, replay_ns = 0, encode_ns = 0, fence_ns = 0, submit_ns = 0, present_ns = 0, upload_bytes = 0;
 } g_timing;
 
 void end_and_wait(VkSemaphore wait, VkSemaphore signal) {
@@ -543,28 +394,39 @@ void end_and_wait(VkSemaphore wait, VkSemaphore signal) {
         si.pSignalSemaphores = &signal;
     }
     p_vkResetFences(g_device, 1, &g_fence);
+    bool queued = check(p_vkQueueSubmit(g_queue, 1, &si, g_fence), "vkQueueSubmit");
+    uint64_t t1 = plat::monotonic_ns();
     // 2 s at most: a frame's work takes milliseconds; longer is a shader that does not end.
-    if (check(p_vkQueueSubmit(g_queue, 1, &si, g_fence), "vkQueueSubmit")) {
+    if (queued) {
         VkResult w = p_vkWaitForFences(g_device, 1, &g_fence, VK_TRUE, 2'000'000'000ull);
         if (w == VK_TIMEOUT) gpu_hung("a submit did not finish in 2 s");
         check(w, "vkWaitForFences");
     }
-    (signal ? g_timing.present_wait_ns : g_timing.wait_ns) += plat::monotonic_ns() - t0;
+    frame_times().encode_ns += t1 - t0, frame_times().fence_ns += plat::monotonic_ns() - t1;
 }
 
 void log_timing(uint64_t frames) {
     auto ms = [&](uint64_t ns) { return double(ns) / 1e6 / double(frames); };
-    if (async_gpu()) g_timing.wait_ns += frame_take_wait_ns();  // fences waited for (slot reuse, ring, syncs)
     static uint64_t last = 0;  // wall clock: the real frame rate
     uint64_t now = plat::monotonic_ns();
     double fps = last ? double(frames) * 1e9 / double(now - last) : 0.0;
     last = now;
-    log("nvn/vk: per frame over %llu: %.1f fps, %.1f submits, replay %.2f ms, GPU wait %.2f ms, present wait %.2f ms, "
-        "upload %.2f MB",
-        (unsigned long long)frames, fps, double(g_timing.submits) / double(frames), ms(g_timing.replay_ns),
-        ms(g_timing.wait_ns), ms(g_timing.present_wait_ns), double(g_timing.upload_bytes) / 1e6 / double(frames));
+    const Timing& t = g_timing;
+    uint64_t known = t.replay_ns + t.encode_ns + t.fence_ns;
+    log("nvn/vk: per frame over %llu: %.1f fps, %.1f submits, replay %.2f ms, submit (encode) %.2f ms, fence wait "
+        "%.2f ms, other %.2f ms, present %.2f ms, upload %.2f MB",
+        (unsigned long long)frames, fps, double(t.submits) / double(frames), ms(t.replay_ns), ms(t.encode_ns),
+        ms(t.fence_ns), ms(t.submit_ns > known ? t.submit_ns - known : 0), ms(t.present_ns),
+        double(t.upload_bytes) / 1e6 / double(frames));
+    frame_log(frames);
     g_timing = {};
 }
+
+// gpu_present's time, whatever way it returns.
+struct PresentTimer {
+    uint64_t t0 = plat::monotonic_ns();
+    ~PresentTimer() { g_timing.present_ns += plat::monotonic_ns() - t0; }
+};
 
 }  // namespace
 
@@ -578,6 +440,8 @@ const DeferredValues* current_deferred() { return g_deferred.get(); }
 void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_ptr<const DeferredValues> deferred) {
     g_deferred = std::move(deferred);
     std::lock_guard lk(g_gpu);
+    uint64_t t_in = plat::monotonic_ns();
+    const FrameTimes f_in = frame_times();
     uint64_t lists_epoch = 0;
     for (auto& l : lists) lists_epoch = std::max(lists_epoch, l->epoch);
     ReplayScope replay(lists_epoch);  // the texture mark (#55, #57), then drain_objects (under the GPU lock, #50)
@@ -587,16 +451,28 @@ void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_
         free_retired_images(UINT64_MAX);
         p_vkResetDescriptorPool(g_device, g_descriptors, 0);
         g_upload_used = 0;
+    } else if (pipelined()) {  // what the retired submits were the last to use (they free nothing themselves)
+        free_retired_images(frame_completed());
     }
     if (!begin(true)) return;
     draw_begin_submit();
     gpu_profile_begin(g_cb);
     zero_draws_begin_submit(g_cb);
+    // Pipelined: the part up to the last dispatch is queued as soon as it is recorded (nvn_frames.cpp). Not with the
+    // profile or the zero-draw queries: they span the submit, which is then waited for whole.
+    size_t split_after = gpu_profile_on() || zero_draws_on() ? SIZE_MAX : frame_plan_split(lists);
     uint64_t t0 = plat::monotonic_ns();
+    const FrameTimes f0 = frame_times();
     Targets st;
-    for (auto& l : lists) replay_list(g_cb, st, *l, 0);
+    for (size_t k = 0; k < lists.size(); k++) {
+        replay_list(g_cb, st, *lists[k], 0);
+        // After the last list with a dispatch, unless nothing follows it (replay_list may have split inside a list).
+        g_cb = k == split_after && k + 1 < lists.size() ? frame_split(g_cb) : frame_cb(g_cb);
+    }
     draw_end_rendering(g_cb);
-    g_timing.submits++, g_timing.replay_ns += plat::monotonic_ns() - t0;
+    const FrameTimes f1 = frame_times();  // the first part's submit and ring waits are not replay time
+    g_timing.submits++;
+    g_timing.replay_ns += plat::monotonic_ns() - t0 - (f1.encode_ns - f0.encode_ns) - (f1.fence_ns - f0.fence_ns);
     g_timing.upload_bytes += async ? frame_upload_used() : g_upload_used;
     gpu_profile_mark(g_cb, "end");
     if (async)  // the profile, zero-draw queries and snapshots read this submit's results right below: waited for
@@ -604,38 +480,42 @@ void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_
                      gpu_profile_on() || zero_draws_on() || debug_snapshots_pending());
     else
         end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);
-    draw_end_submit();  // asynchronous: snapshots only (the write-backs went with the submit)
+    draw_end_submit();  // not waited for: snapshots only (the write-backs went with the submit)
     gpu_profile_collect(), zero_draws_collect();
-    debug_dump_requested(draw_take_dump_request());
+    debug_dump_requested(draw_take_dump_request());  // reads back in a submit of its own, which it waits for
+    const FrameTimes f2 = frame_times();
+    g_timing.encode_ns += f2.encode_ns - f_in.encode_ns, g_timing.fence_ns += f2.fence_ns - f_in.fence_ns;
+    g_timing.submit_ns += plat::monotonic_ns() - t_in;
 }
 
-// Headless: the presented texture is only counted, logged and dumped (no swapchain).
+// Headless: the presented texture is only counted, logged and dumped (no swapchain). Nothing is submitted unless a
+// frame dump is due: the empty submit was a Metal command buffer and a fence wait per frame.
 void present_headless(uint64_t texture) {
-    if (!begin()) return;
-    GpuImage* src = image_of(texture);
+    GpuImage* src = image_of(texture);  // made here if new, as before (the targets rendered into it share it, #44)
     static uint64_t presents = 0;
     presents++;
     if (presents % (presents < 300 ? 60 : 300) == 0) draw_log_stats();
     if (presents % 60 == 0) log_timing(60), gpu_profile_log(60);
     if (presents % 300 == 0) zero_draws_log();
-    bool dump = false;
-    if (src && src->layout != VK_IMAGE_LAYOUT_UNDEFINED && frame_dump_every() && presents % frame_dump_every() == 0) {
+    if (!frame_dump_every() || presents % frame_dump_every() != 0) return;
+    if (src && src->layout != VK_IMAGE_LAYOUT_UNDEFINED && begin()) {
         transition(g_cb, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        dump = frame_dump_record(g_cb, *src);
+        bool dump = frame_dump_record(g_cb, *src);
+        if (async_gpu())
+            frame_submit(VK_NULL_HANDLE, VK_NULL_HANDLE, {}, dump);  // a dumped frame is waited for
+        else
+            end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);
+        if (dump) frame_dump_write(*src, presents);
     }
-    if (async_gpu())
-        frame_submit(VK_NULL_HANDLE, VK_NULL_HANDLE, {}, dump);  // a dumped frame is waited for
-    else
-        end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);
-    if (dump) frame_dump_write(*src, presents);
-    if (frame_dump_every() && presents % frame_dump_every() == 0) debug_dump_textures(presents);
+    debug_dump_textures(presents);
 }
 
 void gpu_present(uint64_t texture, const int32_t* crop) {
     std::lock_guard lk(g_gpu);
+    PresentTimer timer;
     drain_objects();  // under the GPU lock, as in gpu_submit
     if (!init()) return;
-    if (!async_gpu()) free_retired_images(UINT64_MAX);
+    if (!async_gpu() || pipelined()) free_retired_images(async_gpu() ? frame_completed() : UINT64_MAX);
     if (plat::headless()) return present_headless(texture);
     if (plat::window_minimized()) return;
     if (!g_swapchain && !make_swapchain()) return;
@@ -681,8 +561,8 @@ void gpu_present(uint64_t texture, const int32_t* crop) {
     if (presents % 300 == 0) zero_draws_log();
     bool dump = src && frame_dump_every() && presents % frame_dump_every() == 0 && frame_dump_record(g_cb, *src);
     VkSemaphore rendered = async_gpu() ? frame_rendered_semaphore(index) : g_rendered;
-    if (async_gpu())
-        frame_submit(acquired, rendered, {}, dump);  // a dumped frame is waited for
+    if (async_gpu())  // the blit's fence is not waited for (vkQueuePresentKHR waits on `rendered`); a dumped frame is
+        frame_submit(acquired, rendered, {}, dump);
     else
         end_and_wait(acquired, rendered);
     if (dump) frame_dump_write(*src, presents);

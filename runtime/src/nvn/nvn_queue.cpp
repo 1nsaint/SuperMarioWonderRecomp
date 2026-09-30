@@ -1,6 +1,8 @@
 // NVN queues, command buffers, windows and syncs (docs/NVN.md, N3). Synchronously every command completes at
 // submit: fences are signaled right away, the window hands out its textures in turn, and presents are counted. With
-// NX_ASYNC_GPU a fence is the submit it follows, and waiting for it waits for that submit (nvn_frames.cpp). Return
+// NX_ASYNC_GPU a fence is the submit it follows, and waiting for it waits for that submit (nvn_frames.cpp). With
+// NX_PIPELINED the GPU work is in flight when a submit returns but its compute results are in guest memory, so
+// syncs and nvnQueueFinish have nothing to wait for, as synchronously (gpu_serial() is 0). Return
 // values follow the SDK driver (nvnSyncWait sdk+45a960: 0 once the fence has passed; nvnWindowAcquireTexture
 // sdk+45e050: 0 on success).
 #include <algorithm>
@@ -69,7 +71,7 @@ namespace {
 
 struct Sync : Object {
     std::atomic<bool> signaled{false};
-    std::atomic<uint64_t> serial{0};  // NX_ASYNC_GPU: the submit it waits for (0: none)
+    std::atomic<uint64_t> serial{0};  // NX_ASYNC_GPU: the submit it waits for (0: none; always 0 otherwise)
     std::atomic<uint64_t> job{0};     // the replay-thread job that fences it (0: none)
     std::atomic<uint64_t> seq{0};     // the submits it follows (wait_submits); 0: none
 };

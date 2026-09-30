@@ -82,6 +82,7 @@ set(NX_RUNTIME_SOURCES
     runtime/src/nvn/nvn_shaders.cpp
     runtime/src/nvn/nvn_tiling.cpp
     runtime/src/nvn/nvn_vk.cpp
+    runtime/src/nvn/nvn_image.cpp
     runtime/src/nvn/nvn_frames.cpp
     runtime/src/nvn/nvn_dedup.cpp
     runtime/src/nvn/nvn_written.cpp

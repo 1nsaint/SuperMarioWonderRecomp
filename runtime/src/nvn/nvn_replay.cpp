@@ -38,9 +38,10 @@ void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth
             case Cmd::ClearDepthStencil: draw_clear(cb, st, c); break;
             case Cmd::CallList:
                 if (depth < 8) {
-                    if (auto l = command_list(c.a[0]))
+                    if (auto l = command_list(c.a[0])) {
                         replay_list(cb, st, *l, depth + 1);
-                    else {
+                        cb = frame_cb(cb);  // NX_PIPELINED: the called list may have split the submit
+                    } else {
                         static int missing = 0;
                         if (++missing <= 5) log("nvn: called handle %llx is unknown", (unsigned long long)c.a[0]);
                     }
@@ -52,7 +53,11 @@ void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth
                 replay_copy(cb, c, list);
                 if (gpu_profile_on()) gpu_profile_mark(cb, "outside passes (clears, uploads, copies)");
                 break;
-            default: draw_command(cb, c, list, st); break;
+            default:
+                draw_command(cb, c, list, st);
+                // NX_PIPELINED: after the submit's last dispatch the rest goes into a second command buffer.
+                if (c.op == Cmd::DispatchCompute) cb = frame_after_dispatch(cb);
+                break;
         }
     }
 }
