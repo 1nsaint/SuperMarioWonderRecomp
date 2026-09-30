@@ -381,3 +381,25 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
       - `NX_TRACE_CUBES=1` shows each probe rendered face by face and level by level at load, with valid face views,
         so the probe content itself must be dark: the captures render a scene that is still being lit.
       - Next: dump a probe's faces after load (`NX_DUMP_TEXTURES`).
+43. **Why the course runs at ~30 fps: the game's own frame-rate governor.**
+    - **Where it decides.** Wonder's `sead::GameFramework::procFrame_` override (main+e15ec) calls
+      nvnWindowSetPresentInterval every frame (its NVN proc slot is 0x35ad060, not 0x35ad078, which is
+      SetNumActiveTextures).
+    - **What it measures.** `fw[0x118]` is the main thread's time from the end of the previous present wait to the end
+      of this frame's calc and draw recording, in GetSystemTick ticks. GPU timestamps, vsync and performance mode are
+      not used: faking the GPU timings (`NX_FAKE_GPU_TIME=1`) changed nothing.
+    - **The rule.**
+      - It asks for interval 2 when that time reaches 15.83 ms: `int(t*60 + 0.05) + 1`, clamped to 1..2.
+      - Three slow frames in a row lock interval 2, and 15 fast ones release it.
+    - **Measured.** `nvn: main-thread frame time` log lines (every 600 frames, read from that call site): in the menus
+      ~95% of frames are under 12 ms, in the course 30-40% are over 15.8 ms.
+    - **Where the main thread's time goes** (a `sample` of the process in the course):
+      - It spends ~60% of its time yielding in the job system's join loop (main+105930 → svc YieldThread) and ~25% in
+        waits; its own code is a few percent. Workers wait the same way.
+      - The job it joins depends on the render thread (g52), which replays our Vulkan work and waits for the GPU
+        (replay ~9-10 ms, GPU ~7-13 ms per frame). So the replay is on the game's critical path.
+      - The way out is the replay thread (#40), once its pass-break regression is fixed, plus a cheaper replay.
+    - `NX_MAX_INTERVAL=1` clamps the game's maximum interval (writes its fields). It is not an improvement: the course
+      then runs at 20-30 fps with longer frames.
+    - Kept as diagnostics: `NX_FAKE_GPU_TIME`, `NX_MAX_INTERVAL`, `NX_TRACE_CUBES` (writes into cube images), and the
+      present-interval logs.

@@ -137,7 +137,35 @@ void WindowGetPresentInterval(CPU& c) {
     c.x[0] = w ? uint64_t(w->interval) : 1;
 }
 
+// Wonder's sead::GameFramework::procFrame_ override (main+e15ec) picks the interval every frame from the main
+// thread's last frame time, fw[0x118] (GetSystemTick ticks from the end of the previous present wait to the end of
+// this frame's calc and draw recording): 2 when it reaches 15.83 ms, locked after 3 slow frames, back to 1 after 15
+// fast ones (docs/nvn/DEBUG.md #43). From that call site (lr main+e16ac, x19 = the framework): a histogram of that
+// time every 600 frames, and NX_MAX_INTERVAL=1 clamps the game's own maximum to 1 (fields 0x24c/0x264/0x268).
+void frame_time_probe(CPU& c) {
+    const LoadedModule* m = module_at(c.x[30]);
+    if (!m || c.x[30] - m->base != 0xe16ac || !c.x[19]) return;
+    static const char* max_env = std::getenv("NX_MAX_INTERVAL");
+    if (max_env && std::atoi(max_env) >= 1) {
+        uint32_t max = uint32_t(std::atoi(max_env));
+        st<uint32_t>(c.x[19] + 0x24c, max);
+        if (ld<uint32_t>(c.x[19] + 0x268) > max) st<uint32_t>(c.x[19] + 0x268, max);
+        if (ld<uint32_t>(c.x[19] + 0x264) > max) st<uint32_t>(c.x[19] + 0x264, max);
+        if (int(c.x[1]) > int(max)) c.x[1] = max;
+    }
+    static uint64_t bins[5] = {}, frames = 0;
+    double ms = double(ld<uint64_t>(c.x[19] + 0x118)) / 19200.0;
+    bins[ms < 12 ? 0 : ms < 15.83 ? 1 : ms < 20 ? 2 : ms < 33 ? 3 : 4]++;
+    if (++frames % 600 == 0) {
+        log("nvn: main-thread frame time over 600 frames: <12 ms %llu, <15.8 %llu, <20 %llu, <33 %llu, more %llu",
+            (unsigned long long)bins[0], (unsigned long long)bins[1], (unsigned long long)bins[2],
+            (unsigned long long)bins[3], (unsigned long long)bins[4]);
+        for (auto& b : bins) b = 0;
+    }
+}
+
 void WindowSetPresentInterval(CPU& c) {
+    frame_time_probe(c);
     if (auto* w = get<Window>(c.x[0])) {
         static int logged = 0;
         if (w->interval != int(c.x[1]) && logged++ < 50)

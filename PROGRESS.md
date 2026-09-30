@@ -50,8 +50,10 @@ NVN implemented over Vulkan (MoltenVK).
 - **Open.**
   - The course's actors render dark (#39, #42). Mario is fixed by reusing the images of destroyed render targets.
     Goombas and trees still sample dark light-probe cubemaps.
-  - The course is at ~30 fps: the game switches its present interval between 1 and 2, and the frame is ~23 ms of
-    replay plus GPU.
+  - The course is at 30-40 fps. The game's governor asks for 30 fps when its main thread's frame passes 15.8 ms
+    (#43). That thread waits in the job system for the render thread, which replays our Vulkan work and waits for
+    the GPU. Next: fix the replay thread (#40) so the replay leaves the game's critical path, and make the replay
+    cheaper.
   - Tried and kept off by default, documented: the replay thread (#40), Deferred binds (#41), kept pool textures (#38).
 
 ### 2026-09-29 (night): real colours, two crashes fixed
