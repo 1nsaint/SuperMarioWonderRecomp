@@ -67,6 +67,12 @@ struct PadState {
     int32_t lx = 0, ly = 0, rx = 0, ry = 0;
 };
 void read_pad(PadState& p);  // player 1
+// Touch controls to draw over the picture (touch_layout.cpp, platform_android_input.cpp): circles at x, y (0..1
+// across the landscape screen), radius r (a fraction of its height), opacity alpha. 0 where nothing is drawn.
+struct OverlayShape {
+    float x, y, r, alpha;
+};
+size_t touch_overlay(OverlayShape* out, size_t max);
 // NX_HEADLESS=1: no visible window (it is created hidden) and nothing presented; frames still render and
 // NX_DUMP_FRAMES still writes them. For unattended test runs.
 bool headless();
