@@ -326,7 +326,7 @@ A1, 2026-09-30, Galaxy S23 (DEBUG-2.md #68):
   data went to Internal storage with all-files access by `appops`.
 - **Exit met:** the game runs on the phone at 40-60 fps at the title, with no failed draw and no crash, and memory
   under the guard (5 GB set in `config.txt`).
-- Tools: `private/wonder/push_emu.sh` (install and push, any serial) and `private/wonder/run_emu.sh` (run, log,
+- Tools: `tools/wonder_push_android.sh` (install and push, any serial) and `tools/wonder_run_android.sh` (run, log,
   pull the frame dumps).
 
 A2, in progress (DEBUG-2.md #69, #70, #72):
@@ -341,8 +341,8 @@ A4, started (DEBUG-2.md #71):
 - Short taps work in the menus.
 
 **To test when the phone is back:**
-1. `bash private/wonder/push_emu.sh <serial> --no-data` installs the new APK and keeps the data.
-2. `bash private/wonder/run_emu.sh <serial> 90 s23b`.
+1. `bash tools/wonder_push_android.sh <serial> --no-data` installs the new APK and keeps the data.
+2. `bash tools/wonder_run_android.sh <serial> 90 s23b`.
 3. Look at the screen: the title, upright, with bars and the touch controls drawn.
 
 Total: about 12-16 weeks. A0-A2 can start while the Mac track finishes W7. They share no files with the glitch work

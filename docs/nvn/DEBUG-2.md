@@ -159,7 +159,7 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
     - The second failure was the data folder. Files pushed by `adb` into `Android/data/<pkg>` belong to the shell
       user, and the app cannot read them. The data now goes to `Internal storage/Super Mario Bros. Wonder`, with
       all-files access granted by `appops set --uid <pkg> MANAGE_EXTERNAL_STORAGE allow`
-      (`private/wonder/push_emu.sh`).
+      (`tools/wonder_push_android.sh`).
     - Result: the game runs on the S23. Adreno 740, Vulkan 1.3, MAILBOX, 2340x1080 swapchain, 40-60 fps at the
       title, tens of thousands of draws with none failed, and still running after a minute. The screen stays black
       (#69).
