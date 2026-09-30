@@ -157,6 +157,9 @@ void pace_present(int interval) {
     if (off || interval <= 0) return;
     uint64_t now = plat::monotonic_ns();
     if (next > now) plat::sleep_ns(next - now), now = plat::monotonic_ns();
+    static uint64_t presents = 0, at2 = 0;  // how often the game asks for 30 fps (interval 2), per 600 presents
+    at2 += interval >= 2;
+    if (++presents % 600 == 0) log("nvn: %llu of the last 600 presents at interval >= 2", (unsigned long long)at2), at2 = 0;
     uint64_t period = uint64_t(interval) * 16'666'667ull;
     next = (next > now || now - next < period ? next : now) + period;
 }

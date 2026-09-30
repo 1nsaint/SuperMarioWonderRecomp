@@ -240,6 +240,7 @@ bool trace_textures() {
 }
 
 uint64_t keep_for_slots(uint64_t guest);  // below, with the pool registrations
+void hand_image_to_snapshots(uint64_t guest);  // below
 
 void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBuilder*)
     uint64_t guest = c.x[0], builder = c.x[1];
@@ -250,6 +251,7 @@ void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBu
     {
         std::lock_guard lk(objects_lock());
         keep_for_slots(guest);
+        hand_image_to_snapshots(guest);
     }
     auto& t = make<Texture>(guest);
     t.target = uint32_t(driver(c, "nvnTextureBuilderGetTarget", {builder}));
@@ -376,12 +378,79 @@ void TextureFinalize(CPU& c) {
     if (trace_textures()) log("nvn: texture %llx finalized", (unsigned long long)guest);
     {
         std::lock_guard lk(objects_lock());
+        hand_image_to_snapshots(guest);
         uint64_t kept = keep_for_slots(guest);
         for (auto& [pool, set] : pool_textures()) set.erase(guest);
         expire_kept();
         if (kept) return;
     }
     destroy(guest);
+}
+
+// ---- pool snapshots ---------------------------------------------------------------------------------------------
+// An NVN texture pool holds a copy of each registered texture's descriptor: a game may finalize the NVNtexture, or
+// re-initialize it as something else, and still sample the slot. Wonder does both with its light-probe cubemaps at a
+// course load (the struct becomes a 2D texture, a cube binding then fell back to the black dummy: dark Goombas and
+// trees, docs/nvn/DEBUG.md #42). Each registration keeps a copy of the texture as registered under a host key; when
+// the texture object dies or is re-initialized, the copies inherit its GPU image. texture_for (nvn_draw.cpp) uses the
+// copy when the slot's texture is gone or no longer has the registered target and format.
+constexpr uint64_t kSnapshot = 0xE000000000000000ull;
+uint64_t g_next_snapshot = 0;
+std::unordered_map<uint64_t, std::vector<uint64_t>> g_snapshots_of;  // guest texture -> its snapshots
+std::deque<std::pair<uint64_t, uint64_t>> g_snapshot_images;         // (snapshot, since ns) that own an image
+
+uint64_t make_snapshot(uint64_t guest) {  // under objects_lock
+    auto o = objects().find(guest);
+    auto* t = o == objects().end() ? nullptr : dynamic_cast<Texture*>(o->second.get());
+    if (!t) return 0;
+    auto copy = std::make_unique<Texture>();
+    copy->target = t->target, copy->format = t->format, copy->flags = t->flags, copy->levels = t->levels;
+    copy->samples = t->samples, copy->depth_stencil_mode = t->depth_stencil_mode;
+    copy->width = t->width, copy->height = t->height, copy->depth = t->depth, copy->stride = t->stride;
+    copy->pool = t->pool, copy->offset = t->offset, copy->storage_size = t->storage_size;
+    copy->memory = t->memory, copy->gpu = t->gpu, copy->block_height_gobs = t->block_height_gobs;
+    std::memcpy(copy->swizzle, t->swizzle, sizeof copy->swizzle);
+    copy->pool_swizzle = t->pool_swizzle.load();
+    uint64_t key = kSnapshot | ++g_next_snapshot;
+    objects()[key] = std::move(copy);
+    auto& keys = g_snapshots_of[guest];
+    if (keys.size() >= 16)  // re-registered every frame: forget the copies already dropped
+        keys.erase(std::remove_if(keys.begin(), keys.end(), [](uint64_t k) { return !objects().count(k); }), keys.end());
+    keys.push_back(key);
+    return key;
+}
+
+void drop_snapshot(uint64_t key) {  // under objects_lock
+    auto o = objects().find(key);
+    if (o == objects().end()) return;
+    defer_object(std::move(o->second));
+    objects().erase(o);
+}
+
+void hand_image_to_snapshots(uint64_t guest) {  // under objects_lock: the texture at `guest` is going away
+    auto s = g_snapshots_of.find(guest);
+    if (s == g_snapshots_of.end()) return;
+    auto o = objects().find(guest);
+    auto* t = o == objects().end() ? nullptr : dynamic_cast<Texture*>(o->second.get());
+    uint64_t now = plat::monotonic_ns();
+    for (uint64_t key : s->second) {
+        auto so = objects().find(key);
+        auto* snap = so == objects().end() ? nullptr : dynamic_cast<Texture*>(so->second.get());
+        // Cubes and cube arrays only (the light probes): inheriting every image kept ~450 per second alive.
+        if (!snap || !t || !t->image || snap->image || (t->target != 8 && t->target != 9)) continue;
+        snap->image = t->image;
+        g_snapshot_images.push_back({key, now});
+    }
+    g_snapshots_of.erase(s);
+    // A copy holding an image nothing sampled for 2 s lets it go (their slots are rarely re-registered).
+    for (int n = 0; n < 8 && !g_snapshot_images.empty(); n++) {
+        auto [key, since] = g_snapshot_images.front();
+        auto so = objects().find(key);
+        auto* snap = so == objects().end() ? nullptr : dynamic_cast<Texture*>(so->second.get());
+        if (snap && std::max<uint64_t>(since, snap->last_sampled) + 2'000'000'000ull > now) break;
+        g_snapshot_images.pop_front();
+        if (snap) snap->image.reset();
+    }
 }
 
 // A kept texture no slot names any more is destroyed (under objects_lock).
@@ -487,6 +556,8 @@ void TexturePoolRegister(CPU& c) {
         std::lock_guard lk(objects_lock());
         uint64_t old = d->textures.count(uint32_t(c.x[1])) ? d->textures[uint32_t(c.x[1])] : 0;
         d->textures[uint32_t(c.x[1])] = c.x[2];
+        if (auto s = d->snapshots.find(uint32_t(c.x[1])); s != d->snapshots.end()) drop_snapshot(s->second);
+        if (uint64_t snap = make_snapshot(c.x[2])) d->snapshots[uint32_t(c.x[1])] = snap;
         auto& slots = g_registered[c.x[2]];  // re-registered every frame: keep each slot once
         std::pair<uint64_t, uint32_t> slot{c.x[0], uint32_t(c.x[1])};
         if (std::find(slots.begin(), slots.end(), slot) == slots.end()) slots.push_back(slot);

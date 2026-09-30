@@ -321,7 +321,12 @@ std::shared_ptr<GpuImage> reuse_image(const Texture& t) {
     // Off unless NX_IMAGE_REUSE=1: a CPU-written texture placed over a freed render target's memory would sample the
     // old render, and swizzle/alpha_from_r come from the old texture (review of #34). The pass breaks it avoided came
     // mostly from destroyed pool textures (fixed separately).
-    static const bool off = std::getenv("NX_IMAGE_REUSE") == nullptr;
+    // On by default (NX_IMAGE_REUSE=0 turns it off): the course's player samples AO/ambient targets of a destroyed
+    // texture object two frames later (DEBUG.md #39); without the reused image they were black (a dark Mario).
+    static const bool off = [] {
+        const char* e = std::getenv("NX_IMAGE_REUSE");
+        return e && e[0] == '0';
+    }();
     if (!t.memory || off) return nullptr;
     std::lock_guard lk(g_grave_lock);
     auto it = g_reusable.find(reuse_key(t));

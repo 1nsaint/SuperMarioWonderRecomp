@@ -1,6 +1,7 @@
 // The replay's state commands (split from nvn_draw.cpp): binds, viewports, uniform updates, counters; draws and
 // dispatches go back to nvn_draw.cpp.
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include "nvn_draw_state.h"
@@ -107,7 +108,10 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
             static uint64_t reports = 0, types_seen = 0;
             if (c.n < 64 && !(types_seen >> c.n & 1)) types_seen |= 1ull << c.n, log("nvn: first counter report of type %u", c.n);
             if (uint8_t* p = const_cast<uint8_t*>(guest_bytes(c.a[0]))) {
-                uint64_t v[2] = {++reports, plat::monotonic_ns()};
+                // NX_FAKE_GPU_TIME=1: every report of a submit carries the submit's start (a GPU with no cost):
+                // the game picks its present interval from the timings it measures (bisecting its 30 fps mode).
+                static const bool fake = std::getenv("NX_FAKE_GPU_TIME") != nullptr;
+                uint64_t v[2] = {++reports, fake ? submit_start_ns() : plat::monotonic_ns()};
                 std::memcpy(p, v, sizeof v);
                 dedup_invalidate(p, sizeof v);
             }

@@ -158,6 +158,7 @@ struct DescriptorPool : Object {  // an NVNtexturePool or NVNsamplerPool
     uint64_t pool = 0, offset = 0;
     uint32_t count = 0;
     std::map<uint32_t, uint64_t> textures;     // id -> guest NVNtexture*
+    std::map<uint32_t, uint64_t> snapshots;    // id -> host key of a copy of the texture as registered (nvn_objects.cpp)
     std::map<uint32_t, ViewInfo> views;        // id -> the registering view, when it selects anything
     std::map<uint32_t, SamplerInfo> samplers;  // id -> sampler state
 };

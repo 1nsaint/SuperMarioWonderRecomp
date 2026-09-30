@@ -48,7 +48,8 @@ NVN implemented over Vulkan (MoltenVK).
   - Stencil reference and masks, depth bias and depth clamp are applied (#38).
   - Review fixes: host scratch data is not shared between draws, and clears honour their masks and sizes.
 - **Open.**
-  - The course's actors render dark (#39): they sample the AO and ambient-light targets of another frame.
+  - The course's actors render dark (#39, #42). Mario is fixed by reusing the images of destroyed render targets.
+    Goombas and trees still sample dark light-probe cubemaps.
   - The course is at ~30 fps: the game switches its present interval between 1 and 2, and the frame is ~23 ms of
     replay plus GPU.
   - Tried and kept off by default, documented: the replay thread (#40), Deferred binds (#41), kept pool textures (#38).

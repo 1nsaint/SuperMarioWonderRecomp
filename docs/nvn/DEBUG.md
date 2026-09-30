@@ -362,3 +362,22 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
       first, count and pointer (sdk+469680, against BindTextures at sdk+469430, which copies each handle).
     - The runtime can record the pointer and read the array at submit (`NX_DEFERRED_SNAPSHOT=1`) or at replay.
     - Neither fixed #39, and both multiplied the pass breaks, so the arrays are read at recording, as before.
+42. **#39 continued: the player is fixed, the Goombas and trees are not yet.**
+    - **Player.** The course's draws sample AO and ambient-light targets through texture objects the game destroyed
+      two frames earlier, on memory the engine still holds. Reusing the GPU-written image of a destroyed texture for a
+      new one with the same memory and shape (`reuse_image`, nvn_frames.cpp) keeps that content, and Mario renders
+      lit. It is on by default now (`NX_IMAGE_REUSE=0` turns it off).
+    - **Pool snapshots** (nvn_objects.cpp).
+      - Each registration keeps a copy of the texture as registered. When the texture object dies or is re-initialized,
+        the copies of cube textures inherit its image.
+      - texture_for uses the copy when the slot's texture is gone or has another target or format: the light-probe
+        cubemaps get their structs reused as 2D textures at a course load.
+      - Only cubes inherit images: inheriting every image kept ~450 a second alive (6 GB).
+      - A copy nothing sampled for 2 s drops its image.
+    - **Goombas, the big tree, some bushes: still dark.**
+      - Study 3/4 (scratchpad) mapped their draws to the same shader template as the player, with the same render
+        targets. The difference is which light-probe cubemaps they bind.
+      - The probes resolve correctly: the slot's 2-level or 5-level cube, never finalized, with the `rt` flag.
+      - `NX_TRACE_CUBES=1` shows each probe rendered face by face and level by level at load, with valid face views,
+        so the probe content itself must be dark: the captures render a scene that is still being lit.
+      - Next: dump a probe's faces after load (`NX_DUMP_TEXTURES`).

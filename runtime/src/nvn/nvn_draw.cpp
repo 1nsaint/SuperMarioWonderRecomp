@@ -45,6 +45,12 @@ void texture_for(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, ViewI
     if (auto* tp = get<DescriptorPool>(g_state.texture_pool)) {
         auto it = tp->textures.find(tid);
         if (it != tp->textures.end()) texture = it->second;
+        // The slot's texture gone or re-initialized as another kind: the copy made at registration (nvn_objects.cpp).
+        if (auto s = tp->snapshots.find(tid); texture && s != tp->snapshots.end()) {
+            Texture* now = get<Texture>(texture);
+            Texture* then = get<Texture>(s->second);
+            if (then && (!now || now->target != then->target || now->format != then->format)) texture = s->second;
+        }
         auto v = tp->views.find(tid);
         if (view && v != tp->views.end()) *view = v->second;
     }
@@ -88,6 +94,13 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
         img->rendered = true;
         uint32_t level = std::min<uint32_t>(t.views.level[k], img->levels - 1);
         colors[k].imageView = attachment_view(*img, level, t.views.layer[k], view_format(*img, t.views.format[k]));
+        static const bool trace_cubes = std::getenv("NX_TRACE_CUBES") != nullptr;  // writes into cube images
+        static int cube_logs = 0;
+        if (trace_cubes && (img->view_type == VK_IMAGE_VIEW_TYPE_CUBE || img->view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) &&
+            cube_logs++ < 400)
+            log("cubes: render into %llx level %u layer %u (%ux%u, %u levels, %u layers) view %s",
+                (unsigned long long)t.colors[k], level, t.views.layer[k], img->width, img->height, img->levels,
+                img->layers, colors[k].imageView == img->view ? "WHOLE IMAGE (fallback)" : "ok");
         colors[k].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         colors[k].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         colors[k].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -633,6 +646,8 @@ void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
     p_vkCmdClearAttachments(cb, 1, &a, 1, &r);
     g_pass_written |= color ? 1u << c.n : 1u << 8;  // a later draw sampling it needs a fresh pass
 }
+
+uint64_t submit_start_ns() { return g_submit_ns; }
 
 // Entry points of the draws and dispatches for draw_command (nvn_draw_state.cpp).
 bool draw_call(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, const Cmd& c) {
