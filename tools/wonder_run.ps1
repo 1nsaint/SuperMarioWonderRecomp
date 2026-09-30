@@ -14,7 +14,7 @@ param(
     [switch]$Handheld,                   # NX_HANDHELD=1: 720p
     [string]$Script = "",                # NX_INPUT_SCRIPT
     [int]$DumpEvery = 0,                 # NX_DUMP_FRAMES
-    [hashtable]$Env = @{},               # any other NX_* switch
+    [string]$Env = "",                   # any other switches: "NX_A=1;NX_B=2"
     [int]$MinPresents = 300,
     [double]$MinFps = 0,
     [double]$MaxMemGB = 5.0,
@@ -36,7 +36,7 @@ if ($Headless) { $vars.NX_HEADLESS = "1"; $vars.NX_MUTE = "1" }
 if ($Handheld) { $vars.NX_HANDHELD = "1" }
 if ($Script) { $vars.NX_INPUT_SCRIPT = $Script }
 if ($DumpEvery) { $vars.NX_DUMP_FRAMES = "$DumpEvery" }
-foreach ($k in $Env.Keys) { $vars[$k] = "$($Env[$k])" }
+foreach ($kv in ($Env -split ';' | Where-Object { $_ -match '=' })) { $k, $v = $kv -split '=', 2; $vars[$k.Trim()] = $v }
 $saved = @{}
 foreach ($k in $vars.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $vars[$k]) }
 
