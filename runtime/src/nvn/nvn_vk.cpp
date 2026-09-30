@@ -569,8 +569,6 @@ void log_timing(uint64_t frames) {
 
 }  // namespace
 
-void debug_dump_textures(uint64_t frame);  // nvn_debug.cpp
-void debug_dump_requested(uint64_t n);      // nvn_debug.cpp
 uint64_t draw_take_dump_request();          // nvn_draw.cpp
 
 namespace {
@@ -633,7 +631,7 @@ void present_headless(uint64_t texture) {
     if (frame_dump_every() && presents % frame_dump_every() == 0) debug_dump_textures(presents);
 }
 
-void gpu_present(uint64_t texture) {
+void gpu_present(uint64_t texture, const int32_t* crop) {
     drain_objects();
     std::lock_guard lk(g_gpu);
     if (!init()) return;
@@ -667,6 +665,9 @@ void gpu_present(uint64_t texture) {
         VkImageBlit blit{};
         blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         blit.srcOffsets[1] = {int32_t(src->width), int32_t(src->height), 1};
+        if (crop && crop[2] > 0 && crop[3] > 0 && crop[0] + crop[2] <= int32_t(src->width) &&
+            crop[1] + crop[3] <= int32_t(src->height))  // nvnWindowSetCrop
+            blit.srcOffsets[0] = {crop[0], crop[1], 0}, blit.srcOffsets[1] = {crop[0] + crop[2], crop[1] + crop[3], 1};
         blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         blit.dstOffsets[1] = {int32_t(g_sc_extent.width), int32_t(g_sc_extent.height), 1};
         p_vkCmdBlitImage(g_cb, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.image,

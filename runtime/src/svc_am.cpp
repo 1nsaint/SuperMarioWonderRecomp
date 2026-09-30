@@ -1,4 +1,5 @@
 // am services (appletOE): application proxy, focus/operation-mode state, launch parameters.
+#include <cstdlib>
 #include <deque>
 
 #include "ipc.h"
@@ -52,12 +53,14 @@ std::shared_ptr<Service> common_state_getter() {
             if (a.messages.empty()) a.message_event->signaled = false;
             return 0u;
         };
-        s.cmds[5] = [](IpcCtx& c) { c.push<uint8_t>(1); return 0u; };   // GetOperationMode: docked
-        s.cmds[6] = [](IpcCtx& c) { c.push<uint32_t>(1); return 0u; };  // GetPerformanceMode: boost
+        // NX_HANDHELD=1: handheld mode, so the game renders for 1280x720 (a lighter GPU load) instead of docked 1080p.
+        static const bool handheld = std::getenv("NX_HANDHELD") != nullptr;
+        s.cmds[5] = [](IpcCtx& c) { c.push<uint8_t>(handheld ? 0 : 1); return 0u; };   // GetOperationMode
+        s.cmds[6] = [](IpcCtx& c) { c.push<uint32_t>(handheld ? 0 : 1); return 0u; };  // GetPerformanceMode
         s.cmds[9] = [](IpcCtx& c) { c.push<uint8_t>(1); return 0u; };   // GetCurrentFocusState: in focus
         s.cmds[60] = [](IpcCtx& c) {  // GetDefaultDisplayResolution
-            c.push<uint32_t>(1920);
-            c.push<uint32_t>(1080);
+            c.push<uint32_t>(handheld ? 1280 : 1920);
+            c.push<uint32_t>(handheld ? 720 : 1080);
             return 0u;
         };
         s.cmds[61] = [](IpcCtx& c) {  // GetDefaultDisplayResolutionChangeEvent

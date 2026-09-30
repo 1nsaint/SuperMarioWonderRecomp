@@ -4,6 +4,8 @@
 // values follow the SDK driver (nvnSyncWait sdk+45a960: 0 once the fence has passed; nvnWindowAcquireTexture
 // sdk+45e050: 0 on success).
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <cstdlib>
 #include <atomic>
 #include <vector>
@@ -200,7 +202,8 @@ void QueuePresentTexture(CPU& c) {
         worker_wait(queued[next_slot]);
         if (int(c.x[2]) >= 0 && size_t(c.x[2]) < w->textures.size()) {
             uint64_t texture = w->textures[size_t(c.x[2])];
-            queued[next_slot] = worker_run([texture] { gpu_present(texture); });
+            std::array<int32_t, 4> crop{w->crop[0], w->crop[1], w->crop[2], w->crop[3]};
+            queued[next_slot] = worker_run([texture, crop] { gpu_present(texture, crop.data()); });
             next_slot ^= 1;
         }
         pace_present(w->interval);
@@ -210,8 +213,22 @@ void QueuePresentTexture(CPU& c) {
     g_frame++;
 }
 
+// (NVNwindow*, int x, int y, int width, int height): the part of the window textures shown. In handheld mode
+// (NX_HANDHELD) the game renders 1280x720 into its 1920x1080 window textures and crops to it.
+void WindowSetCrop(CPU& c) {
+    if (auto* w = get<Window>(c.x[0])) {
+        int32_t v[4] = {int32_t(c.x[1]), int32_t(c.x[2]), int32_t(c.x[3]), int32_t(c.x[4])};
+        if (std::memcmp(v, w->crop, sizeof v) != 0) {
+            static int logged = 0;
+            if (logged++ < 20) log("nvn: window crop %d,%d %dx%d", v[0], v[1], v[2], v[3]);
+            std::memcpy(w->crop, v, sizeof v);
+        }
+    }
+}
+
 }  // namespace
 
+NX_HLE("nvnWindowSetCrop", WindowSetCrop);
 NX_HLE("nvnSyncInitialize", SyncInitialize);
 NX_HLE("nvnSyncFinalize", SyncFinalize);
 NX_HLE("nvnSyncWait", SyncWait);

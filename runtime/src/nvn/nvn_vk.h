@@ -65,6 +65,8 @@ struct WriteBack {
     uint64_t size;
 };
 std::vector<WriteBack> draw_take_write_backs();  // nvn_draw.cpp: this submit's, for an asynchronous submit
+void debug_dump_textures(uint64_t frame);  // nvn_debug.cpp: NX_DUMP_TEXTURES and the requested ones
+void debug_dump_requested(uint64_t n);      // nvn_debug.cpp: NX_DUMP_ON_TARGET / NX_DUMP_ON_FS
 void debug_dump_add(uint64_t texture);  // nvn_debug.cpp: read back at the end of this submit
 
 // nvn_frames.cpp: asynchronous submission (NX_ASYNC_GPU). Slots of command buffer, fence, descriptor pool and ring
@@ -98,6 +100,17 @@ struct Targets {
     uint64_t depth = 0;
     TargetViews views;  // level and layer of each (index 8: depth)
 };
+// Field by field: a memcmp also compared the padding after color_count, which a copy need not keep.
+inline bool targets_same(const Targets& a, const Targets& b) {
+    if (a.color_count != b.color_count || a.depth != b.depth) return false;
+    for (uint32_t k = 0; k < 9; k++) {
+        if (k < 8 && a.colors[k] != b.colors[k]) return false;
+        if (a.views.level[k] != b.views.level[k] || a.views.layer[k] != b.views.layer[k] ||
+            a.views.format[k] != b.views.format[k])
+            return false;
+    }
+    return true;
+}
 void draw_begin_submit();
 void draw_end_submit();  // after the GPU finished the submit
 void draw_log_stats();
@@ -106,7 +119,20 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
 // 4 clear larger than the pass, 5 copy, 6 snapshot, 7 SetRenderTargets (NX_TARGETS_BREAK).
 void draw_end_rendering(VkCommandBuffer cb, int reason = 0);  // before transfers (clears, copies, present) and at the end
 // ClearColor / ClearDepthStencil inside the render pass of the current targets (nvn_draw.cpp).
-void draw_clear(VkCommandBuffer cb, const Targets& targets, const Cmd& c);
+void draw_clear(VkCommandBuffer cb, const Targets& targets, const Cmd& c);  // nvn_clears.cpp
+// nvn_clears.cpp: clears pending as the next pass's loadOps; nvn_draw.cpp: the open pass, for it.
+bool clears_pending_image(const GpuImage* img);
+bool clears_pending_other(const Targets& t);
+uint32_t clears_apply(const Targets& t, VkRenderingAttachmentInfo* colors, VkRenderingAttachmentInfo& depth,
+                      VkRenderingAttachmentInfo& stencil);
+void clears_flush(VkCommandBuffer cb);  // outside a pass: the pending clears in a pass of their own
+void clears_begin_submit();
+void clears_log();
+void pass_end_only(VkCommandBuffer cb, int reason);  // draw_end_rendering without the pending clears
+bool pass_open_on(const Targets& t);
+VkExtent2D pass_extent();
+void pass_begin(VkCommandBuffer cb, const Targets& t);
+void pass_mark_written(uint32_t bits);
 // nvn_replay.cpp: a command list into `cb` (`depth`: CallList nesting).
 void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth);
 

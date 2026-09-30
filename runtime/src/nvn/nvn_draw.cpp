@@ -74,6 +74,7 @@ using namespace replay;
 namespace {
 
 bool g_rendering = false;
+bool g_sampled_pending = false;  // gather_textures: the draw samples an image with a pending clear
 Targets g_pass;           // what the open pass renders to
 GpuImage* g_pass_images[9];  // their images (8: depth), resolved once per pass for gather_textures
 uint32_t g_pass_written = 0;
@@ -92,6 +93,7 @@ VkExtent2D g_pass_extent{};
 int api_stage(ShaderStage s) { return s == ShaderStage::Fragment ? 1 : s == ShaderStage::Compute ? 5 : 0; }
 
 void begin_rendering(VkCommandBuffer cb, const Targets& t) {
+    if (clears_pending_other(t)) clears_flush(cb);  // other targets' clears first, in order
     VkRenderingAttachmentInfo colors[8]{};
     VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     VkExtent2D extent{UINT32_MAX, UINT32_MAX};
@@ -136,6 +138,8 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
         dimg = nullptr;
     }
     if (extent.width == UINT32_MAX) extent = {1, 1};
+    VkRenderingAttachmentInfo stencil = depth;  // same view, its own loadOp
+    uint32_t cleared = clears_apply(t, colors, depth, stencil);  // pending clears of these targets: loadOp CLEAR
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea = {{0, 0}, extent};
     ri.layerCount = 1;
@@ -143,11 +147,11 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     ri.pColorAttachments = colors;
     if (dimg) {
         if (dimg->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ri.pDepthAttachment = &depth;
-        if (dimg->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ri.pStencilAttachment = &depth;
+        if (dimg->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ri.pStencilAttachment = &stencil;
     }
     p_vkCmdBeginRendering(cb, &ri);
     g_rendering = true;
-    g_pass_written = 0;
+    g_pass_written = cleared;  // as a clear inside the pass: sampling it needs it stored first
     g_pass = t;
     g_pass_extent = extent;
 }
@@ -350,6 +354,7 @@ bool gather_textures(const std::vector<const ShaderInfo*>& shaders,
                 if (g_pass.colors[c] && g_pass_images[c] == img) hit |= 1u << c;
             if (hit & g_pass_written) need_break = true;
         }
+        if (texture && clears_pending_image(image_of(texture))) g_sampled_pending = need_break = true;
     }
     return need_break;
 }
@@ -438,8 +443,11 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     // Textures first: an upload or a layout change cannot happen inside the render pass.
     std::vector<std::pair<const ShaderInfo*, const DescriptorBinding*>> tex_bindings;
     std::vector<uint64_t> handles;
+    g_sampled_pending = false;
     bool need_break = gather_textures(*shaders, tex_bindings, handles);
-    bool targets_changed = !g_rendering || std::memcmp(&g_pass, &t, sizeof t) != 0;
+    if (g_sampled_pending) clears_flush(cb);  // cleared (and stored) before it is sampled
+    static const bool bytes = std::getenv("NX_TARGETS_MEMCMP") != nullptr;  // bisecting
+    bool targets_changed = !g_rendering || (bytes ? std::memcmp(&g_pass, &t, sizeof t) != 0 : !targets_same(g_pass, t));
     if (g_rendering && (need_break || targets_changed)) {
         (targets_changed ? g_stats.breaks_targets : g_stats.breaks_textures)++;
         draw_end_rendering(cb, 1);
@@ -605,6 +613,7 @@ std::vector<WriteBack> draw_take_write_backs() {  // an asynchronous submit copi
 
 void draw_begin_submit() {
     g_rendering = false;
+    clears_begin_submit();
     g_submit_ns = plat::monotonic_ns();
     dedup_reset();
     pipeline_begin_submit();
@@ -615,6 +624,7 @@ uint64_t recorded_draws();
 void draw_log_stats() {
     dedup_log();
     sampled_ready_log();
+    clears_log();
     log("nvn passes ended: %llu submit end, %llu draw, %llu dispatch, %llu clear of other targets, %llu clear larger than "
         "the pass, %llu copy, %llu snapshot, %llu SetRenderTargets", (unsigned long long)g_pass_ends[0],
         (unsigned long long)g_pass_ends[1], (unsigned long long)g_pass_ends[2], (unsigned long long)g_pass_ends[3],
@@ -629,55 +639,21 @@ void draw_log_stats() {
         (unsigned long long)t.breaks_textures, (unsigned long long)t.breaks_targets, (unsigned long long)t.dispatches);
 }
 
-void draw_end_rendering(VkCommandBuffer cb, int reason) {
+void pass_end_only(VkCommandBuffer cb, int reason) {
     if (!g_rendering) return;
     g_pass_ends[reason & 7]++;
     p_vkCmdEndRendering(cb);
     g_rendering = false;
     gpu_profile_mark(cb, "outside passes (clears, uploads, copies)");
 }
-
-// Clears run inside the render pass of the current targets (vkCmdClearAttachments). A transfer clear between passes
-// was a Metal encoder of its own and made the next pass reload its targets: most of the ~25 ms per frame of GPU time
-// "outside passes" (docs/nvn/DEBUG.md #31). Depth and stencil clears honour the call's masks.
-void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
-    bool color = c.op == Cmd::ClearColor;
-    uint64_t guest = color ? (c.n < 8 ? t.colors[c.n] : 0) : t.depth;
-    GpuImage* img = guest ? image_of(guest) : nullptr;
-    if (!img || color != (img->aspect == VK_IMAGE_ASPECT_COLOR_BIT)) return;
-    if (color && !(c.mask & 0xF)) return;  // no channel enabled
-    VkClearAttachment a{};
-    if (color) {
-        a.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, a.colorAttachment = c.n;
-        std::memcpy(a.clearValue.color.float32, c.f, 16);
-    } else {
-        if ((c.mask & 1) && (img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) a.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
-        if ((c.mask >> 8 & 0xFF) && (img->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) a.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
-        if (!a.aspectMask) return;
-        a.clearValue.depthStencil = {c.f[0], uint32_t(c.i[0])};
-    }
-    if (g_rendering && std::memcmp(&g_pass, &t, sizeof t) != 0) draw_end_rendering(cb, 3);
-    if (!g_rendering) begin_rendering(cb, t);
-    uint32_t level = color ? t.views.level[c.n] : t.views.level[8];
-    VkExtent2D full{std::max(1u, img->width >> level), std::max(1u, img->height >> level)};
-    static const bool transfer = std::getenv("NX_TRANSFER_CLEARS") != nullptr;  // bisecting: whole-image clears
-    if (transfer && !color) a.aspectMask = img->aspect;  // the old clears ignored the masks
-    if (transfer || full.width > g_pass_extent.width || full.height > g_pass_extent.height) {
-        // The pass is smaller than this target (a larger shared depth buffer): clear all of it, outside the pass.
-        draw_end_rendering(cb, 4);
-        transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);
-        VkImageSubresourceRange r{a.aspectMask, std::min<uint32_t>(level, img->levels - 1), 1,
-                                  std::min<uint32_t>(color ? t.views.layer[c.n] : t.views.layer[8], img->layers - 1), 1};
-        if (color)
-            p_vkCmdClearColorImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &a.clearValue.color, 1, &r);
-        else
-            p_vkCmdClearDepthStencilImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &a.clearValue.depthStencil, 1, &r);
-        return;
-    }
-    VkClearRect r{{{0, 0}, g_pass_extent}, 0, 1};
-    p_vkCmdClearAttachments(cb, 1, &a, 1, &r);
-    g_pass_written |= color ? 1u << c.n : 1u << 8;  // a later draw sampling it needs a fresh pass
+void draw_end_rendering(VkCommandBuffer cb, int reason) {  // and the pending clears (nvn_clears.cpp)
+    pass_end_only(cb, reason);
+    clears_flush(cb);
 }
+bool pass_open_on(const Targets& t) { return g_rendering && targets_same(g_pass, t); }
+VkExtent2D pass_extent() { return g_pass_extent; }
+void pass_begin(VkCommandBuffer cb, const Targets& t) { begin_rendering(cb, t); }
+void pass_mark_written(uint32_t bits) { g_pass_written |= bits; }
 
 uint64_t submit_start_ns() { return g_submit_ns; }
 

@@ -1,0 +1,194 @@
+// Clears (split from nvn_draw.cpp). A clear of targets other than the open pass's used to end it and begin a pass on
+// the new targets with every attachment loaded, then clear with a vkCmdClearAttachments quad: ~36 passes per course
+// frame, each a full-resolution load on a tile GPU for data the clear then overwrote. Such a clear is now kept
+// pending and becomes the loadOp CLEAR of the pass the next draw begins on the same targets (same extent, so the
+// same area as the quad). Anything else first (a draw on other targets or sampling a cleared image, a dispatch, a
+// copy, the submit's end) clears it in a pass of its own with no draw (docs/nvn/DEBUG.md #47).
+// NX_EAGER_CLEARS=1: the old way (bisecting).
+#include <algorithm>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <string>
+
+#include "nvn_draw_state.h"
+
+namespace nx::nvn {
+
+using namespace nx::vk;
+
+namespace {
+
+struct Pending {
+    bool on = false;
+    Targets t;
+    uint32_t colors = 0;  // bit c: colour target c cleared
+    VkClearValue color[8]{};
+    VkImageAspectFlags ds = 0;
+    VkClearValue depth{};
+};
+Pending g_pending;
+uint64_t g_deferred = 0, g_as_load = 0, g_alone = 0;
+
+// begin_rendering's render area for these targets: the smallest attachment at its level.
+VkExtent2D targets_extent(const Targets& t) {
+    VkExtent2D e{UINT32_MAX, UINT32_MAX};
+    auto fold = [&](uint64_t guest, uint32_t level) {
+        GpuImage* img = guest ? image_of(guest) : nullptr;
+        if (!img) return;
+        level = std::min<uint32_t>(level, img->levels - 1);
+        e = {std::min(e.width, std::max(1u, img->width >> level)), std::min(e.height, std::max(1u, img->height >> level))};
+    };
+    for (uint32_t k = 0; k < t.color_count; k++) fold(t.colors[k], t.views.level[k]);
+    if (GpuImage* d = t.depth ? image_of(t.depth) : nullptr; d && d->aspect != VK_IMAGE_ASPECT_COLOR_BIT)
+        fold(t.depth, t.views.level[8]);
+    return e;
+}
+
+}  // namespace
+
+bool clears_pending_image(const GpuImage* img) {
+    if (!g_pending.on || !img) return false;
+    for (uint32_t k = 0; k < g_pending.t.color_count; k++)
+        if ((g_pending.colors >> k & 1) && g_pending.t.colors[k] && image_of(g_pending.t.colors[k]) == img) return true;
+    return g_pending.ds && g_pending.t.depth && image_of(g_pending.t.depth) == img;
+}
+
+namespace {
+
+// Where each pending cleared attachment is in `t` (slot, or -1): the same texture and view at the same render area.
+bool pending_slots(const Targets& t, int slot[9]) {
+    const Targets& p = g_pending.t;
+    for (uint32_t k = 0; k < 9; k++) slot[k] = -1;
+    for (uint32_t k = 0; k < p.color_count; k++) {
+        if (!(g_pending.colors >> k & 1)) continue;
+        for (uint32_t j = 0; j < t.color_count && slot[k] < 0; j++)
+            if (t.colors[j] == p.colors[k] && t.views.level[j] == p.views.level[k] &&
+                t.views.layer[j] == p.views.layer[k] && t.views.format[j] == p.views.format[k])
+                slot[k] = int(j);
+        if (slot[k] < 0) return false;
+    }
+    if (g_pending.ds) {
+        if (t.depth != p.depth || t.views.level[8] != p.views.level[8] || t.views.layer[8] != p.views.layer[8])
+            return false;
+        slot[8] = 8;
+    }
+    if (targets_same(t, p)) return true;
+    // NX_CLEARS_SUBSET=1: also a pass on more targets with the same area. It measured no faster (GPU 13.7 against
+    // 13.0 ms) and one run showed a black band across the course, so it is off.
+    static const bool subset = std::getenv("NX_CLEARS_SUBSET") != nullptr;
+    if (!subset) return false;
+    VkExtent2D a = targets_extent(t), b = targets_extent(p);
+    return a.width == b.width && a.height == b.height;
+}
+
+}  // namespace
+
+bool clears_pending_other(const Targets& t) {
+    int slot[9];
+    return g_pending.on && !pending_slots(t, slot);
+}
+
+uint32_t clears_apply(const Targets& t, VkRenderingAttachmentInfo* colors, VkRenderingAttachmentInfo& depth,
+                      VkRenderingAttachmentInfo& stencil) {
+    int slot[9];
+    if (!g_pending.on || !pending_slots(t, slot)) return 0;
+    uint32_t cleared = 0;
+    for (uint32_t k = 0; k < 8; k++)
+        if (slot[k] >= 0 && colors[slot[k]].imageView) {
+            colors[slot[k]].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            colors[slot[k]].clearValue = g_pending.color[k];
+            cleared |= 1u << slot[k];
+        }
+    if (g_pending.ds && depth.imageView) {
+        depth.clearValue = stencil.clearValue = g_pending.depth;
+        if (g_pending.ds & VK_IMAGE_ASPECT_DEPTH_BIT) depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        if (g_pending.ds & VK_IMAGE_ASPECT_STENCIL_BIT) stencil.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        cleared |= 1u << 8;
+    }
+    g_pending.on = false;
+    g_as_load++;
+    return cleared;
+}
+
+void clears_flush(VkCommandBuffer cb) {
+    if (!g_pending.on) return;
+    Targets t = g_pending.t;
+    g_alone++, g_as_load--;  // counted by clears_apply
+    pass_begin(cb, t);        // takes the clears as its loadOps
+    pass_end_only(cb, 3);
+}
+
+void clears_begin_submit() { g_pending.on = false; }
+
+void clears_log() {
+    log("nvn clears: %llu deferred to the next pass on their targets, %llu of those passes with draws, %llu alone",
+        (unsigned long long)g_deferred, (unsigned long long)g_as_load, (unsigned long long)g_alone);
+}
+
+// Clears run inside the render pass of the current targets (vkCmdClearAttachments), or become the loadOps of the
+// next one (above). A transfer clear between passes was a Metal encoder of its own and made the next pass reload its
+// targets: most of the ~25 ms per frame of GPU time "outside passes" (docs/nvn/DEBUG.md #31). Depth and stencil
+// clears honour the call's masks.
+void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
+    bool color = c.op == Cmd::ClearColor;
+    uint64_t guest = color ? (c.n < 8 ? t.colors[c.n] : 0) : t.depth;
+    GpuImage* img = guest ? image_of(guest) : nullptr;
+    if (!img || color != (img->aspect == VK_IMAGE_ASPECT_COLOR_BIT)) return;
+    if (color && !(c.mask & 0xF)) return;  // no channel enabled
+    VkClearAttachment a{};
+    if (color) {
+        a.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, a.colorAttachment = c.n;
+        std::memcpy(a.clearValue.color.float32, c.f, 16);
+    } else {
+        if ((c.mask & 1) && (img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) a.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+        if ((c.mask >> 8 & 0xFF) && (img->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) a.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        if (!a.aspectMask) return;
+        a.clearValue.depthStencil = {c.f[0], uint32_t(c.i[0])};
+    }
+    uint32_t level = color ? t.views.level[c.n] : t.views.level[8];
+    VkExtent2D full{std::max(1u, img->width >> level), std::max(1u, img->height >> level)};
+    static const bool transfer = std::getenv("NX_TRANSFER_CLEARS") != nullptr;  // bisecting: whole-image clears
+    static const bool eager = std::getenv("NX_EAGER_CLEARS") != nullptr;
+    if (!transfer && !eager && !pass_open_on(t)) {
+        VkExtent2D e = targets_extent(t);
+        if (full.width <= e.width && full.height <= e.height) {  // the pass covers it: a loadOp can clear it
+            pass_end_only(cb, 3);  // other targets' pass, and their pending clears
+            if (g_pending.on && !targets_same(g_pending.t, t)) clears_flush(cb);  // its slots index its own targets
+            if (!g_pending.on) g_pending = {true, t};
+            if (color) {
+                g_pending.colors |= 1u << c.n;
+                g_pending.color[c.n] = a.clearValue;
+            } else {
+                if (a.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) g_pending.depth.depthStencil.depth = c.f[0];
+                if (a.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) g_pending.depth.depthStencil.stencil = uint32_t(c.i[0]);
+                g_pending.ds |= a.aspectMask;
+            }
+            g_deferred++;
+            return;
+        }
+    }
+    if (!pass_open_on(t)) {
+        draw_end_rendering(cb, 3);
+        pass_begin(cb, t);
+    }
+    VkExtent2D pe = pass_extent();
+    if (transfer && !color) a.aspectMask = img->aspect;  // the old clears ignored the masks
+    if (transfer || full.width > pe.width || full.height > pe.height) {
+        // The pass is smaller than this target (a larger shared depth buffer): clear all of it, outside the pass.
+        draw_end_rendering(cb, 4);
+        transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);
+        VkImageSubresourceRange r{a.aspectMask, std::min<uint32_t>(level, img->levels - 1), 1,
+                                  std::min<uint32_t>(color ? t.views.layer[c.n] : t.views.layer[8], img->layers - 1), 1};
+        if (color)
+            p_vkCmdClearColorImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &a.clearValue.color, 1, &r);
+        else
+            p_vkCmdClearDepthStencilImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &a.clearValue.depthStencil, 1, &r);
+        return;
+    }
+    VkClearRect r{{{0, 0}, pe}, 0, 1};
+    p_vkCmdClearAttachments(cb, 1, &a, 1, &r);
+    pass_mark_written(color ? 1u << c.n : 1u << 8);  // a later draw sampling it needs a fresh pass
+}
+
+}  // namespace nx::nvn

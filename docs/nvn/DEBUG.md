@@ -485,3 +485,33 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
         - compute write-backs in the same submit;
         - GPU renders through another object;
         - CPU readback of render targets.
+47. **Deferred clears (nvn_clears.cpp).**
+    - Before: a clear of targets other than the open pass's began a pass with every attachment loaded, then cleared
+      with a `vkCmdClearAttachments` quad. That was ~36 passes per course frame, each a full-resolution load on a
+      tile GPU.
+    - Now the clear stays pending. The next pass on the same targets begins with loadOp CLEAR (same render area, so
+      the same pixels as the quad).
+    - Anything else first gets the clear done in a pass of its own, with no draw:
+      - a pass on other targets;
+      - a draw sampling a cleared image;
+      - a dispatch, a copy, a snapshot, or the submit's end.
+    - `NX_EAGER_CLEARS=1` restores the old way.
+    - `Targets` are now compared field by field (`targets_same`); a memcmp also compared the padding after
+      `color_count`. `NX_TARGETS_MEMCMP=1` restores the memcmp in draws.
+    - Matching a pending clear into a pass on more targets with the same area (`NX_CLEARS_SUBSET=1`) measured no
+      faster, so it is off.
+    - Course average (headless, synchronous): replay 7.9 → 7.4 ms, GPU wait 13.1 → 12.5-13.0 ms, 44.7 → 46-47 fps.
+      Runs vary by ±1 ms with the character the input script happens to pick.
+    - GPU profile of the course (`NX_GPU_PROFILE=1`): ~3 ms/frame between passes (~66 gaps), and 1080p shading.
+      The biggest passes are fs 4601469d (1.5 ms) and f8a4447a (2x 0.85 ms).
+    - Open: an intermittent band of horizontal garbage across the course's middle layer (seen in 2 of 9 course runs,
+      both after a respawn, in docked and handheld mode). Not caused by the clear matching; being bisected.
+48. **Handheld mode (`NX_HANDHELD=1`) and `nvnWindowSetCrop`.**
+    - `GetOperationMode` / `GetPerformanceMode` report handheld and normal (both am and apm), and the default display
+      resolution is 1280x720.
+    - The game then renders its 3D at 720p into its 1920x1080 window textures and crops to 1280x720 with
+      `nvnWindowSetCrop`. That call was a stub; it now sets the part of the window texture blitted to the window.
+    - Course: GPU wait 9.7 ms against 12.5-13, and 52-57 fps against 46-47 docked.
+    - Docked stays the default (the Switch's docked picture).
+    - Async GPU (`NX_ASYNC_GPU=2` + `MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0`) was retested: menus hold 60, but the
+      loads became slow enough that the input script never reached the course. It stays off.
