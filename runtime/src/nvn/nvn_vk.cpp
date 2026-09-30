@@ -496,8 +496,7 @@ namespace {
 void make_upload_buffer(uint64_t size) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
-    bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bi.usage = kUploadUsage;
     p_vkCreateBuffer(g_device, &bi, nullptr, &g_upload);
     VkMemoryRequirements req{};
     p_vkGetBufferMemoryRequirements(g_device, g_upload, &req);

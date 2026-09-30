@@ -102,6 +102,7 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
                 if (uint8_t* p = const_cast<uint8_t*>(guest_bytes(c.a[0] + off))) {
                     std::memcpy(p, list.blobs[c.blob].data(), list.blobs[c.blob].size());
                     dedup_invalidate(p, list.blobs[c.blob].size());
+                    written_cpu_write(p, list.blobs[c.blob].size());
                 }
             break;
         }
@@ -115,6 +116,7 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
                 uint64_t v[2] = {++reports, fake ? submit_start_ns() : plat::monotonic_ns()};
                 std::memcpy(p, v, sizeof v);
                 dedup_invalidate(p, sizeof v);
+                written_cpu_write(p, sizeof v);
             }
             break;
         }

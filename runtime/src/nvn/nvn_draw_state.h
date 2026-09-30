@@ -77,6 +77,26 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
 void dedup_reset();                                     // at each submit
 void dedup_invalidate(const uint8_t* p, uint64_t size);  // guest bytes written during the replay
 void dedup_log();
+// nvn_written.cpp: compute results within a submit (docs/nvn/GLITCH-PLAN.md G5), one copy per written guest range.
+bool written_separate();  // NX_COMPUTE_SEPARATE=1: a copy per binding, as before
+// A dispatch's storage binding it writes: the range's copy (made, reused or merged), kAlign aligned.
+Upload written_bind(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_t padded);
+// Bytes read by later work: the written copy when [p, p + size) meets one (may end the render pass), else false.
+bool written_read(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align, Upload& out);
+Upload read_upload(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align);  // or dedup
+bool written_overlaps(const uint8_t* p, uint64_t size);
+bool written_indirect(VkCommandBuffer cb, const uint8_t* p);  // vkCmdDispatchIndirect when a dispatch wrote {x, y, z}
+// A draw's vertex buffers (the streams `vs` reads) and index buffer; false: its indices are not in guest memory.
+struct DrawInputs {
+    Upload vertex[15], index;
+    uint32_t used = 0;  // bit s: stream s
+    VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+};
+bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in);
+void written_cpu_write(const uint8_t* p, uint64_t size);       // replay-time guest writes (logged when they meet one)
+std::vector<WriteBack> written_take();                         // one write-back per range, at the end of the submit
+void written_reset();
+void written_log();
 // c[0], the NVN driver constants of a stage (nvn_dedup.cpp).
 std::array<uint8_t, 0x1000> driver_constants(ShaderStage stage, int st);
 

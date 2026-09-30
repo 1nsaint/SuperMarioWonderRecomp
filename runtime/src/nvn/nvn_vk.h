@@ -53,6 +53,11 @@ struct Upload {
     uint64_t offset = 0;
     uint8_t* ptr = nullptr;
 };
+// What it is bound as, and GPU copies within it and dispatch arguments read from it (nvn_written.cpp).
+constexpr VkBufferUsageFlags kUploadUsage =
+    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+    VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
 Upload upload_alloc(uint64_t size, uint64_t align);
 Upload upload(const void* data, uint64_t size, uint64_t align);
 

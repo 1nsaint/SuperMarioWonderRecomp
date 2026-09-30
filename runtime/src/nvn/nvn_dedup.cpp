@@ -1,8 +1,8 @@
 // Per-submit upload reuse (docs/nvn/DEBUG.md #30). A draw's buffers are copied from guest memory into the upload
 // ring when it is replayed; the same camera block, scene constants and vertex buffers were copied again for every
 // draw that bound them (~130 KB per draw, 50-70 MB per frame). Within one submit guest memory only changes through
-// inline uniform updates (UpdateUniformBuffer, which invalidates what it overlaps) and compute results (written back
-// after the submit, so every draw of the submit reads the same pre-dispatch bytes either way): a copy made once can
+// inline uniform updates (UpdateUniformBuffer, which invalidates what it overlaps) and compute results (ranges a
+// dispatch writes are read from their written copy, nvn_written.cpp, and invalidated here): a copy made once can
 // serve every later draw of the submit that binds the same bytes.
 #include <array>
 #include <cstdlib>

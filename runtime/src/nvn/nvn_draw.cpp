@@ -165,7 +165,8 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
 
 // The buffer a descriptor points to: `bytes` copied into the upload buffer (at least 16 bytes, zero padded).
 // Storage buffers written by compute shaders go back to guest memory after the submit (the GPU's writes are what the
-// game and later work read; WriteBack in nvn_vk.h).
+// game and later work read; WriteBack in nvn_vk.h). One copy per written range, shared by the later work of the
+// submit (nvn_written.cpp); g_write_backs: NX_COMPUTE_SEPARATE=1, a copy per binding.
 std::vector<WriteBack> g_write_backs;
 bool all_write_backs() {  // NX_WRITE_BACK_ALL=1: every compute storage binding, written or not (bisecting)
     static const bool on = std::getenv("NX_WRITE_BACK_ALL") != nullptr;
@@ -174,11 +175,16 @@ bool all_write_backs() {  // NX_WRITE_BACK_ALL=1: every compute storage binding,
 
 // guest: the bytes are guest memory (a copy is shared by later draws of the submit); host scratch data (the support
 // buffer, c[0]: on the stack, at the same address for every draw) is copied every time (docs/nvn/DEBUG.md #30).
-VkDescriptorBufferInfo buffer_of(const void* bytes, uint64_t size, uint64_t min_size = 16, bool write_back = false,
-                                 bool guest = true) {
+VkDescriptorBufferInfo buffer_of(VkCommandBuffer cb, const void* bytes, uint64_t size, uint64_t min_size = 16,
+                                 bool write_back = false, bool guest = true) {
     uint64_t n = std::max<uint64_t>((size + 15) & ~15ull, min_size);
+    const auto* p = static_cast<const uint8_t*>(bytes);
     if (!write_back && guest) {
-        Upload u = dedup_upload(static_cast<const uint8_t*>(bytes), size, n, 256);
+        Upload u = read_upload(cb, p, size, n, 256);
+        return {u.buffer, u.offset, n};
+    }
+    if (write_back && p && size && !written_separate()) {
+        Upload u = written_bind(cb, p, size, n);
         return {u.buffer, u.offset, n};
     }
     Upload u = upload_alloc(n, 256);
@@ -222,14 +228,32 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
     float vw = g_state.has_viewport ? float(g_state.viewport[2]) : 1280.0f;
     float vh = g_state.has_viewport ? float(g_state.viewport[3]) : 720.0f;
     support_buffer_set_viewport(sb, vw, vh);
+    // A storage binding's bytes, and whether this compute stage writes them.
+    auto storage = [](const ShaderInfo* s, const DescriptorBinding& b, int st, const uint8_t*& p, uint64_t& size) {
+        const Range& r = b.nvn.index >= 0 && b.nvn.index < 16 ? g_state.storage[st][b.nvn.index] : Range{};
+        p = r.address ? guest_bytes(r.address) : nullptr;
+        size = p ? std::min<uint64_t>(r.size, 16ull << 20) : 0;
+        return s->stage == ShaderStage::Compute &&
+               (all_write_backs() || (b.binding < 64 && written_storage_bindings(s) >> b.binding & 1));
+    };
+    // The written ranges first (nvn_written.cpp): two bindings of one dispatch that meet get one copy, and bindings
+    // that read what the dispatch writes see it, as on the GPU.
+    for (const ShaderInfo* s : shaders)
+        for (const DescriptorBinding& b : s->refl.bindings) {
+            const uint8_t* p;
+            uint64_t size;
+            if (b.set < 2 && b.nvn.source == NvnSource::StorageBuffer && storage(s, b, api_stage(s->stage), p, size) &&
+                p && size && !written_separate())
+                written_bind(cb, p, size, std::max<uint64_t>((size + 15) & ~15ull, 0x10000));
+        }
     for (const ShaderInfo* s : shaders) {
         int st = api_stage(s->stage);
         for (const DescriptorBinding& b : s->refl.bindings) {
             if (b.set >= 2) continue;
             VkDescriptorBufferInfo info{};
             switch (b.nvn.source) {
-                case NvnSource::SupportBuffer: info = buffer_of(&sb, sizeof sb, 16, false, false); break;
-                case NvnSource::ConstantData: info = buffer_of(s->constants.data(), s->constants.size()); break;
+                case NvnSource::SupportBuffer: info = buffer_of(cb, &sb, sizeof sb, 16, false, false); break;
+                case NvnSource::ConstantData: info = buffer_of(cb, s->constants.data(), s->constants.size()); break;
                 case NvnSource::UniformBlock:
                 case NvnSource::UniformAsStorage: {
                     const Range& r = b.nvn.index >= 0 && b.nvn.index < 18 ? g_state.uniforms[st][b.nvn.index] : Range{};
@@ -239,25 +263,24 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
                     // Banks the shader indexes with a computed value (clamped to 64 KB, nvn_spirv_patch.cpp): all
                     // 64 KB, so every read past the data returns 0 as on Maxwell.
                     bool indexed = b.set == 0 && b.binding < 64 && (dynamic_uniform_bindings(s) >> b.binding & 1);
-                    info = buffer_of(p, p ? std::min<uint64_t>(r.size, 0x10000) : 0, indexed ? 0x10000 : 0x1000);
+                    info = buffer_of(cb, p, p ? std::min<uint64_t>(r.size, 0x10000) : 0, indexed ? 0x10000 : 0x1000);
                     break;
                 }
                 case NvnSource::StorageBuffer: {
-                    const Range& r = b.nvn.index >= 0 && b.nvn.index < 16 ? g_state.storage[st][b.nvn.index] : Range{};
-                    const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
+                    const uint8_t* p;
+                    uint64_t size;
+                    bool written = storage(s, b, st, p, size);
                     // At least 64 KB: Metal does not bound-check, and a shader writing past a small or missing
                     // buffer overwrote the next data in the upload buffer (garbage everywhere after a compute).
-                    info = buffer_of(p, p ? std::min<uint64_t>(r.size, 16ull << 20) : 0, 0x10000,
-                                     s->stage == ShaderStage::Compute &&
-                                         (all_write_backs() || (b.binding < 64 && written_storage_bindings(s) >> b.binding & 1)));
+                    info = buffer_of(cb, p, size, 0x10000, written);
                     break;
                 }
                 case NvnSource::DriverConstants: {
                     auto c0 = driver_constants(s->stage, st);
-                    info = buffer_of(c0.data(), c0.size(), 16, false, false);
+                    info = buffer_of(cb, c0.data(), c0.size(), 16, false, false);
                     break;
                 }
-                default: info = buffer_of(nullptr, 0x1000, 16, false, false); break;
+                default: info = buffer_of(cb, nullptr, 0x1000, 16, false, false); break;
             }
             buffers.push_back(info);
             VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -378,13 +401,13 @@ void dispatch(VkCommandBuffer cb, const Cmd& c) {
             if (s->stage == ShaderStage::Compute) cs = s;
     if (!cs) return;
     uint32_t x = uint32_t(c.i[0]), y = uint32_t(c.i[1]), z = uint32_t(c.i[2]);
-    if (c.n == 1) {  // indirect
-        const uint8_t* p = guest_bytes(c.a[0]);
-        if (!p) return;
-        std::memcpy(&x, p, 4), std::memcpy(&y, p + 4, 4), std::memcpy(&z, p + 8, 4);
-    }
-    if (!x || !y || !z) return;
-    trace_compute_once(cs, x, y, z);
+    const uint8_t* args = c.n == 1 ? guest_bytes(c.a[0]) : nullptr;  // indirect: {x, y, z}
+    if (c.n == 1 && !args) return;
+    // Written by an earlier dispatch of this submit: only the GPU knows them (vkCmdDispatchIndirect, below).
+    bool gpu_args = args && !written_separate() && written_overlaps(args, 12);
+    if (args && !gpu_args) std::memcpy(&x, args, 4), std::memcpy(&y, args + 4, 4), std::memcpy(&z, args + 8, 4);
+    if (!gpu_args && (!x || !y || !z)) return;
+    trace_compute_once(cs, x, y, z);  // 0, 0, 0 for GPU arguments
     std::vector<const ShaderInfo*> stages{cs};
     const ProgramLayout& layout = program_layout(stages);
     VkPipeline pipeline = compute_pipeline(cs, layout);
@@ -399,7 +422,7 @@ void dispatch(VkCommandBuffer cb, const Cmd& c) {
     p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout.layout, 0, 4, d.sets, 0, nullptr);
     if (gpu_profile_on()) gpu_profile_mark(cb, "compute " + cs->hash);
-    p_vkCmdDispatch(cb, x, y, z);
+    if (!gpu_args || !written_indirect(cb, args)) p_vkCmdDispatch(cb, x, y, z);
     if (gpu_profile_on()) gpu_profile_mark(cb, "outside passes (clears, uploads, copies)");
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -462,6 +485,13 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
 
     Descriptors d;
     build_sets(cb, *shaders, layout, tex_bindings, handles, d);
+    // Vertex and index data before the pass begins: a range a dispatch of this submit wrote may need a GPU copy
+    // (nvn_written.cpp), which cannot be recorded inside a pass.
+    DrawInputs in;
+    if (!draw_inputs(cb, vs, indexed, c, in)) {
+        g_stats.no_indices++;
+        return false;
+    }
     if (!g_rendering) {
         if (gpu_profile_on()) {
             GpuImage* img = t.color_count && t.colors[0] ? image_of(t.colors[0]) : nullptr;
@@ -503,20 +533,11 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.layout, 0, 4, d.sets, 0, nullptr);
 
-    // Vertex buffers: the bound ranges of the streams the vertex shader reads (the pipeline declares no others),
-    // plus the zero stream (binding 15).
-    uint32_t max_vertex = 0, used = 0;
-    for (const ShaderIo& in : vs->refl.inputs)
-        if (in.location < g_state.attribs.size() && g_state.attribs[in.location].stream < 15)
-            used |= 1u << g_state.attribs[in.location].stream;
+    // The vertex buffers resolved above, plus the zero stream (binding 15).
     for (uint32_t s = 0; s < 15; s++) {
-        if (!(used >> s & 1)) continue;
-        const Range& r = g_state.vertex_buffers[s];
-        const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
-        uint64_t size = p ? std::min<uint64_t>(r.size, 64ull << 20) : 0;
-        Upload u = dedup_upload(p, size, std::max<uint64_t>((size + 15) & ~15ull, 16), 16);
-        VkDeviceSize off = u.offset;
-        p_vkCmdBindVertexBuffers(cb, s, 1, &u.buffer, &off);
+        if (!(in.used >> s & 1)) continue;
+        VkDeviceSize off = in.vertex[s].offset;
+        p_vkCmdBindVertexBuffers(cb, s, 1, &in.vertex[s].buffer, &off);
     }
     {
         Upload z = upload_alloc(64, 16);
@@ -524,7 +545,6 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         VkDeviceSize off = z.offset;
         p_vkCmdBindVertexBuffers(cb, 15, 1, &z.buffer, &off);
     }
-    (void)max_vertex;
 
     VkViewport vp{0, 0, float(g_pass_extent.width), float(g_pass_extent.height), 0, 1};
     if (g_state.has_viewport)
@@ -548,24 +568,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     trace_skin(indexed, c, vs, fs);
     if (indexed) {
         uint32_t count = uint32_t(c.i[0]);
-        const uint8_t* p = guest_bytes(c.a[0]);
-        if (!p) {
-            g_stats.no_indices++;
-            return false;
-        }
-        // 8-bit indices: Metal has none, and MoltenVK converts them on the GPU at every draw (that was most of the
-        // frame's GPU time), so they are widened here.
-        Upload u;
-        VkIndexType type = vk_index_type(c.mask);
-        if (type == VK_INDEX_TYPE_UINT8_EXT) {
-            u = upload_alloc(uint64_t(count) * 2, 16);
-            auto* d = reinterpret_cast<uint16_t*>(u.ptr);
-            for (uint32_t k = 0; k < uint32_t(count); k++) d[k] = p[k];
-            type = VK_INDEX_TYPE_UINT16;
-        } else {
-            u = upload(p, uint64_t(count) * index_size(c.mask), 16);
-        }
-        p_vkCmdBindIndexBuffer(cb, u.buffer, u.offset, type);
+        p_vkCmdBindIndexBuffer(cb, in.index.buffer, in.index.offset, in.index_type);
         bool q = zero_draws_on() && zero_draws_begin(cb, vs->hash + " " + (fs ? fs->hash : std::string("-")));
         p_vkCmdDrawIndexed(cb, count, uint32_t(std::max(1, c.i[3])), 0, c.i[1], uint32_t(c.i[2]));
         if (q) zero_draws_end(cb);
@@ -610,13 +613,13 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
 
 void draw_end_submit() {  // after the submit's fence: compute results to guest memory, debug snapshots
     debug_snapshots_write();
-    for (const WriteBack& w : g_write_backs) std::memcpy(w.to, w.from, w.size);
-    g_write_backs.clear();
+    for (const WriteBack& w : draw_take_write_backs()) std::memcpy(w.to, w.from, w.size);
 }
 
 std::vector<WriteBack> draw_take_write_backs() {  // an asynchronous submit copies them when it is retired
-    std::vector<WriteBack> v;
-    v.swap(g_write_backs);
+    std::vector<WriteBack> v = written_take();  // one per written range (disjoint), then NX_COMPUTE_SEPARATE's
+    v.insert(v.end(), g_write_backs.begin(), g_write_backs.end());
+    g_write_backs.clear();
     return v;
 }
 
@@ -625,6 +628,7 @@ void draw_begin_submit() {
     clears_begin_submit();
     g_submit_ns = plat::monotonic_ns();
     dedup_reset();
+    written_reset();
     pipeline_begin_submit();
 }
 
@@ -632,6 +636,7 @@ uint64_t recorded_draws();
 
 void draw_log_stats() {
     dedup_log();
+    written_log();
     sampled_ready_log();
     clears_log();
     log("nvn passes ended: %llu submit end, %llu draw, %llu dispatch, %llu clear of other targets, %llu clear larger than "

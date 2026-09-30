@@ -587,3 +587,16 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
     - **Copies within one image.** A copy between two subresources of one image (two texture objects sharing it,
       #36) is no longer dropped; it runs in GENERAL layout with explicit barriers (`NX_COPY_NO_SAME_IMAGE=1`).
     - "Too bad!" is still drawn hollow: not a masked clear (none happened). Next suspect: the glyph pass itself.
+53. **Compute results within a submit (GLITCH-PLAN G5, `nvn_written.cpp`).**
+    - The problem:
+      - a storage buffer a dispatch writes was a private copy of guest memory, written back only after the submit;
+      - later draws and dispatches in the same submit read the old guest bytes;
+      - a second writer's write-back overwrote the first's.
+    - Now each submit keeps one copy per written guest range:
+      - writers reuse or merge copies;
+      - reads that overlap one (uniform, storage, vertex, index) bind that copy, composing on the GPU when a read
+        only partly overlaps;
+      - an indirect dispatch whose arguments were written in the submit uses `vkCmdDispatchIndirect`;
+      - each range is written back once.
+    - `NX_COMPUTE_SEPARATE=1` restores the old copies.
+    - Course: ~6,200 bindings of written copies per log period, no regression, 45.7 fps (fewer copies).
