@@ -53,15 +53,24 @@ Five read-only studies of the remaining glitches gave one plan, [docs/nvn/GLITCH
   mid-replay.
 - **Translator.** FMZ honoured on FMUL/FFMA (#49, 21 compute blocks).
 
-Course (docked 1080p, headless): 44-46 fps.
+- **The game records frame N+1 while frame N is replayed (#56, #57).** 98.5% of the texture-pool registrations
+  happen during a replay.
+  - The replay now resolves textures and pool slots as they were when its command lists ended recording.
+  - Compute write-backs copy back only the words the GPU changed.
+  - This removed the intermittent glitches: the band at the horizon, exploded meshes, a white foreground layer.
+    4 runs, 28 course frames, all clean (before: about 1 run in 3).
+
+![Course](docs/media/wonder/36-course-tree-goombas.png)
+
+Course (docked 1080p, headless): 42-47 fps.
 
 Open:
 
-- An intermittent band of stretched geometry at the course horizon, in about 1 run in 3 (#35).
-- The character-select blur and halftone: the ui2d `multi_filter` programs never run (#42).
-- "Too bad!" drawn as an outline.
-- Button glyph font (needs `master_key_16`).
-- 60 fps docked.
+- **Character-select blur (#42).** The chain runs once, and the game's own command stream clears its capture
+  (DEBUG #58). The mask and halftone dots are drawn. It needs a capture from a real console to know what is right.
+- **"Too bad!"** is an outline by design (its font is an outline face, DEBUG #56).
+- **Button glyph font.** Needs `master_key_16` from the user's console.
+- **60 fps docked.** The plan is in [docs/nvn/PERF-PLAN.md](docs/nvn/PERF-PLAN.md).
 
 ### 2026-09-30 (night): 60 fps in menus, the course at ~30 fps
 
