@@ -15,6 +15,55 @@ namespace nx::nvn::replay {
 
 using namespace nx::vk;
 
+namespace {
+
+// NX_TRACE_CUBE_DRAWS=<first frame>: the draws into cube and cube-array targets from that frame on (3000 at most),
+// what makes the light probes. A scene start writes the 6 faces of one level at once (6 colour targets). Per sampled
+// texture: `rt` GPU-written, `up` only uploaded from guest memory (GPU writes through an older object are not there),
+// `undef` never written (reads black), `SELF` an image this draw renders into (a mip chain reading the level above).
+void trace_cube_draw(const Targets& t, const ShaderInfo* vs, const ShaderInfo* fs, const TexBindings& tex_bindings,
+                     const std::vector<uint64_t>& handles) {
+    static const char* env = std::getenv("NX_TRACE_CUBE_DRAWS");
+    static const uint64_t from = env ? std::strtoull(env, nullptr, 10) : 0;
+    static int traced = 0;
+    if (!env || traced >= 3000 || g_frame < from) return;
+    GpuImage* targets[8] = {};
+    bool cube = false;
+    for (uint32_t k = 0; k < t.color_count && k < 8; k++)
+        if ((targets[k] = t.colors[k] ? image_of(t.colors[k]) : nullptr))
+            cube |= targets[k]->view_type == VK_IMAGE_VIEW_TYPE_CUBE || targets[k]->view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+    if (!cube) return;
+    traced++;
+    std::string tex;
+    for (size_t k = 0; k < tex_bindings.size(); k++) {
+        uint64_t texture = 0;
+        SamplerInfo si;
+        ViewInfo v;
+        texture_for(handles[k], texture, si, &v);
+        Texture* tx = texture ? get<Texture>(texture) : nullptr;
+        GpuImage* img = tx ? tx->image.get() : nullptr;
+        bool self = img && std::find(targets, targets + 8, img) != targets + 8;
+        char b[160];
+        std::snprintf(b, sizeof b, " t%zu=%llx:%llx(%ux%ux%u L%u target %u f%x view L%u+%u layer %u%s%s%s)", k,
+                      (unsigned long long)handles[k], (unsigned long long)texture, tx ? tx->width : 0, tx ? tx->height : 0,
+                      tx ? tx->depth : 0, tx ? tx->levels : 0, tx ? tx->target : 0, tx ? tx->format : 0, v.base_level,
+                      v.levels, v.min_layer, !img ? " no image" : img->rendered ? " rt" : img->uploaded ? " up" : "",
+                      img && img->layout == VK_IMAGE_LAYOUT_UNDEFINED ? " undef" : "", self ? " SELF" : "");
+        tex += b;
+    }
+    GpuImage* d = t.depth ? image_of(t.depth) : nullptr;
+    log("cube draw %llu frame %llu: vs %s fs %s targets %u:%llx level %u layer %u depth %llx (%ux%u)%s",
+        (unsigned long long)g_stats.done, (unsigned long long)g_frame.load(), vs->hash.c_str(), fs ? fs->hash.c_str() : "-",
+        t.color_count, (unsigned long long)t.colors[0], t.views.level[0], t.views.layer[0], (unsigned long long)t.depth,
+        d ? d->width : 0, d ? d->height : 0, tex.c_str());
+    if (const Range& u = g_state.uniforms[1][0]; u.address && u.size >= 64)  // fs c3: lod, level, probe index
+        if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
+            log("  fs c3: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", f[0], f[1], f[2], f[3], f[4], f[5],
+                f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+}
+
+}  // namespace
+
 void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, const ShaderInfo* vs,
                 const ShaderInfo* fs, const TexBindings& tex_bindings, const std::vector<uint64_t>& handles) {
     // Always: the first draws with a huge vertex or instance count (a GPU hang candidate).
@@ -23,6 +72,7 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
     if ((count > (1u << 18) || instances > 1024 || uint64_t(count) * instances > (1u << 20)) && big++ < 40)
         log("nvn: huge draw %llu: vs %s fs %s %s count %u x%u", (unsigned long long)g_stats.done, vs->hash.c_str(),
             fs ? fs->hash.c_str() : "-", indexed ? "indexed" : "arrays", count, instances);
+    trace_cube_draw(t, vs, fs, tex_bindings, handles);
     // NX_TRACE_DRAWS=<first draw>: logs 80 draws from there.
     static const char* trace_env = std::getenv("NX_TRACE_DRAWS");
     static const uint64_t trace_from = trace_env ? std::strtoull(trace_env, nullptr, 10) : 0;

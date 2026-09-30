@@ -175,8 +175,8 @@ uint64_t real_proc(CPU& c, const char* name) {
     return real;
 }
 
-std::shared_mutex& objects_lock() {
-    static std::shared_mutex m;
+ObjectsLock& objects_lock() {
+    static ObjectsLock m;
     return m;
 }
 

@@ -78,6 +78,7 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
 GpuImage* ensure_contents(VkCommandBuffer cb, uint64_t texture);
 // A single level and layer of an image, for rendering to.
 void sampled_ready_log();
+void check_linear_content(Texture& t);  // nvn_sampler.cpp
 VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer, VkFormat format = VK_FORMAT_UNDEFINED);
 // The Vulkan format of a view with NVN format `nvn` (0: the image's own) of `img`: the image's when the view's is not
 // a same-size colour format it can be viewed as.

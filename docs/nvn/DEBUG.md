@@ -436,3 +436,16 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
       - Sharing only GPU-written images was tried and dropped: the window texture creates its image before the render
         target draws into it, so the two never connected and every presented frame was the grey "never rendered"
         fill.
+45. **Cheaper replay; the course at 44-46 fps.** From the night's performance study:
+    - `get<T>` keeps a per-thread cache of its last 8 lookups per type. Any exclusive lock of the object registry
+      bumps a generation and invalidates it, so the shared lock is taken only on a miss.
+    - The pitch-linear texture content hash runs 4 lanes at once, at most once per 4 presented frames.
+    - The open pass's target images are resolved once per pass, not per sampled texture.
+    - Result: replay ~10 → ~7.9 ms per frame, the course 33 → 44-46 fps.
+    - The rest of the frame is GPU wait (~13 ms, synchronous): the next target (issue #31).
+    - Probe study (scratchpad study_black): a `cube draw` trace (`NX_TRACE_CUBE_DRAWS=<frame>`) and
+      `NX_TRACE_CUBES=<frame>` (from that frame on) for the dark Goombas.
+      - Also a rule that uses the pool copy when a slot's texture changed memory or size (`NX_SNAPSHOT_SHAPE=1`, off
+        by default).
+      - It broke the course's foreground flowers (dynamic-resolution targets are meant to be followed) and did not
+        light the Goombas.

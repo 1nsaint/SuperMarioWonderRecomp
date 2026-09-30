@@ -49,15 +49,43 @@ struct Object {
 };
 
 // Looked up for every command recorded and every draw replayed, from several threads: a hash map under a
-// reader/writer lock (lookups share it; make/destroy take it alone).
-std::shared_mutex& objects_lock();
+// reader/writer lock (lookups share it; make/destroy take it alone). Every exclusive lock bumps `generation`.
+struct ObjectsLock {
+    std::shared_mutex m;
+    std::atomic<uint64_t> generation{1};
+    void lock() { m.lock(), generation.fetch_add(1, std::memory_order_acq_rel); }
+    bool try_lock() { return m.try_lock() ? (generation.fetch_add(1, std::memory_order_acq_rel), true) : false; }
+    void unlock() { m.unlock(); }
+    void lock_shared() { m.lock_shared(); }
+    bool try_lock_shared() { return m.try_lock_shared(); }
+    void unlock_shared() { m.unlock_shared(); }
+};
+ObjectsLock& objects_lock();
 std::unordered_map<uint64_t, std::unique_ptr<Object>>& objects();
 
+// A per-thread cache of the last lookups of each type, valid until anything takes the lock alone: a recorded command
+// looks up its command buffer, a replayed draw the same texture 5-10 times, and libc++'s shared lock is a mutex and a
+// condition variable that the game threads and the replay contend on (~20% of the main thread's own CPU in the
+// course, docs/nvn/DEBUG.md #44). The generation is read before the lookup: a concurrent change invalidates it.
 template <typename T>
 T* get(uint64_t guest) {
-    std::shared_lock lk(objects_lock());
-    auto it = objects().find(guest);
-    return it == objects().end() ? nullptr : dynamic_cast<T*>(it->second.get());
+    struct Entry {
+        uint64_t guest = 0, generation = 0;
+        T* object = nullptr;
+    };
+    thread_local Entry cache[8];
+    ObjectsLock& ol = objects_lock();
+    uint64_t gen = ol.generation.load(std::memory_order_acquire);
+    Entry& e = cache[((guest >> 3) ^ (guest >> 11)) & 7];
+    if (e.generation == gen && e.guest == guest) return e.object;
+    T* p;
+    {
+        std::shared_lock lk(ol);
+        auto it = objects().find(guest);
+        p = it == objects().end() ? nullptr : dynamic_cast<T*>(it->second.get());
+    }
+    e = {guest, gen, p};
+    return p;
 }
 
 // Objects the game destroys or re-creates are freed on the replay thread between two jobs (drain_objects), never

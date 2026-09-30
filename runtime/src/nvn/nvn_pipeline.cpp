@@ -453,25 +453,6 @@ void apply_texel_writes(VkCommandBuffer cb, Texture& t, GpuImage& img) {
 
 uint64_t g_submit_serial = 0;
 
-uint64_t hash_memory(const uint8_t* p, uint64_t size) {
-    uint64_t h = 0x9E3779B97F4A7C15ull, n = size / 8;
-    const uint64_t* w = reinterpret_cast<const uint64_t*>(p);
-    for (uint64_t k = 0; k < n; k++) h = (h ^ w[k]) * 0x100000001B3ull + (h >> 29);
-    return h;
-}
-
-// A pitch-linear texture the GPU does not write: did the CPU change it since the last upload?
-void check_linear_content(Texture& t) {
-    // Every 4th submit at most: hashing Wonder's 16 MB glyph cache every frame cost ~20% of the GPU thread; a new
-    // glyph shows up to 3 frames late.
-    if (!t.stride || !t.memory || !t.image || t.image->rendered || (t.hashed_submit && t.hashed_submit + 4 > g_submit_serial))
-        return;
-    t.hashed_submit = g_submit_serial;
-    uint64_t h = hash_memory(reinterpret_cast<const uint8_t*>(t.memory), t.storage_size);
-    if (t.content_hash && h != t.content_hash) t.dirty = true;
-    t.content_hash = h;
-}
-
 void pipeline_begin_submit() { g_submit_serial++; }
 
 uint64_t g_not_ready[6];  // why sampled_ready said no: no image, dirty, texel writes, rendered, not uploaded, layout

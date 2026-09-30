@@ -46,10 +46,17 @@ void texture_for(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, ViewI
         auto it = tp->textures.find(tid);
         if (it != tp->textures.end()) texture = it->second;
         // The slot's texture gone or re-initialized as another kind: the copy made at registration (nvn_objects.cpp).
+        // NX_SNAPSHOT_SHAPE=1 also uses the copy when only the memory or size changed (the pool's descriptor copy):
+        // it broke the course's foreground flowers (dynamic-resolution targets re-initialized every frame are meant
+        // to be followed) and did not light the Goombas (docs/nvn/DEBUG.md #45).
+        static const bool kind_only = std::getenv("NX_SNAPSHOT_SHAPE") == nullptr;
         if (auto s = tp->snapshots.find(tid); texture && s != tp->snapshots.end()) {
             Texture* now = get<Texture>(texture);
             Texture* then = get<Texture>(s->second);
-            if (then && (!now || now->target != then->target || now->format != then->format)) texture = s->second;
+            bool moved = now && then && !kind_only &&
+                         (now->memory != then->memory || now->width != then->width || now->height != then->height ||
+                          now->depth != then->depth || now->levels != then->levels);
+            if (then && (!now || moved || now->target != then->target || now->format != then->format)) texture = s->second;
         }
         auto v = tp->views.find(tid);
         if (view && v != tp->views.end()) *view = v->second;
@@ -68,6 +75,7 @@ namespace {
 
 bool g_rendering = false;
 Targets g_pass;           // what the open pass renders to
+GpuImage* g_pass_images[9];  // their images (8: depth), resolved once per pass for gather_textures
 uint32_t g_pass_written = 0;
 uint64_t g_pass_ends[8];  // passes ended, by draw_end_rendering reason
 uint64_t g_submit_ns = 0;  // when the submit being replayed started
@@ -90,15 +98,19 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     for (uint32_t k = 0; k < t.color_count; k++) {
         colors[k].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
+        g_pass_images[k] = img;
         if (!img) continue;
         transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);  // rendered images stay GENERAL (sampled while rendered)
         img->rendered = true;
         uint32_t level = std::min<uint32_t>(t.views.level[k], img->levels - 1);
         colors[k].imageView = attachment_view(*img, level, t.views.layer[k], view_format(*img, t.views.format[k]));
-        static const bool trace_cubes = std::getenv("NX_TRACE_CUBES") != nullptr;  // writes into cube images
+        // NX_TRACE_CUBES=<first frame>: writes into cube images from that frame on. With 400 from the start, the log
+        // ran out at the first 3D scene (frame ~171) and never reached a course load.
+        static const char* trace_cubes = std::getenv("NX_TRACE_CUBES");
+        static const uint64_t cube_from = trace_cubes ? std::strtoull(trace_cubes, nullptr, 10) : 0;
         static int cube_logs = 0;
         if (trace_cubes && (img->view_type == VK_IMAGE_VIEW_TYPE_CUBE || img->view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) &&
-            cube_logs++ < 400)
+            g_frame >= cube_from && cube_logs++ < 2000)
             log("cubes: render into %llx level %u layer %u (%ux%u, %u levels, %u layers) view %s",
                 (unsigned long long)t.colors[k], level, t.views.layer[k], img->width, img->height, img->levels,
                 img->layers, colors[k].imageView == img->view ? "WHOLE IMAGE (fallback)" : "ok");
@@ -109,6 +121,7 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
                   std::min(extent.height, std::max(1u, img->height >> level))};
     }
     GpuImage* dimg = t.depth ? image_of(t.depth) : nullptr;
+    g_pass_images[8] = dimg;
     if (dimg && dimg->aspect != VK_IMAGE_ASPECT_COLOR_BIT) {
         transition(cb, *dimg, VK_IMAGE_LAYOUT_GENERAL);
         dimg->rendered = true;
@@ -332,9 +345,9 @@ bool gather_textures(const std::vector<const ShaderInfo*>& shaders,
         // Only when a draw of this pass wrote it (g_pass_written: bit c colour target c, bit 8 depth).
         if (texture && g_rendering) {
             GpuImage* img = image_of(texture);
-            uint32_t hit = img && g_pass.depth && image_of(g_pass.depth) == img ? 1u << 8 : 0;
+            uint32_t hit = img && g_pass.depth && g_pass_images[8] == img ? 1u << 8 : 0;
             for (uint32_t c = 0; c < g_pass.color_count && img; c++)
-                if (g_pass.colors[c] && image_of(g_pass.colors[c]) == img) hit |= 1u << c;
+                if (g_pass.colors[c] && g_pass_images[c] == img) hit |= 1u << c;
             if (hit & g_pass_written) need_break = true;
         }
     }

@@ -60,4 +60,29 @@ VkSampler sampler_for(const SamplerInfo& s, bool shadow) {
     return v;
 }
 
+// ---- pitch-linear texture contents (moved from nvn_pipeline.cpp) ------------------------------------------------
+
+// Four independent lanes: one multiply chain ran at ~1 byte per cycle (Wonder's 16 MB glyph cache: ~5 ms).
+uint64_t hash_memory(const uint8_t* p, uint64_t size) {
+    uint64_t h[4] = {0x9E3779B97F4A7C15ull, 1, 2, 3}, n = size / 32;
+    const uint64_t* w = reinterpret_cast<const uint64_t*>(p);
+    for (uint64_t k = 0; k < n; k++)
+        for (int l = 0; l < 4; l++) h[l] = (h[l] ^ w[4 * k + l]) * 0x100000001B3ull + (h[l] >> 29);
+    uint64_t r = h[0] ^ h[1] * 3 ^ h[2] * 5 ^ h[3] * 7;
+    for (uint64_t k = n * 4; k < size / 8; k++) r = (r ^ w[k]) * 0x100000001B3ull + (r >> 29);
+    return r;
+}
+
+// A pitch-linear texture the GPU does not write: did the CPU change it since the last upload?
+void check_linear_content(Texture& t) {
+    // Every 4th presented frame at most (every 4th submit was about every frame, ~1 ms); a new glyph shows 3 frames late.
+    uint64_t frame = g_frame.load(std::memory_order_relaxed) + 1;
+    if (!t.stride || !t.memory || !t.image || t.image->rendered || (t.hashed_submit && t.hashed_submit + 4 > frame))
+        return;
+    t.hashed_submit = frame;
+    uint64_t h = hash_memory(reinterpret_cast<const uint8_t*>(t.memory), t.storage_size);
+    if (t.content_hash && h != t.content_hash) t.dirty = true;
+    t.content_hash = h;
+}
+
 }  // namespace nx::nvn
