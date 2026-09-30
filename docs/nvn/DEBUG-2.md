@@ -1,6 +1,7 @@
 # Debugging the NVN → Vulkan path (continued)
 
-Continues [DEBUG.md](DEBUG.md) (entries 1-58, and the environment variable table) from entry 59. Milestone W7 on
+Continues [DEBUG.md](DEBUG.md) (entries 1-58) from entry 59. The environment variables are in
+[SWITCHES.md](SWITCHES.md). Milestone W7 on
 GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`docs/media/wonder/glitches/`) and
 60 fps.
 
@@ -144,3 +145,37 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
     - In the draw trace, the indented state lines come *before* the `draw N:` line they belong to.
     - Check: the map shows the chosen character. The course is still 60 fps, and menus and "Here we go!" are
       unchanged.
+
+## Windows (2026-09-30, the PC: RTX 3050 laptop + Intel UHD 770; WINDOWS-PLAN.md)
+
+68. **The data packs had no `spirv/results.tsv` (all storage buffers of translated shaders unbound).**
+    - `tools/pack_phone_wonder.py` packs only `*.spv`, and `pack_pc_wonder.py` reuses it. On the phone and on the
+      first PC boot the log said `no private/wonder/spirv/results.tsv: storage buffers of translated shaders cannot
+      be bound`: every compute and vertex shader that reads a storage buffer read nothing.
+    - Fix: both packers require and pack it. On the PC it was regenerated with the harness (TRANSLATOR.md, "Setup
+      (Windows)"); `shader_cache_test` checks it against every `.spv`.
+    - The Android build has the same hole: rebuild its data zip.
+
+69. **NVIDIA: the process died in the driver at the title (`c0000094`, divide by zero in `nvoglv64.dll`).**
+    - The Windows crash handler now names the module and unwinds the host stack (`host #n <module>+<offset>`;
+      `tools/symbolize.py` for the exe's own frames). The stack was `image_of` → `vkCreateImage`.
+    - Cause: an ASTC texture (NVN 0x87, ASTC 4x4 sRGB). Desktop NVIDIA GPUs have no `textureCompressionASTC_LDR`;
+      creating an image in an unsupported format is undefined behaviour, and this driver divides by zero.
+    - Wonder ships ASTC widely: the title's key art and logo (4x4) and the models' albedo maps (6x5).
+    - Fix 1 (`nvn_image.cpp` `image_supported`): every image is checked with
+      `vkGetPhysicalDeviceImageFormatProperties` first. Unsupported storage/attachment usages are dropped; an
+      unsupported format is logged once and the texture keeps no image.
+    - Fix 2: without the feature, ASTC textures are RGBA8 (sRGB or not) images, decoded on the CPU at upload by our
+      own decoder (`nvn_astc.cpp`, from the Khronos specification). `nvn/vk: ASTC decoded on the CPU: n textures,
+      MB, ms` is logged. `NX_ASTC_DECODE=1` forces it on a GPU that has ASTC (the Intel UHD 770 does: CPU and
+      hardware decoding can be compared on the same GPU).
+    - Tests: `astc_test --selftest` (void extent, reserved modes, 280,000 random blocks at all 14 footprints) and
+      `tests/astc_check.py`: 29 of the game's textures (4x4 and 6x5, 4x4 to 1920x1080) match an independent decoder
+      within 1 per channel on 100% of texels.
+    - Check: the title on the RTX 3050 has its key art and logo; against the Mac's `37-title.png` only the animated
+      parts differ (logo shine, scrolling checkers).
+
+70. **The first Vulkan device was the integrated GPU.** On the laptop the loader lists the Intel UHD 770 first.
+    `NX_GPU=discrete|integrated|<index>|<name part>` chooses (`nvn_gpu_pick.cpp`); the default is the first discrete
+    GPU. Every device and the choice are logged. `gpu_pick_test` covers the rule (it caught `NX_GPU=3050` being read
+    as an index).

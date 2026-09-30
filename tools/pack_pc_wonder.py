@@ -7,6 +7,7 @@ Extracted into the repository root on the PC, it recreates private/wonder as the
     private/wonder/analysis/{main,sdk}.bin      the modules as loaded (tools/nso2bin.py output)
     private/wonder/extract/romfs/...            the RomFS (3.5 GB)
     private/wonder/spirv/<hash>.spv             the offline shader translation
+    private/wonder/spirv/results.tsv            the harness's records (storage buffer offsets; the first PC zip lacked it)
     private/wonder/fonts/shared_5.ttf           the button glyphs
 
 The generated C++ (private/wonder/gen, 1.4 GB) is not packed: recompiling on the PC takes about 6 minutes and

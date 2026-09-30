@@ -71,12 +71,19 @@ constexpr VkFormat kAstcSrgb[] = {
     VK_FORMAT_ASTC_12x10_SRGB_BLOCK, VK_FORMAT_ASTC_12x12_SRGB_BLOCK,
 };
 
+bool g_astc_native = true;
+
 }  // namespace
+
+// Without textureCompressionASTC_LDR (NVIDIA, AMD) ASTC textures are RGBA8 images, decoded at upload (nvn_astc.cpp).
+void set_astc_native(bool native) { g_astc_native = native; }
+bool astc_native() { return g_astc_native; }
+bool is_astc(uint32_t f) { return f >= 0x79 && f <= 0x94; }
 
 VkFormat vk_format(uint32_t f) {
     if (f < sizeof kFormats / sizeof kFormats[0]) return kFormats[f].vk;
-    if (f >= 0x79 && f <= 0x86) return kAstc[f - 0x79];
-    if (f >= 0x87 && f <= 0x94) return kAstcSrgb[f - 0x87];
+    if (f >= 0x79 && f <= 0x86) return g_astc_native ? kAstc[f - 0x79] : VK_FORMAT_R8G8B8A8_UNORM;
+    if (f >= 0x87 && f <= 0x94) return g_astc_native ? kAstcSrgb[f - 0x87] : VK_FORMAT_R8G8B8A8_SRGB;
     switch (f) {
         case 0x95: return VK_FORMAT_B5G6R5_UNORM_PACK16;
         case 0x96:

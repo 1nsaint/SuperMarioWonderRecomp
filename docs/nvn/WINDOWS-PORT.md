@@ -3,7 +3,8 @@
 Branch `feat/windows-wonder`. Target: Super Mario Bros. Wonder 1.0.0 on a Windows 10/11 PC with an NVIDIA GPU. Today
 it runs on macOS (Apple M1, MoltenVK) and boots on Android (Galaxy S23). This page is written to be picked up on
 the PC with no other context: read it, then [../../README.md](../../README.md), [../NVN.md](../NVN.md),
-[DEBUG.md](DEBUG.md) and [DEBUG-2.md](DEBUG-2.md).
+[DEBUG.md](DEBUG.md) and [DEBUG-2.md](DEBUG-2.md). The order of work on the PC, the gaps found there, the test
+plan and milestone W5 (integrated GPU) are in [WINDOWS-PLAN.md](WINDOWS-PLAN.md).
 
 ## Why it is a short port
 

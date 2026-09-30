@@ -6,8 +6,10 @@
 #include <set>
 #include <vector>
 
+#include "nvn_astc.h"
 #include "nvn_pipeline.h"
 #include "nvn_tiling.h"
+#include "platform.h"
 
 namespace nx::nvn {
 
@@ -53,6 +55,35 @@ bool copies_fit(const Texture& t, const VkBufferImageCopy* r, uint32_t n, uint64
         log("nvn/vk: upload short: texture %ux%u format %#x reads %llu bytes, %llu staged: cleared instead", t.width,
             t.height, t.format, (unsigned long long)need, (unsigned long long)staged);
     return false;
+}
+
+// ASTC on a GPU without it (nvn_format.cpp): the untiled blocks of every level become RGBA8 texels, and the levels
+// are re-laid out for them (each level's layers back to back, 16-byte aligned). Logged every 500 textures: count,
+// bytes and CPU time, the cost of the decoder at load.
+void decode_astc(uint32_t format, std::vector<uint8_t>& linear, std::vector<LinearLevel>& levels, uint32_t layers,
+                 uint32_t bw, uint32_t bh) {
+    static uint64_t textures = 0, bytes = 0, ns = 0, invalid = 0;
+    const uint64_t t0 = plat::monotonic_ns();
+    const bool srgb = format >= 0x87;
+    std::vector<LinearLevel> out = levels;
+    uint64_t at = 0;
+    for (LinearLevel& l : out) {
+        l.offset = at;
+        l.layer_size = uint64_t(l.width) * l.height * 4;
+        l.width_blocks = l.width, l.height_blocks = l.height;
+        at += (l.layer_size * layers + 15) & ~15ull;
+    }
+    std::vector<uint8_t> rgba(at);
+    for (size_t k = 0; k < levels.size(); k++)
+        if (levels[k].offset + levels[k].layer_size * layers <= linear.size())
+            invalid += astc_decode_image(linear.data() + levels[k].offset, levels[k].width, levels[k].height, layers,
+                                         bw, bh, srgb, rgba.data() + out[k].offset);
+    linear.swap(rgba);
+    levels.swap(out);
+    bytes += at, ns += plat::monotonic_ns() - t0;
+    if (++textures % 500 == 1)
+        log("nvn/vk: ASTC decoded on the CPU: %llu textures, %.1f MB, %.0f ms, %llu invalid blocks",
+            (unsigned long long)textures, double(bytes) / 1e6, double(ns) / 1e6, (unsigned long long)invalid);
 }
 
 }  // namespace
@@ -116,6 +147,10 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
         p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
         return;
     }
+    if (t.stride && is_astc(t.format) && !astc_native()) {  // never seen: pitch-linear ASTC would need the decoder too
+        log("nvn/vk: pitch-linear ASTC texture %ux%u format %#x: cleared", img.width, img.height, t.format);
+        return clear_image(cb, img);
+    }
     if (t.stride) {  // pitch-linear: rows as they are
         uint64_t rows = (img.height + bh - 1) / bh;
         VkBufferImageCopy r{};
@@ -148,6 +183,10 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
         log("nvn/vk: texture %ux%u format %#x: could not untile (%llu bytes)", img.width, img.height, t.format,
             (unsigned long long)t.storage_size);
         return;
+    }
+    if (is_astc(t.format) && !astc_native()) {  // RGBA8 texels from here on
+        decode_astc(t.format, linear, levels, layers, bw, bh);
+        bw = bh = 1, bytes = host_bytes = 4;
     }
     // Widened, every offset in the linear buffer doubles (level offsets are multiples of the 4-byte texel).
     uint64_t scale = widen ? 2 : 1;

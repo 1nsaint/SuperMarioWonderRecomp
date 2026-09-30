@@ -51,6 +51,12 @@ def entries(root):
             yield os.path.join(spirv, f), "spirv/" + f
     if not n:
         sys.exit(f"no shaders in {spirv} (docs/nvn/TRANSLATOR.md)")
+    # The harness's records: the c[0] offset of every storage buffer, which the SPIR-V does not carry. Without it
+    # the runtime binds no storage buffer of any translated shader (nvn_shaders.cpp, shader_for).
+    results = os.path.join(spirv, "results.tsv")
+    if not os.path.isfile(results):
+        sys.exit(f"missing {results} (docs/nvn/TRANSLATOR.md)")
+    yield results, "spirv/results.tsv"
     font = os.path.join(root, "fonts", "shared_5.ttf")
     if os.path.isfile(font):
         yield font, "fonts/shared_5.ttf"

@@ -5,8 +5,11 @@
 // into a slot's, not waited for, nvn_frames.cpp); image layouts are tracked per image, in submission order. The image
 // behind a texture is nvn_image.cpp. On macOS this is MoltenVK: the instance enumerates portability drivers and the
 // device enables VK_KHR_portability_subset.
-#include <unistd.h>
+#if !defined(_WIN32)
+#include <unistd.h>  // _exit (stdlib.h on Windows)
+#endif
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -123,9 +126,13 @@ bool init() {
     p_enum_physical = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(gipa(g_instance, "vkEnumeratePhysicalDevices"));
     p_create_device = reinterpret_cast<PFN_vkCreateDevice>(gipa(g_instance, "vkCreateDevice"));
 
-    n = 1;
-    p_enum_physical(g_instance, &n, &g_physical);
-    if (!n || !g_physical) {
+    n = 0;
+    p_enum_physical(g_instance, &n, nullptr);
+    std::vector<VkPhysicalDevice> gpus(n);
+    p_enum_physical(g_instance, &n, gpus.data());
+    gpus.resize(n);
+    g_physical = pick_physical_device(gpus);  // NX_GPU, default: the first discrete GPU (nvn_gpu_pick.cpp)
+    if (!g_physical) {
         log("nvn/vk: no GPU");
         return false;
     }
@@ -190,6 +197,9 @@ bool init() {
     p_vkGetPhysicalDeviceFeatures2(g_physical, &features);
     g_depth_clip_control = fclip.depthClipControl;
     g_features = features.features;
+    // NX_ASTC_DECODE=1: the CPU decoder even where the GPU has ASTC (to compare the two on the same GPU).
+    set_astc_native(g_features.textureCompressionASTC_LDR && !std::getenv("NX_ASTC_DECODE"));
+    log("nvn/vk: ASTC %s", astc_native() ? "native" : "decoded to RGBA8 at upload (no textureCompressionASTC_LDR)");
     log("nvn/vk: depthClamp %u, depthBiasClamp %u, depthBounds %u, depth clip control %u (extension %u)",
         g_features.depthClamp, g_features.depthBiasClamp, g_features.depthBounds, g_depth_clip_control,
         has_extension(dext, "VK_EXT_depth_clip_control") ? 1u : 0u);

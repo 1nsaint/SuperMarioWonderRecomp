@@ -37,6 +37,8 @@ bool vk_depth_clip_control();
 // The core features the device was created with (all the GPU has): depthClamp, depthBiasClamp, depthBounds, ...
 const VkPhysicalDeviceFeatures& vk_features();
 VkPhysicalDevice vk_physical();
+// nvn_gpu_pick.cpp: logs every device and returns the one NX_GPU asks for (default: the first discrete GPU).
+VkPhysicalDevice pick_physical_device(const std::vector<VkPhysicalDevice>& devices);
 uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want);
 
 // The image behind an NVN texture (guest NVNtexture*), made on first use.

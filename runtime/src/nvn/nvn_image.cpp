@@ -20,6 +20,45 @@ bool check(VkResult r, const char* what) {  // as nvn_vk.cpp's
     return false;
 }
 
+// Whether the device can make this image. An unsupported format or usage is undefined behaviour in vkCreateImage:
+// NVIDIA's driver divided by zero on one (WINDOWS-PLAN.md). Usages the device refuses (storage, attachment) are
+// dropped first; a format it cannot make at all is logged once and the texture gets no image (the dummy).
+bool image_supported(VkImageCreateInfo& ci, uint32_t nvn_format) {
+    auto ok = [&] {
+        VkImageFormatProperties p{};
+        return p_vkGetPhysicalDeviceImageFormatProperties(vk_physical(), ci.format, ci.imageType, ci.tiling, ci.usage,
+                                                          ci.flags, &p) == VK_SUCCESS &&
+               ci.mipLevels <= p.maxMipLevels && ci.arrayLayers <= p.maxArrayLayers &&
+               ci.extent.width <= p.maxExtent.width && ci.extent.height <= p.maxExtent.height &&
+               ci.extent.depth <= p.maxExtent.depth;
+    };
+    if (ok()) return true;
+    static std::map<std::pair<uint32_t, uint32_t>, bool> logged;
+    const VkImageUsageFlags wanted = ci.usage;
+    for (VkImageUsageFlags drop : {VkImageUsageFlags(VK_IMAGE_USAGE_STORAGE_BIT),
+                                   VkImageUsageFlags(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)}) {
+        ci.usage = wanted & ~drop;
+        if (ok()) {
+            if (!logged[{nvn_format, ci.usage}]) {
+                logged[{nvn_format, ci.usage}] = true;
+                log("nvn/vk: format %#x (Vulkan %d): usage %#x not supported, made with %#x", nvn_format,
+                    int(ci.format), wanted, ci.usage);
+            }
+            return true;
+        }
+    }
+    ci.usage = wanted;
+    if (!logged[{nvn_format, 0}]) {
+        logged[{nvn_format, 0}] = true;
+        log("nvn/vk: format %#x (Vulkan %d) %ux%ux%u, %u levels, %u layers, type %d, flags %#x: not supported by this "
+            "GPU, texture left without an image",
+            nvn_format, int(ci.format), ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
+            ci.arrayLayers, int(ci.imageType), ci.flags);
+    }
+    return false;
+}
+
 }  // namespace
 
 // The VkImage behind an NVN texture, made on first use. NVN texture targets (GL order): 0 1D, 1 2D, 2 3D, 3 1D array,
@@ -128,6 +167,7 @@ GpuImage* image_of(uint64_t guest) {
         if (img->storage) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     }
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!image_supported(ci, t->format)) return nullptr;
     if (!check(p_vkCreateImage(vk_device(), &ci, nullptr, &img->image), "vkCreateImage")) return nullptr;
     VkMemoryRequirements req{};
     p_vkGetImageMemoryRequirements(vk_device(), img->image, &req);

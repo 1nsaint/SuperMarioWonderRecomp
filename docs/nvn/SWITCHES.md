@@ -1,0 +1,62 @@
+# Runtime switches (environment variables)
+
+Every switch below works on the normal build, no rebuild needed. Moved here from [DEBUG.md](DEBUG.md) (700-line
+rule); the bugs each one helped find are in DEBUG.md and [DEBUG-2.md](DEBUG-2.md). Player-facing ones are also in the
+README.
+
+| Variable | What it does | Code |
+|---|---|---|
+| `NX_LOG=<file>` | runtime log (use `private/wonder/nx.log`) | runtime |
+| `NX_DUMP_FRAMES=N` | every Nth presented window texture → `private/wonder/frames/NNNNN.ppm` | nvn_vk.cpp |
+| `NX_DUMP_TEXTURES=<hex>,<hex>` | at the same frames, those `NVNtexture*` are read back too → `NNNNN_<texture>.ppm` (blitted to RGBA8) | nvn_debug.cpp |
+| `NX_DUMP_RAW=1` | with the above: texels as stored → `.raw` (u32 width, height, VkFormat, then 4-byte texels) | nvn_debug.cpp |
+| `NX_DUMP_ON_TARGET=<hex>` | dump `NX_DUMP_TEXTURES` right after the submit that draws into that texture (every `NX_DUMP_FRAMES`-th such draw), before later frames overwrite them | nvn_draw.cpp, nvn_vk.cpp |
+| `NX_TRACE_DRAWS=<first>` | logs 80 replayed draws from draw number `<first>`: shaders, targets, textures (handle:texture, size, format, `rt` = GPU-written), fragment `c3` contents, blend/mask/logic op, viewport/scissor/cull, depth | nvn_draw.cpp |
+| `NX_TRACE_TARGET=<hex>` | with `NX_TRACE_DRAWS`: only draws into that color target | nvn_draw.cpp |
+| `NX_TRACE_TEXTURES=1` | every `nvnTextureInitialize`: target, format, size, levels, flags, storage size, block height, swizzle | nvn_objects.cpp |
+| `NX_NVN_LISTS=1` | per ended command list (a window of 200): commands, draws, calls, the caller; per submit (5 frames): handles | nvn_cmd.cpp, nvn_queue.cpp |
+| `NX_NVN_STATES=1` | decoded state objects and samplers as they are bound | nvn_state.cpp, nvn_sampler.cpp |
+| `NX_DUMP_SHADER_MISSES=1` | writes shader blocks that have no SPIR-V yet (to translate offline) | nvn_shaders.cpp |
+| `NX_NVN_REAL=1` | records every proc's real driver address in `nvn_trace.txt` | nvn_trace.cpp |
+| `NX_TRACE_SKIN=1` | the first draws of every vertex shader with an integer vertex input (skinned models): input formats and streams, vertex uniform blocks, the first vertices' bone indices and the bone rows of c8 they select | nvn_draw_trace.cpp |
+| `NX_TRACE_SKINLISTS=1` | follows command lists that bind skinned programs: recorded (handle, command buffer), called, replayed; dumps the first ones' commands (`P<vs>` binds, `*` skinned, `D` draws, `C<handle>(cmds/draws/programs)` calls, `GONE` for a handle already dropped) | nvn_cmd.cpp |
+| `NX_INT_ATTRIBS=0` | turns off the integer vertex input patch (on by default since #26) | nvn_pipeline.cpp |
+| `NX_ZERO_DRAWS=1` | every draw inside an occlusion query; every 300 frames lists the `vs fs` shader pairs whose draws never passed a single sample (what the scene draws but we lose) | nvn_debug.cpp |
+| `NX_GPU_PROFILE=1` | GPU time per render pass (timestamps at pass starts), top 10 labels every 60 frames: `ms/frame WxH L<level> fs <hash>` | nvn_debug.cpp |
+| `NX_SKIP_FS=<hash>,<hash>` | drops draws with those fragment shaders (measure what they cost, or hide a broken one) | nvn_draw.cpp |
+| `NX_INPUT_SCRIPT="<s>:<button>:<hold s>;..."` | presses buttons at times after the first pad read (A B X Y L R ZL ZR PLUS MINUS LEFT RIGHT UP DOWN; directions also push the stick) | input_script.cpp |
+| `NX_INPUT="<frame>:<button>,..."` | older, per presented frame, 8-frame presses | hle_hid.cpp |
+| `NX_TRACE_FS=1` | every file the game opens or looks for; also counts reads of streamed audio (`.bwav`) | hle_fs.cpp |
+| `NX_HEADLESS=1` | no visible window, nothing presented; frames still render and dump (unattended runs) | platform_mac.cpp, nvn_vk.cpp |
+| `NX_MEM_LIMIT_GB=<n>` | the memory guard ends the process past this footprint (default 8); `memory:` lines every 30 s | memguard_mac.cpp |
+| `NX_THREAD_DUMP_AT=<s>` | once, every guest thread's call chain (frame-pointer walk) | kernel.cpp |
+| `NX_TRACE_FS_HASH=<hash>` | with `NX_TRACE_DRAWS`: only draws with that fragment shader | nvn_draw.cpp |
+| `NX_TRACE_COUNT=<n>` | how many draws `NX_TRACE_DRAWS` logs (default 80) | nvn_draw.cpp |
+| `NX_TRACE_GLYPHS=1` | with the draw trace: the first glyph records of text draws, the atlas memory at their UVs, the sampler | nvn_draw.cpp |
+| `NX_SWAP_FS=<from>:<to>` | draws with fragment shader `<from>` use `<to>` (already loaded): shows what a draw covers | nvn_draw.cpp |
+| `NX_SNAP_DRAWS=<n>,<n>` | mid-frame snapshots: colour target 0 right after those draws → `frames/00000_<draw hex>.ppm` (use `seq -f %.0f`: macOS `seq` prints big numbers in scientific notation) | nvn_debug.cpp |
+| `NX_SNAP_FS=<hash>,...[@<draw>]` | snapshots after draws with those fragment shaders (8 at most), from draw `<draw>` on | nvn_draw.cpp |
+| `NX_SNAP_FS_BEFORE=<hash>[@<draw>]` | snapshot of colour target 0 *before* such a draw (what a feedback pass like a tonemap reads) | nvn_draw.cpp |
+| `NX_TRACE_VS_BLOCKS=1` | with the draw trace: the vertex stage's uniform blocks (camera block rows, c4..c6) | nvn_draw.cpp |
+| `NX_TRACE_UPLOADS=1` | uploads of big textures, with how much of their memory is non-zero | nvn_pipeline.cpp |
+
+Always on: every 60 presents `nvn/vk: per frame over 60: submits, replay ms (host), GPU wait ms, present wait ms,
+upload MB`.
+
+Clear colors are logged under `NX_TRACE_DRAWS` too (`clear <texture> (WxH) to r g b a`, each pair once).
+
+Reading dumps: `.ppm` opens in Preview. `.raw` of `VK_FORMAT_B10G11R11_UFLOAT_PACK32` (122): bits 0-10 R and 11-21 G
+(5-bit exponent, 6-bit mantissa), 22-31 B (5/5); exponent 31 is Inf/NaN. A 20-line numpy script decodes it.
+
+Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the translated GLSL; the hash is what
+`NX_TRACE_DRAWS` prints. `private/wonder/spirv/results.tsv` has each shader's resources.
+
+## Windows (docs/nvn/WINDOWS-PLAN.md)
+
+| Variable | What it does | Code |
+|---|---|---|
+| `NX_GPU=discrete\|integrated\|<index>\|<name part>` | the Vulkan device to run on; default the first discrete GPU. Every device is logged (`nvn/vk: GPU n: ...`), then the choice | nvn_gpu_pick.cpp |
+| `NX_MUTE=1` | no sound device (also implied by `NX_HEADLESS`) | platform_win.cpp, platform_mac.cpp |
+| `NX_FULLSCREEN=1` | start fullscreen (F11 / Alt+Enter toggle) | platform_win.cpp |
+| `NX_HANDHELD=1` | handheld mode: the game renders for 1280x720 | svc_am.cpp |
+| `NX_ASTC_DECODE=1` | ASTC decoded on the CPU even where the GPU has it (compare with the hardware decoder; DEBUG-2 #69) | nvn_vk.cpp, nvn_upload.cpp |

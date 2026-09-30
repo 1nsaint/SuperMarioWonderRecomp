@@ -87,7 +87,7 @@ Useful switches:
 | `NX_HANDHELD=1` | handheld mode, 720p |
 | `NX_PIPELINED=0` | waits for every submit, as before 60 fps (diagnosis) |
 
-Every debug switch (draw traces, snapshots, bisecting toggles) is listed in [docs/nvn/DEBUG.md](docs/nvn/DEBUG.md).
+Every debug switch (draw traces, snapshots, bisecting toggles) is listed in [docs/nvn/SWITCHES.md](docs/nvn/SWITCHES.md).
 
 ### How it works, and where it is written down
 
