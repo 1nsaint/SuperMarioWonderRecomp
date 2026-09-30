@@ -76,6 +76,7 @@ struct PipelineKey {
 VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout);
 bool depth_remap();  // NX_CLIP_Z_PATCH: clip z -w..w mapped in the vertex shaders, not by VK_EXT_depth_clip_control
 bool patch_clip_z(const std::vector<uint32_t>& in, std::vector<uint32_t>& out);  // nvn_spirv_clip.cpp
+void clip_z_module(const ShaderInfo* s, std::vector<uint32_t>& code);             // patch_clip_z if depth_remap
 
 // Integer vertex inputs (nvn_spirv_patch.cpp): the kind of an NVN attribute format (0 float, 1 unsigned bits,
 // 2 signed bits), and a copy of a module with those locations declared as integers and bitcast to float on load.

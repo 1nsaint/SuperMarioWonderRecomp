@@ -58,13 +58,7 @@ VkShaderModule module_of(const ShaderInfo* s, const uint8_t* kinds = nullptr, ui
         bool is_patched = false;
         const uint8_t* int_kinds = k != std::string(16, '\0') ? reinterpret_cast<const uint8_t*>(k.data()) : nullptr;
         std::vector<uint32_t> code = patched_spirv(s, int_kinds, unwritten, &is_patched);
-        if (s->stage == ShaderStage::Vertex && depth_remap()) {
-            std::vector<uint32_t> clipped;
-            if (patch_clip_z(code, clipped))
-                code.swap(clipped);
-            else
-                log("nvn/vk: shader %s: clip z not patched (no gl_Position found)", s->hash.c_str());
-        }
+        if (s->stage == ShaderStage::Vertex) clip_z_module(s, code);  // NX_CLIP_Z_PATCH (nvn_spirv_clip.cpp)
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         ci.codeSize = code.size() * 4;
         ci.pCode = code.data();
@@ -223,18 +217,6 @@ const ProgramLayout& program_layout(const std::vector<const ShaderInfo*>& stages
 }
 
 // ---- graphics pipelines ---------------------------------------------------------------------------------------------
-
-// NVN depth mode 0 puts clip-space z in -w..w. MoltenVK offers VK_EXT_depth_clip_control, but the world map's depth
-// linearization read half the distance (issue #50, DEBUG-2.md #67). NX_CLIP_Z_PATCH=1: the extension is not used and
-// the vertex shaders map z themselves (nvn_spirv_clip.cpp). (Doing it with the viewport depth range instead clipped
-// every 2D pass with z below 0: black frames.)
-bool depth_remap() {
-    static const bool on = [] {
-        const char* e = std::getenv("NX_CLIP_Z_PATCH");
-        return e && e[0] == '1';
-    }();
-    return on;
-}
 
 VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout) {
     // By the key's bytes, as before, but hashed (nvn_pipeline.h) instead of a ~700-byte std::string built and
@@ -551,11 +533,8 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
     // The swizzle belongs to the texture (its builder, or its pool view), not to the image: an image may be shared
     // with or inherited from another texture over the same memory (#36, #42), whose swizzle differs. With the
     // image's, the UI's single-channel masks lost their alpha and drew as rectangles (docs/nvn/DEBUG.md #44).
-    // A pool slot's own view comes in `view`. The swizzle a registration left on the texture (pool_swizzle) is that of
-    // whichever slot registered it last: the world map registers its player mask (RG16F: distance, strength) once
-    // with a G G G G view for another use, and the composite's slot, which has no swizzle, then read the strength as
-    // the distance: the player was always "behind the scenery", a flat silhouette (issue #50, DEBUG-2.md #67). So it
-    // only stands in when no slot view is known. NX_POOL_SWIZZLE_ANY=1: as before.
+    // The slot's own view decides: pool_swizzle is whichever slot registered the texture last (the world map's player
+    // mask read as G G G G: a flat silhouette, DEBUG-2.md #67). NX_POOL_SWIZZLE_ANY=1: as before.
     static const bool pool_any = std::getenv("NX_POOL_SWIZZLE_ANY") != nullptr;
     ViewInfo vi = view ? *view : ViewInfo{};
     if (!vi.swizzle && !img->alpha_from_r)

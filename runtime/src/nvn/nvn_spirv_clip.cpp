@@ -3,6 +3,7 @@
 // map's depth linearization read half the distance (the stored depth was clip z as is): the player composite then took
 // the player for hidden behind the scenery (a flat silhouette, issue #50). What Ryujinx does without the extension is
 // done here instead: before each return of the vertex entry point, gl_Position.z = (z + w) / 2.
+#include <cstdlib>
 #include <map>
 
 #include "nvn_pipeline.h"
@@ -109,6 +110,27 @@ bool patch_clip_z(const std::vector<uint32_t>& in, std::vector<uint32_t>& out) {
     if (!returns) return false;
     out[3] = bound;
     return true;
+}
+
+// NVN depth mode 0 puts clip-space z in -w..w. MoltenVK offers VK_EXT_depth_clip_control, but the world map's depth
+// linearization read half the distance (issue #50, DEBUG-2.md #67). NX_CLIP_Z_PATCH=1: the extension is not used and
+// the vertex shaders map z themselves (nvn_spirv_clip.cpp). (Doing it with the viewport depth range instead clipped
+// every 2D pass with z below 0: black frames.)
+bool depth_remap() {
+    static const bool on = [] {
+        const char* e = std::getenv("NX_CLIP_Z_PATCH");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
+void clip_z_module(const ShaderInfo* s, std::vector<uint32_t>& code) {
+    if (!depth_remap()) return;
+    std::vector<uint32_t> clipped;
+    if (patch_clip_z(code, clipped))
+        code.swap(clipped);
+    else
+        log("nvn/vk: shader %s: clip z not patched (no gl_Position found)", s->hash.c_str());
 }
 
 }  // namespace nx::nvn
