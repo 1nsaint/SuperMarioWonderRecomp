@@ -409,3 +409,30 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
     - The extra breaks are draws whose targets differ from the open pass: the command stream itself alternates targets
       more when the submit does not wait for the replay. Probably the game changes behaviour (its dynamic resolution or
       its pacing) when submits return at once. To study next.
+44. **Two fixes from the night's studies.**
+    - **The course's 30 fps came from macOS `sched_yield`, not from our replay.** This corrects #43.
+      - Wonder's job system yields after every job item and in its barriers (main+105930, main+111cd0). The main
+        thread and two workers run those loops together.
+      - On macOS `sched_yield` drops the caller to priority 0: measured at 20-180 us per call on the M1. The main
+        thread spent ~60% of its frame yielding.
+      - `plat::yield` now calls `thread_switch(MACH_PORT_NULL, SWITCH_OPTION_NONE, 0)` (2-4 us). `NX_YIELD=sched`
+        restores the old call.
+      - Result: in the course the main thread's frame is under 15.8 ms for ~98% of frames (it was 60-70%), the
+        governor stays at interval 1, and the course holds ~40 fps. The limit is now the render thread: replay plus
+        GPU, ~25 ms.
+    - **UI shapes drawn as rectangles** (the character select's cog badge and star highlight, a black box behind
+      "Ver." and the text shadows).
+      - Bisected with runtime-only builds of older commits (`private/wonder/bis_commit.sh`): ebe4e5f is correct,
+        c41b534 is not.
+      - Switches then isolated it: `NX_NO_IMAGE_SHARE=1 NX_IMAGE_REUSE=0` restores the cog badge. Stencil
+        (`NX_OLD_STENCIL`), clears (`NX_TRANSFER_CLEARS`), pass breaks (`NX_TARGETS_BREAK`) and upload reuse
+        (`NX_NO_DEDUP`) are not the cause.
+      - Cause: a GpuImage kept the swizzle of the texture that created it. A shared or inherited image sampled
+        through another texture (a UI mask) used the wrong channel mapping, so alpha was 1 and the mask covered its
+        whole quad.
+      - Fix:
+        - `sampled_view` uses the sampling texture's own swizzle (pool view, else builder);
+        - image sharing and reuse keys include the swizzle.
+      - Sharing only GPU-written images was tried and dropped: the window texture creates its image before the render
+        target draws into it, so the two never connected and every presented frame was the grey "never rendered"
+        fill.

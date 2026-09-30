@@ -9,6 +9,8 @@
 // Settings: NX_<KEY> environment variables, as on Windows.
 #include <dlfcn.h>
 #include <pthread.h>
+#include <cstdlib>
+#include <mach/thread_switch.h>
 #include <pthread/qos.h>
 #include <sched.h>
 #include <signal.h>
@@ -159,7 +161,20 @@ void sleep_ns(int64_t ns) {
     nanosleep(&ts, nullptr);
 }
 
-void yield() { sched_yield(); }
+// macOS sched_yield drops the caller to priority 0 for a while: measured 20-180 us per call on the M1, and Wonder's
+// job system yields after every job item and in its barriers, so the main thread spent ~60% of its frame there and
+// the game's governor fell to 30 fps (docs/nvn/DEBUG.md #44). thread_switch with no hint (2-4 us) gives the core to
+// another ready thread without that penalty. NX_YIELD=sched: the old call.
+void yield() {
+    static const bool sched = [] {
+        const char* e = std::getenv("NX_YIELD");
+        return e && std::strcmp(e, "sched") == 0;
+    }();
+    if (sched)
+        sched_yield();
+    else
+        thread_switch(MACH_PORT_NULL, SWITCH_OPTION_NONE, 0);
+}
 void set_thread_name(const char* name) { pthread_setname_np(name); }  // Darwin: the calling thread only
 
 int64_t current_thread_id() {

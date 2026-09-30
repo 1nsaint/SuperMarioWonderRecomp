@@ -5,6 +5,7 @@
 // after the submit, so every draw of the submit reads the same pre-dispatch bytes either way): a copy made once can
 // serve every later draw of the submit that binds the same bytes.
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 
@@ -30,7 +31,8 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
         std::memset(u.ptr, 0, padded);
         return u;
     }
-    auto it = g_copies.find(p);
+    static const bool off = std::getenv("NX_NO_DEDUP") != nullptr;  // bisecting: a fresh copy every time
+    auto it = off ? g_copies.end() : g_copies.find(p);
     if (it != g_copies.end() && it->second.size == size && it->second.padded == padded &&
         it->second.upload.offset % align == 0) {
         g_saved += padded;

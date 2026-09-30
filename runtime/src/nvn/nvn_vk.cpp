@@ -307,10 +307,10 @@ uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
 // stale upload of guest memory: no blur behind the menus, missing UI masks (docs/nvn/DEBUG.md #36).
 struct StorageKey {
     uint64_t memory = 0;
-    uint32_t format = 0, width = 0, height = 0, depth = 0, levels = 0, target = 0, samples = 0;
+    uint32_t format = 0, width = 0, height = 0, depth = 0, levels = 0, target = 0, samples = 0, swizzle = 0;
     bool operator<(const StorageKey& o) const {
-        return std::tie(memory, format, width, height, depth, levels, target, samples) <
-               std::tie(o.memory, o.format, o.width, o.height, o.depth, o.levels, o.target, o.samples);
+        return std::tie(memory, format, width, height, depth, levels, target, samples, swizzle) <
+               std::tie(o.memory, o.format, o.width, o.height, o.depth, o.levels, o.target, o.samples, o.swizzle);
     }
 };
 std::map<StorageKey, std::weak_ptr<GpuImage>> g_live_images;
@@ -319,7 +319,9 @@ GpuImage* image_of(uint64_t guest) {
     Texture* t = get<Texture>(guest);
     if (!t) return nullptr;
     if (t->image) return t->image.get();
-    StorageKey key{t->memory, t->format, t->width, t->height, t->depth, t->levels, t->target, t->samples};
+    uint32_t swizzle = uint32_t(t->swizzle[0]) | uint32_t(t->swizzle[1]) << 8 | uint32_t(t->swizzle[2]) << 16 |
+                  uint32_t(t->swizzle[3]) << 24;
+    StorageKey key{t->memory, t->format, t->width, t->height, t->depth, t->levels, t->target, t->samples, swizzle};
     static const bool share = std::getenv("NX_NO_IMAGE_SHARE") == nullptr;  // bisecting
     if (share && t->memory && t->pool_swizzle == 0)
         if (auto it = g_live_images.find(key); it != g_live_images.end())

@@ -550,7 +550,18 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
     }
     *layout = img->rendered ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     transition(cb, *img, *layout);
-    VkImageView v = view_of(*img, view_type(shape), view ? *view : ViewInfo{});
+    // The swizzle belongs to the texture (its builder, or its pool view), not to the image: an image may be shared
+    // with or inherited from another texture over the same memory (#36, #42), whose swizzle differs. With the
+    // image's, the UI's single-channel masks lost their alpha and drew as rectangles (docs/nvn/DEBUG.md #44).
+    ViewInfo vi = view ? *view : ViewInfo{};
+    if (!vi.swizzle && !img->alpha_from_r)
+        if (Texture* t = get<Texture>(texture)) {
+            uint32_t s = t->pool_swizzle.load();
+            if (!s)
+                for (int k = 0; k < 4; k++) s |= uint32_t(std::min<uint8_t>(t->swizzle[k], 5)) << (8 * k);
+            vi.swizzle = s;
+        }
+    VkImageView v = view_of(*img, view_type(shape), vi);
     if (!v) {
         *layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         if (++incompatible % 1000 == 1)
