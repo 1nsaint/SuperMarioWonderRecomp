@@ -432,6 +432,7 @@ void apply_texel_writes(VkCommandBuffer cb, Texture& t, GpuImage& img) {
         writes.swap(t.writes);
     }
     if (writes.empty()) return;
+    img.texels = true;
     VkImageLayout back = img.layout;
     transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     bool is3d = img.view_type == VK_IMAGE_VIEW_TYPE_3D;
@@ -506,7 +507,8 @@ GpuImage* ensure_contents(VkCommandBuffer cb, uint64_t texture) {
     GpuImage* img = t ? image_of(texture) : nullptr;
     if (!img) return nullptr;
     bool dirty = t->dirty.exchange(false);
-    if (!img->rendered && (!img->uploaded || dirty)) upload_texture(cb, *t, *img);
+    static const bool reupload = std::getenv("NX_TEXELS_REUPLOAD") != nullptr;  // bisecting: the old way
+    if (!img->rendered && (!img->uploaded || (dirty && (!img->texels || reupload)))) upload_texture(cb, *t, *img);
     apply_texel_writes(cb, *t, *img);
     if (img->layout == VK_IMAGE_LAYOUT_UNDEFINED) {  // never written: black, not garbage
         transition(cb, *img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);

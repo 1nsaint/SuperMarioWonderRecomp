@@ -515,3 +515,39 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
     - Docked stays the default (the Switch's docked picture).
     - Async GPU (`NX_ASYNC_GPU=2` + `MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0`) was retested: menus hold 60, but the
       loads became slow enough that the input script never reached the course. It stays off.
+49. **WriteTexels images keep their texels; FMZ in the translator.**
+    - An image given texels by `nvnTextureWriteTexels` is not uploaded again from guest memory when a pool flush
+      marks it dirty. Those texels never reach guest memory here, so the re-upload wiped them.
+      `NX_TEXELS_REUPLOAD=1` restores the old behaviour.
+    - `tools/maxwell/spirv_harness/translator/spirv-fmz.patch`:
+      - Ryujinx decodes Maxwell's FMZ mode on FMUL/FFMA and ignores it. The patch makes a zero factor give 0 (FFMA:
+        c) even against Inf/NaN.
+      - A full batch changes 21 blocks, all compute (particle effects).
+      - No visible change in the course; kept for correctness.
+    - Debug tools:
+      - `NX_DUMP_ON_FS=<fs,...>` (`NX_DUMP_FROM`, `NX_DUMP_ANY`, `NX_DUMP_TARGET_EVERY`): reads back a draw's
+        target and inputs at the submit's end.
+      - `NX_SNAP_FOLLOW=<fs>@<draw>|@f<frame>` (`NX_SNAP_FOLLOW_COUNT`, `NX_SNAP_FOLLOW_NOSNAP`): logs and
+        snapshots the draws of a pass one by one.
+50. **Sampler state was lost (the biggest remaining glitch source; docs/nvn/GLITCH-PLAN.md G1).**
+    - Commit c41b534 split `nvn_sampler.cpp` and overwrote the file that held the sampler objects:
+      - `nvnSamplerInitialize` / `Finalize`;
+      - `nvnSamplerPoolRegisterSampler` / `RegisterSamplerBuilder`;
+      - the `nvnSamplerGet*` getters.
+    - They fell back to trace stubs, so every texture sampled with `SamplerInfo{}`:
+      - nearest filtering;
+      - clamp to edge;
+      - mip 0 only;
+      - shadow compare ALWAYS.
+    - Restored as `nvn_sampler_objects.cpp`. Result:
+      - **The dark Goombas, tree and characters (#26, #39, #42) are lit.** Their shaders read the SSAO target with
+        `textureLod(ao, uv, 1.0)`. The game renders AO only into level 1, so mip 0 (never written) made AO 0 and
+        the lighting fell to its floor.
+      - Smooth sky (#28).
+      - The world map's repeating textures are back (grass, flower beds, water).
+    - The #49 rule that let only render targets (flags 0x8) reuse destroyed images is reverted: the AO targets have
+      flags 0 and depend on reuse (#42).
+    - A duplicated `nvn_sampler.cpp` line in CMakeLists.txt is removed.
+
+![Course](../media/wonder/33-course-samplers-restored-goombas-lit.png)
+![World map](../media/wonder/34-world-map-samplers-restored.png)

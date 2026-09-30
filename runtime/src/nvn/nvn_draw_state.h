@@ -54,6 +54,8 @@ uint32_t handle_texture(uint64_t handle, uint32_t* sampler);
 // The texture and sampler a handle names in the bound pools.
 void texture_for(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, ViewInfo* view = nullptr);
 
+// NX_SNAP_FOLLOW (nvn_draw_trace.cpp): log and snapshot this draw.
+bool snap_follow(const Targets& t, const ShaderInfo* vs, const ShaderInfo* fs, const std::vector<uint64_t>& handles);
 using TexBindings = std::vector<std::pair<const ShaderInfo*, const DescriptorBinding*>>;
 // NX_TRACE_DRAWS & co (docs/nvn/DEBUG.md): logs a replayed draw with its state, when the switches select it.
 void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, const ShaderInfo* vs,

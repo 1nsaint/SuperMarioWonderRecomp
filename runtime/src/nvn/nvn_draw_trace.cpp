@@ -56,12 +56,18 @@ void trace_cube_draw(const Targets& t, const ShaderInfo* vs, const ShaderInfo* f
         (unsigned long long)g_stats.done, (unsigned long long)g_frame.load(), vs->hash.c_str(), fs ? fs->hash.c_str() : "-",
         t.color_count, (unsigned long long)t.colors[0], t.views.level[0], t.views.layer[0], (unsigned long long)t.depth,
         d ? d->width : 0, d ? d->height : 0, tex.c_str());
-    for (int bank : {4, 5})  // the probe shaders' colours (c5[16], c5[17]) and axes (c4[1])
-        if (const Range& u = g_state.uniforms[1][bank - 3]; u.address && u.size >= 288)
-            if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
-                log("  fs c%d (%llx, %llu bytes): [1] %g %g %g %g [16] %g %g %g %g [17] %g %g %g %g", bank,
-                    (unsigned long long)u.address, (unsigned long long)u.size, f[4], f[5], f[6], f[7], f[64], f[65],
-                    f[66], f[67], f[68], f[69], f[70], f[71]);
+    for (int bank : {4, 5}) {  // the probe shaders' axes (c4[1..3]), colours (c5[16..21]) and LUT rows (c5[8..10])
+        const Range& u = g_state.uniforms[1][bank - 3];
+        const float* f = u.address ? reinterpret_cast<const float*>(guest_bytes(u.address)) : nullptr;
+        std::string rows;
+        for (int r : {0, 1, 2, 3, 8, 16, 17, 18, 19})
+            if (f && uint64_t(r) * 16 + 16 <= u.size) {
+                char b[96];
+                std::snprintf(b, sizeof b, " [%d] %g %g %g %g", r, f[4 * r], f[4 * r + 1], f[4 * r + 2], f[4 * r + 3]);
+                rows += b;
+            }
+        log("  fs c%d (%llx, %llu bytes):%s", bank, (unsigned long long)u.address, (unsigned long long)u.size, rows.c_str());
+    }
     if (const Range& u = g_state.uniforms[1][0]; u.address && u.size >= 64)  // fs c3: lod, level, probe index
         if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
             log("  fs c3: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", f[0], f[1], f[2], f[3], f[4], f[5],
@@ -69,6 +75,39 @@ void trace_cube_draw(const Targets& t, const ShaderInfo* vs, const ShaderInfo* f
 }
 
 }  // namespace
+
+// NX_SNAP_FOLLOW=<fs hash>@<first draw>: from the first draw with that fragment shader, the next 48 draws into its
+// colour target 0 are logged (shaders, textures) and snapshotted after (frames/00000_<draw>.ppm): which draw of a
+// pass paints what.
+bool snap_follow(const Targets& t, const ShaderInfo* vs, const ShaderInfo* fs, const std::vector<uint64_t>& handles) {
+    static const std::string env = std::getenv("NX_SNAP_FOLLOW") ? std::getenv("NX_SNAP_FOLLOW") : "";
+    static const uint64_t from = env.find('@') != std::string::npos ? std::strtoull(env.c_str() + env.find('@') + 1, nullptr, 10) : 0;
+    static uint64_t target = 0;
+    static int left = 0;
+    if (env.empty() || !t.color_count) return false;
+    static const int count = std::getenv("NX_SNAP_FOLLOW_COUNT") ? std::atoi(std::getenv("NX_SNAP_FOLLOW_COUNT")) : 48;
+    static const bool by_frame = env.find("@f") != std::string::npos;  // <hash>@f<presented frame>
+    static const uint64_t frame_from = by_frame ? std::strtoull(env.c_str() + env.find("@f") + 2, nullptr, 10) : 0;
+    bool started = by_frame ? g_frame >= frame_from : g_stats.done >= from;
+    if (!target && fs && started && env.compare(0, 16, fs->hash) == 0) target = t.colors[0], left = count;
+    if (!target || t.colors[0] != target || left <= 0) return false;
+    left--;
+    std::string tex;
+    for (size_t k = 0; k < handles.size(); k++) {
+        uint64_t texture = 0;
+        SamplerInfo si;
+        texture_for(handles[k], texture, si);
+        Texture* tx = texture ? get<Texture>(texture) : nullptr;
+        char b[96];
+        std::snprintf(b, sizeof b, " t%zu=%llx(%ux%u f%x%s)", k, (unsigned long long)texture, tx ? tx->width : 0,
+                      tx ? tx->height : 0, tx ? tx->format : 0, tx && tx->image && tx->image->rendered ? " rt" : "");
+        tex += b;
+    }
+    log("follow: draw %llu vs %s fs %s%s", (unsigned long long)g_stats.done, vs->hash.c_str(), fs ? fs->hash.c_str() : "-",
+        tex.c_str());
+    static const bool nosnap = std::getenv("NX_SNAP_FOLLOW_NOSNAP") != nullptr;  // log only (8 MB per snapshot)
+    return !nosnap;
+}
 
 void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, const ShaderInfo* vs,
                 const ShaderInfo* fs, const TexBindings& tex_bindings, const std::vector<uint64_t>& handles) {

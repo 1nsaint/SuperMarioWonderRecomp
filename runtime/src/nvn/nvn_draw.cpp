@@ -576,7 +576,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                       ((fs && snap_fs.find(fs->hash) != std::string::npos) ||
                        snap_fs.find(vs->hash) != std::string::npos) &&
                       ++snap_count;  // the vertex shader's hash matches too
-    if ((snap_by_fs || debug_snap_wanted(g_stats.done)) && t.color_count && t.colors[0])
+    if ((snap_by_fs || snap_follow(t, vs, fs, handles) || debug_snap_wanted(g_stats.done)) && t.color_count && t.colors[0])
         if (GpuImage* snap = image_of(t.colors[0])) draw_end_rendering(cb, 6), debug_snapshot(cb, *snap, g_stats.done);
     // NX_DUMP_ON_TARGET=<hex NVNtexture*>: every NX_DUMP_FRAMES-th draw into it asks for NX_DUMP_TEXTURES to be read
     // back right after this submit (before later frames change them).
@@ -587,7 +587,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     static const std::string dump_fs = [] { const char* e = std::getenv("NX_DUMP_ON_FS"); return std::string(e ? e : ""); }();
     static const uint64_t dump_from = [] { const char* e = std::getenv("NX_DUMP_FROM"); return e ? std::strtoull(e, nullptr, 10) : 0; }();
     if (!dump_fs.empty() && fs && g_frame >= dump_from && dump_fs.find(fs->hash) != std::string::npos && g_dump_draws < 400 &&
-        t.colors[0] && image_of(t.colors[0]) && (image_of(t.colors[0])->view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
+        t.colors[0] && image_of(t.colors[0]) && (std::getenv("NX_DUMP_ANY") || image_of(t.colors[0])->view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
                                                            image_of(t.colors[0])->view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)) {
         debug_dump_add(t.colors[0]);
         for (const ResolvedTexture& r : g_resolved) debug_dump_add(r.texture);

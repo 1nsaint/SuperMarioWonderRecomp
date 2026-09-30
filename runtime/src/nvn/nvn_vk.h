@@ -21,6 +21,9 @@ struct GpuImage {
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     bool rendered = false;  // written by the GPU: never re-uploaded from guest memory
     bool uploaded = false;  // filled from the texture's pool memory
+    // Given texels by nvnTextureWriteTexels: those never reach guest memory here, so it is not uploaded from there
+    // again (a pool flush over it wiped the light probes' direction map, docs/nvn/DEBUG.md #49).
+    bool texels = false;
     VkComponentMapping swizzle{};  // for sampling (attachment views stay identity)
     bool storage = false;          // created with VK_IMAGE_USAGE_STORAGE_BIT (compute shaders write it)
     // An R8 texture always read as (1, 1, 1, R) (a glyph cache): stored as RGBA8 (255, 255, 255, R) and sampled
