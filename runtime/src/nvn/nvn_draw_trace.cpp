@@ -174,11 +174,11 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
     static const char* target_env = std::getenv("NX_TRACE_TARGET");
     static const uint64_t trace_target = target_env ? std::strtoull(target_env, nullptr, 16) : 0;
     static uint64_t traced = 0;
-    // NX_TRACE_FS_HASH=<hash>: only draws with that fragment shader.
+    // NX_TRACE_FS_HASH=<hash>[,<hash>...]: only draws with those fragment shaders.
     static const char* fs_env = std::getenv("NX_TRACE_FS_HASH");
     static const uint64_t trace_count = std::getenv("NX_TRACE_COUNT") ? std::strtoull(std::getenv("NX_TRACE_COUNT"), nullptr, 10) : 80;
     if (trace_env && g_stats.done >= trace_from && traced < trace_count && (!trace_target || t.colors[0] == trace_target) &&
-        (!fs_env || (fs && fs->hash == fs_env))) {
+        (!fs_env || (fs && std::strstr(fs_env, fs->hash.c_str())))) {  // one hash or a comma list
         traced++;
         std::string tex;
         for (size_t k = 0; k < tex_bindings.size(); k++) {
