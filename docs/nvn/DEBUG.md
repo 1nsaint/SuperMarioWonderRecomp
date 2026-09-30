@@ -600,3 +600,21 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
       - each range is written back once.
     - `NX_COMPUTE_SEPARATE=1` restores the old copies.
     - Course: ~6,200 bindings of written copies per log period, no regression, 45.7 fps (fewer copies).
+54. **NaN semantics, fast math, and the intermittent band (GLITCH-PLAN G9, G3).**
+    - **NaN translator patch** (`translator/spirv-nan.patch`, not in the build):
+      - What it does: float Clamp/Min/Max emitted as GLSL.std.450 NClamp/NMin/NMax, Maxwell's NaN-dropping `.SAT`
+        and FMNMX.
+      - Batch: changes 10,304 of 12,717 blocks, all valid.
+      - Course run: horizontal streaks along the horizon, a black and white patch near the ground, replay 7.8 →
+        11 ms (new Metal compiles).
+      - The same streaks then appeared with the old shaders too, so the patch is not proven to cause them. It is
+        kept out anyway: no visible gain.
+    - **`MVK_CONFIG_FAST_MATH_ENABLED=0`:** no visual change, course 39.8 fps (against 44-46). It stays on.
+    - **The horizon band.**
+      - Rows of garbage across the course's background layer appear in about every other 290 s run.
+      - `NX_ALIAS_MAGENTA=1` showed no fresh render target being sampled.
+      - Serializing texture re-initialization with the replay (`NX_REINIT_WAITS_REPLAY=1`, experiment): no band in
+        the run that played, but another run hung at boot, and the course ran at 32 fps. It stays opt-in.
+      - The race it points at: other game threads re-initialize dynamic-resolution texture structs while a submit
+        is replayed, so `get<Texture>` returns the new incarnation mid-replay. It needs a proper design (per-submit
+        incarnations): in progress.

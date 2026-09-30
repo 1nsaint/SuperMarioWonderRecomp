@@ -13,6 +13,8 @@
 
 namespace nx::nvn {
 
+std::recursive_mutex& gpu_lock();  // nvn_vk.cpp
+
 // ---- GPU virtual addresses --------------------------------------------------------------------------------------
 
 namespace {
@@ -242,7 +244,15 @@ bool trace_textures() {
 uint64_t keep_for_slots(uint64_t guest);  // below, with the pool registrations
 void hand_image_to_snapshots(uint64_t guest);  // below
 
+// NX_REINIT_WAITS_REPLAY=1 (experiment): texture objects are re-initialized and finalized only between replays, never
+// while a submit is being replayed on another thread (the intermittent course band, DEBUG.md #54).
+std::unique_lock<std::recursive_mutex> reinit_guard() {
+    static const bool wait = std::getenv("NX_REINIT_WAITS_REPLAY") != nullptr;
+    return wait ? std::unique_lock<std::recursive_mutex>(gpu_lock()) : std::unique_lock<std::recursive_mutex>();
+}
+
 void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBuilder*)
+    auto guard = reinit_guard();
     uint64_t guest = c.x[0], builder = c.x[1];
     // Re-initializing a texture a pool slot still names (without finalizing it: Wonder reuses the structs of its
     // dynamic-resolution targets every frame) keeps the old one for those slots, as the pool's descriptor copy
@@ -374,6 +384,7 @@ void expire_kept() {
 }
 
 void TextureFinalize(CPU& c) {
+    auto guard = reinit_guard();
     uint64_t guest = c.x[0];
     if (trace_textures()) log("nvn: texture %llx finalized", (unsigned long long)guest);
     {
