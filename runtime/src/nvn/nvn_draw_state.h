@@ -99,6 +99,39 @@ struct DrawInputs {
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
 };
 bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in);
+
+// nvn_sets.cpp: the descriptor sets of a draw or dispatch, and the replay's CPU shortcuts (docs/nvn/PERF-PLAN.md).
+// NX_DRAW_SLOW=1 turns every shortcut off, for bisecting; letters instead of 1 pick them: m the scratch memory kept
+// from draw to draw, e empty descriptor sets not allocated, h the submit's handle cache, s state the command buffer
+// already has not set again (nvn_draw.cpp), u uploads shared (indices, zero stream, support buffer, c[0]).
+enum : uint32_t { kSlowScratch = 1, kSlowEmptySets = 2, kSlowHandles = 4, kSlowState = 8, kSlowUploads = 16 };
+bool draw_slow(uint32_t what);
+// What a texture binding of the draw being replayed samples.
+struct ResolvedTexture {
+    uint64_t texture = 0;  // guest NVNtexture*; 0: nothing behind the binding (the dummy)
+    SamplerInfo sampler;
+    ViewInfo view;
+    VkSampler vk_sampler = VK_NULL_HANDLE;  // sampler_for(sampler, shadow) when the handle cache has it
+};
+struct DrawTextures {
+    TexBindings bindings;  // the set 2 bindings of the program's stages
+    std::vector<uint64_t> handles;
+    std::vector<ResolvedTexture> resolved;
+};
+extern DrawTextures g_textures;  // filled by gather_textures, read by build_sets and the traces of the same draw
+enum : uint32_t { kNeedBreak = 1, kSampledPending = 2 };
+uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders);
+void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shaders, const ProgramLayout& layout);
+// vkUpdateDescriptorSets for what build_sets made, then the sets bound at `point`.
+void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayout& layout);
+Upload zero_stream();  // 64 zero bytes for vertex binding 15
+// draw_inputs, with 16- and 32-bit indices through dedup_upload.
+bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in);
+std::vector<WriteBack>& separate_write_backs();  // NX_COMPUTE_SEPARATE=1: a write-back per binding
+void sets_begin_submit();
+void sets_log();
+// nvn_draw.cpp: `img` is a target of the open pass that a draw or clear of the pass wrote.
+bool pass_wrote(const GpuImage* img);
 void written_cpu_write(const uint8_t* p, uint64_t size);       // replay-time guest writes (logged when they meet one)
 std::vector<WriteBack> written_take();                         // one write-back per range, at the end of the submit
 void written_reset();
