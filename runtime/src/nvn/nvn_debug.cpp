@@ -369,6 +369,7 @@ struct Snap {
     Scratch s;
     uint32_t w = 0, h = 0;
     uint64_t draw = 0;
+    uint32_t raw_format = 0;  // NX_SNAP_RAW: the texels as stored (4-byte formats), written as .raw
 };
 std::vector<Snap> g_snaps;
 
@@ -412,6 +413,21 @@ void debug_snapshot(VkCommandBuffer cb, GpuImage& img, uint64_t draw) {
     }
     VkImageLayout back = img.layout;
     transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    // NX_SNAP_RAW=1: 4-byte formats (R32F depth copies, RG16F, ...) as stored, to frames/00000_<draw>.raw (u32 width,
+    // height, VkFormat, then the texels): an RGBA8 blit rounds small floats to 0..2.
+    static const bool raw = std::getenv("NX_SNAP_RAW") != nullptr;
+    if (raw && (img.format == VK_FORMAT_R32_SFLOAT || img.format == VK_FORMAT_R16G16_SFLOAT ||
+                img.format == VK_FORMAT_R32_UINT || img.format == VK_FORMAT_R8G8B8A8_UNORM)) {
+        VkBufferImageCopy r{};
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.imageOffset = {x0, y0, 0};
+        r.imageExtent = {snap.w, snap.h, 1};
+        p_vkCmdCopyImageToBuffer(cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, snap.s.buffer, 1, &r);
+        if (back != VK_IMAGE_LAYOUT_UNDEFINED) transition(cb, img, back);
+        snap.raw_format = uint32_t(img.format);
+        g_snaps.push_back(snap);
+        return;
+    }
     GpuImage dst;
     dst.image = snap.s.image;
     dst.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -437,7 +453,20 @@ bool debug_snapshots_pending() { return !g_snaps.empty(); }
 
 void debug_snapshots_write() {  // after the submit's fence
     for (Snap& snap : g_snaps) {
-        write_ppm(snap.s, snap.w, snap.h, 0, snap.draw);  // frames/00000_<draw in hex>.ppm
+        void* p = nullptr;
+        if (snap.raw_format && p_vkMapMemory(vk_device(), snap.s.buffer_memory, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS) {
+            char name[64];
+            std::snprintf(name, sizeof name, "/frames/00000_%llx.raw", (unsigned long long)snap.draw);
+            if (FILE* f = plat::fopen_utf8(plat::data_root() + name, "wb")) {
+                uint32_t head[3] = {snap.w, snap.h, snap.raw_format};
+                std::fwrite(head, 4, 3, f);
+                std::fwrite(p, 4, size_t(snap.w) * snap.h, f);
+                std::fclose(f);
+            }
+            p_vkUnmapMemory(vk_device(), snap.s.buffer_memory);
+        } else if (!snap.raw_format) {
+            write_ppm(snap.s, snap.w, snap.h, 0, snap.draw);  // frames/00000_<draw in hex>.ppm
+        }
         snap.s.destroy(vk_device());
     }
     g_snaps.clear();

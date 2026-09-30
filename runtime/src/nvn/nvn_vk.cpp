@@ -190,8 +190,9 @@ bool init() {
     p_vkGetPhysicalDeviceFeatures2(g_physical, &features);
     g_depth_clip_control = fclip.depthClipControl;
     g_features = features.features;
-    log("nvn/vk: depthClamp %u, depthBiasClamp %u, depthBounds %u", g_features.depthClamp, g_features.depthBiasClamp,
-        g_features.depthBounds);
+    log("nvn/vk: depthClamp %u, depthBiasClamp %u, depthBounds %u, depth clip control %u (extension %u)",
+        g_features.depthClamp, g_features.depthBiasClamp, g_features.depthBounds, g_depth_clip_control,
+        has_extension(dext, "VK_EXT_depth_clip_control") ? 1u : 0u);
     log("nvn/vk: portability: format reinterpretation %u, format swizzle %u", fport.fields[2], fport.fields[3]);
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};

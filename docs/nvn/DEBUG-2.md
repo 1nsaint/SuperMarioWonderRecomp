@@ -115,3 +115,32 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
       `gpu_present` stops (`window_minimized`).
     - Next, with the window visible: `NX_GPU_PROFILE=1` in the slow stretch; `NX_PIPELINED=3`; and a check of whether
       the compositor holds the 3 swapchain images (IMMEDIATE, 2560x1440).
+
+67. **World map: the player was a flat silhouette (issue #50). A pool swizzle leaked from another slot.**
+    - The map draws the player into a target of its own. It then composites the player over the scene
+      (fs `0bebd775`) from three textures:
+      - A (RG16F): the player's distance and silhouette strength, written by fs `0030c911`;
+      - C (R32F): the scene depth made linear by fs `0aa56d1b`;
+      - P: the player colour.
+    - Where `A.x >= C.x + 1e-5`, the player is behind the scenery: dark overlay. Otherwise P is shown.
+    - Measured in one frame (new `NX_SNAP_RAW`): A.x and C match within 4e-6 at every player pixel. The shader
+      still took the "behind" branch.
+    - Cause: the game also registers A in another pool slot with a G G G G view. `TexturePoolRegister` stored that
+      swizzle on the Texture (`pool_swizzle`). `sampled_view` applied it to every slot whose own view has no swizzle,
+      the composite's included. A.x then read the strength (1.0), not the distance.
+    - Fix (`nvn_pipeline.cpp` `sampled_view`): a slot's own view decides. `pool_swizzle` stands in only when no slot
+      view is known. `NX_POOL_SWIZZLE_ANY=1`: as before.
+    - Ruled out on the way, each kept as an opt-in switch:
+      - depth invariance of GREATER (`NX_GREATER_SLACK=1`);
+      - clip-space z convention: `NX_CLIP_Z_PATCH=1` maps z in the vertex shaders (`nvn_spirv_clip.cpp`) instead of
+        using VK_EXT_depth_clip_control. It gives the same image, so MoltenVK's extension works.
+    - Kept on: a pass that samples its own depth image while neither testing nor writing depth now runs without it
+      attached (undefined on Metal). `NX_KEEP_SAMPLED_DEPTH=1`: as before.
+    - Debug tools added:
+      - `NX_SNAP_RAW=1`: 4-byte formats snapshotted as stored, to `.raw`;
+      - `NX_SNAP_FS_MAX`;
+      - `NX_TRACE_FS_HASH` takes a list;
+      - `NX_TRACE_VERTS=1`: the first vertices of stream 0.
+    - In the draw trace, the indented state lines come *before* the `draw N:` line they belong to.
+    - Check: the map shows the chosen character. The course is still 60 fps, and menus and "Here we go!" are
+      unchanged.

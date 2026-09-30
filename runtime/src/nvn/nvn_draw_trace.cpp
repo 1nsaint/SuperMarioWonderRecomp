@@ -180,6 +180,24 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
     if (trace_env && g_stats.done >= trace_from && traced < trace_count && (!trace_target || t.colors[0] == trace_target) &&
         (!fs_env || (fs && std::strstr(fs_env, fs->hash.c_str())))) {  // one hash or a comma list
         traced++;
+        // NX_TRACE_VERTS=1: the first 3 vertices of stream 0 as floats and halves (8 words each at most).
+        if (std::getenv("NX_TRACE_VERTS") && !g_state.streams.empty())
+            if (const Range& vb = g_state.vertex_buffers[0]; vb.address)
+                if (const auto* w = reinterpret_cast<const uint32_t*>(guest_bytes(vb.address))) {
+                    uint32_t stride = g_state.streams[0].stride, words = std::min<uint32_t>(stride / 4, 8);
+                    for (uint32_t v = 0; v < 3 && uint64_t(v + 1) * stride <= vb.size; v++) {
+                        std::string line;
+                        for (uint32_t k = 0; k < words; k++) {
+                            uint32_t x = w[v * stride / 4 + k];
+                            float f;
+                            std::memcpy(&f, &x, 4);
+                            char b[48];
+                            std::snprintf(b, sizeof b, " %g[%08x]", f, x);
+                            line += b;
+                        }
+                        log("  vertex %u (stride %u):%s", v, stride, line.c_str());
+                    }
+                }
         std::string tex;
         for (size_t k = 0; k < tex_bindings.size(); k++) {
             uint64_t texture = 0;

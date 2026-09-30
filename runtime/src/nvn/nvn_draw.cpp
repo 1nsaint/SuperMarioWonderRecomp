@@ -254,10 +254,31 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     }
     // Textures first: an upload or a layout change cannot happen inside the render pass.
     uint32_t gathered = gather_textures(*shaders);
+    // A pass that neither tests nor writes depth but keeps its depth image bound while sampling that same image (the
+    // world map's depth-to-colour linearization, fs 0aa56d1b): on Metal the image is then attached and read in one
+    // encoder, which is undefined, and the copy came out 0 everywhere; the composite then took the player for
+    // occluded (a flat silhouette, issue #50; DEBUG-2.md #67). The depth is unused: the pass runs without it.
+    // NX_KEEP_SAMPLED_DEPTH=1: as before.
+    Targets detached;
+    const Targets& tt = [&]() -> const Targets& {
+        static const bool keep = std::getenv("NX_KEEP_SAMPLED_DEPTH") != nullptr;
+        const DepthStencilInfo& d = g_state.depth;
+        if (keep || !t.depth || d.depth_test || d.depth_write || d.stencil_test) return t;
+        GpuImage* dimg = image_of(t.depth);
+        if (!dimg) return t;
+        for (const ResolvedTexture& r : g_textures.resolved)
+            if (r.texture && image_of(r.texture) == dimg) {
+                static uint64_t n = 0;
+                if (n++ == 0) log("nvn: a pass samples its own unused depth image: drawn without it (#50)");
+                detached = t, detached.depth = 0;
+                return detached;
+            }
+        return t;
+    }();
     bool need_break = gathered & kNeedBreak;
     if (gathered & kSampledPending) clears_flush(cb);  // cleared (and stored) before it is sampled
     static const bool bytes = std::getenv("NX_TARGETS_MEMCMP") != nullptr;  // bisecting
-    bool targets_changed = !g_rendering || (bytes ? std::memcmp(&g_pass, &t, sizeof t) != 0 : !targets_same(g_pass, t));
+    bool targets_changed = !g_rendering || (bytes ? std::memcmp(&g_pass, &tt, sizeof tt) != 0 : !targets_same(g_pass, tt));
     if (g_rendering && (need_break || targets_changed)) {
         (targets_changed ? g_stats.breaks_targets : g_stats.breaks_textures)++;
         draw_end_rendering(cb, 1);
@@ -279,7 +300,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                           t.views.level[0], fs ? fs->hash.c_str() : "-");
             gpu_profile_mark(cb, label);
         }
-        begin_rendering(cb, t);
+        begin_rendering(cb, tt);
     }
 
     // Pipeline.
@@ -300,7 +321,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         key.color_formats[k] = img ? view_format(*img, t.views.format[k]) : VK_FORMAT_R8G8B8A8_UNORM;
         if (img && (img->nvn_format == 0x3f || t.views.format[k] == 0x3f)) key.ufloat_colors |= 1u << k;  // G4
     }
-    GpuImage* dimg = t.depth ? image_of(t.depth) : nullptr;
+    GpuImage* dimg = tt.depth ? image_of(tt.depth) : nullptr;
     key.depth_format = dimg && dimg->aspect != VK_IMAGE_ASPECT_COLOR_BIT ? dimg->format : VK_FORMAT_UNDEFINED;
     VkPipeline pipeline = graphics_pipeline(key, layout);
     if (!pipeline) {
@@ -358,12 +379,14 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     }
     g_stats.done++;
     g_pass_written |= ((1u << t.color_count) - 1) | (g_state.depth.depth_write || g_state.depth.stencil_test ? 1u << 8 : 0);
-    // NX_SNAP_FS=<hash>,<hash>[@<first draw>]: also snapshot after draws with those fragment shaders (8 at most).
+    // NX_SNAP_FS=<hash>,<hash>[@<first draw>]: also snapshot after draws with those fragment shaders (8 at most, or
+    // NX_SNAP_FS_MAX).
     static const std::string snap_fs = std::getenv("NX_SNAP_FS") ? std::getenv("NX_SNAP_FS") : "";
     static const uint64_t snap_from = snap_fs.find('@') != std::string::npos
                                           ? std::strtoull(snap_fs.c_str() + snap_fs.find('@') + 1, nullptr, 10) : 0;
     static int snap_count = 0;
-    bool snap_by_fs = !snap_fs.empty() && g_stats.done >= snap_from && snap_count < 8 &&
+    static const int snap_max = std::getenv("NX_SNAP_FS_MAX") ? std::atoi(std::getenv("NX_SNAP_FS_MAX")) : 8;
+    bool snap_by_fs = !snap_fs.empty() && g_stats.done >= snap_from && snap_count < snap_max &&
                       ((fs && snap_fs.find(fs->hash) != std::string::npos) ||
                        snap_fs.find(vs->hash) != std::string::npos) &&
                       ++snap_count;  // the vertex shader's hash matches too

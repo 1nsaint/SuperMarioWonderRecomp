@@ -93,6 +93,7 @@ set(NX_RUNTIME_SOURCES
     runtime/src/nvn/nvn_pipeline.cpp
     runtime/src/nvn/nvn_upload.cpp
     runtime/src/nvn/nvn_spirv_patch.cpp
+    runtime/src/nvn/nvn_spirv_clip.cpp
     runtime/src/nvn/nvn_draw.cpp
     runtime/src/nvn/nvn_sets.cpp
     runtime/src/nvn/nvn_clears.cpp
