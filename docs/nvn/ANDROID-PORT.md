@@ -257,6 +257,20 @@ milestone compares frame dumps (`NX_DUMP_FRAMES`) against the Mac on the same sc
 | A6 | Memory | the cuts of section 6; memory budget via JNI | peak PSS + GPU budget under 3.5 GB; 30 min on a 12 GB phone with no kill; one 8 GB phone reported | 1-2 weeks |
 | A7 | Breadth | a Mali/Immortalis device and an Xclipse device; World 1 end to end; saves across app kills | the W7 glitch set is clean on 2 vendors; world 1 done; the save survives a force stop | 2-3 weeks |
 
+### Progress (branch `feat/android-wonder`)
+
+A0, 2026-09-30:
+- `platform_android.cpp` is split into window/threads/main (568 lines), `platform_android_input.cpp` and
+  `platform_android_audio.cpp`, with `platform_android.h` between them.
+- `games/wonder/AndroidManifest.xml`: package `io.github.belmantegu.wonderrecomp`, Vulkan 1.3 required, landscape.
+- CMake adds `-march=armv8.2-a+crypto` (game code and runtime) and `-Wl,-z,max-page-size=16384`.
+- `config.txt`: its `NX_*` lines become environment variables before boot. `NX_HANDHELD=1` is the Android default.
+- `memguard_android.cpp`: Pss from `/proc/self/smaps_rollup`; the limit is `NX_MEM_LIMIT_GB`, else 60% of RAM.
+- The shared font falls back to Roboto.
+- `tools/pack_phone_wonder.py` makes `Wonder-data.zip`: 31,766 files, 3.92 GB, stored. The SPIR-V stays loose files
+  for now; the single-file pack is moved to A2, where its loading time can be measured.
+- All 62 runtime objects, the NVN layer included, compile with NDK 28.2. The Mac build is unchanged.
+
 Total: about 12-16 weeks. A0-A2 can start while the Mac track finishes W7. They share no files with the glitch work
 except `nvn_vk.cpp` (present and swapchain) and `nvn_format.cpp`, where the Android changes are per-device branches
 chosen from capabilities, not platform `#ifdef`s.
