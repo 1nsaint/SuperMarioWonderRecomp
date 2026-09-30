@@ -60,11 +60,18 @@ void lookup_handle(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, Vie
             if (auto it = tp->snapshots.find(tid); it != tp->snapshots.end()) e.snapshot = it->second;
             if (auto it = tp->views.find(tid); it != tp->views.end()) e.has_view = true, e.view = it->second;
         }
-        if (sp)
+        SamplerSlot ss;
+        // A slot empty at the mark was registered after the lists were recorded but before the submit (NVN reads
+        // descriptors when the GPU runs): the current entry is the one.
+        if (sp && sampler_entry_at(g_state.sampler_pool, sid, t_replay_mark, ss) && ss.has) {
+            sampler = ss.info;
+            if (has_sampler) *has_sampler = true;
+        } else if (sp) {
             if (auto it = sp->samplers.find(sid); it != sp->samplers.end()) {
                 sampler = it->second;
                 if (has_sampler) *has_sampler = true;
             }
+        }
     }
     if (tp) {
         texture = e.texture;

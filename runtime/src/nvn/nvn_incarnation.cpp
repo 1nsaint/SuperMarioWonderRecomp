@@ -92,6 +92,24 @@ bool pool_entry_at(uint64_t pool, uint32_t id, uint64_t mark, PoolEntry& out) {
     return false;
 }
 
+namespace {
+std::map<std::pair<uint64_t, uint32_t>, std::vector<std::pair<uint64_t, SamplerSlot>>> g_sampler_changes;
+}  // namespace
+
+void note_sampler_change(uint64_t pool, uint32_t id, const SamplerSlot& before) {
+    if (texture_race_old()) return;
+    g_sampler_changes[{pool, id}].push_back({g_epoch.fetch_add(1, std::memory_order_acq_rel) + 1, before});
+}
+
+bool sampler_entry_at(uint64_t pool, uint32_t id, uint64_t mark, SamplerSlot& out) {
+    if (!mark || g_sampler_changes.empty()) return false;
+    auto h = g_sampler_changes.find({pool, id});
+    if (h == g_sampler_changes.end()) return false;
+    for (auto& [epoch, entry] : h->second)
+        if (epoch > mark) return out = entry, true;
+    return false;
+}
+
 void purge_incarnations(uint64_t upto) {
     auto trim = [upto](auto& map) {
         for (auto it = map.begin(); it != map.end();) {
@@ -100,7 +118,7 @@ void purge_incarnations(uint64_t upto) {
             it = v.empty() ? map.erase(it) : std::next(it);
         }
     };
-    trim(g_retired), trim(g_pool_changes);
+    trim(g_retired), trim(g_pool_changes), trim(g_sampler_changes);
 }
 
 namespace {

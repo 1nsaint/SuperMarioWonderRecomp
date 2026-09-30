@@ -264,14 +264,22 @@ bool make_swapchain() {
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     // The game paces itself on its vsync event (hle_vi.cpp, 60 Hz): a FIFO present also waited for the display's own
     // refresh, two clocks drifting against each other (stutter near 60 fps, docs/nvn/DEBUG.md #33). MAILBOX never
-    // blocks and shows the newest frame at each refresh; FIFO when the driver has no mailbox.
+    // blocks and shows the newest frame at each refresh; else IMMEDIATE (MoltenVK: no display sync in the Metal
+    // layer, the macOS compositor still shows whole frames at its refresh), FIFO last. NX_FIFO=1: FIFO (DEBUG.md #62).
     ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
     uint32_t modes_n = 0;
     p_vkGetPhysicalDeviceSurfacePresentModesKHR(g_physical, g_surface, &modes_n, nullptr);
     std::vector<VkPresentModeKHR> modes(modes_n);
     p_vkGetPhysicalDeviceSurfacePresentModesKHR(g_physical, g_surface, &modes_n, modes.data());
-    for (VkPresentModeKHR m : modes)
-        if (m == VK_PRESENT_MODE_MAILBOX_KHR && !std::getenv("NX_FIFO")) ci.presentMode = m;
+    auto has = [&](VkPresentModeKHR m) { return std::find(modes.begin(), modes.end(), m) != modes.end(); };
+    if (!std::getenv("NX_FIFO")) {
+        if (has(VK_PRESENT_MODE_MAILBOX_KHR))
+            ci.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+        else if (has(VK_PRESENT_MODE_IMMEDIATE_KHR))
+            ci.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    }
+    static const char* const mode_names[] = {"IMMEDIATE", "MAILBOX", "FIFO", "FIFO_RELAXED"};
+    log("nvn/vk: present mode %s (%u modes offered)", ci.presentMode <= 3 ? mode_names[ci.presentMode] : "?", modes_n);
     ci.clipped = VK_TRUE;
     if (!check(p_vkCreateSwapchainKHR(g_device, &ci, nullptr, &g_swapchain), "vkCreateSwapchainKHR")) return false;
     uint32_t n = 0;

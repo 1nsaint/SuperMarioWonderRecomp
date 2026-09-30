@@ -233,6 +233,13 @@ struct PoolEntry {
 void note_pool_change(uint64_t pool, uint32_t id, const PoolEntry& before);  // objects_lock held exclusively
 // objects_lock held: the slot's entry at `mark` when it changed since (false: the current entry is the one).
 bool pool_entry_at(uint64_t pool, uint32_t id, uint64_t mark, PoolEntry& out);
+// The same for sampler pool slots (DEBUG.md #63): recorded only when the sampler changes.
+struct SamplerSlot {
+    bool has = false;
+    SamplerInfo info;
+};
+void note_sampler_change(uint64_t pool, uint32_t id, const SamplerSlot& before);  // objects_lock held exclusively
+bool sampler_entry_at(uint64_t pool, uint32_t id, uint64_t mark, SamplerSlot& out);
 
 // NVNformat -> VkFormat, and whether it is color (0), depth (1), stencil (2) or both (3) (nvn_format.cpp).
 VkFormat vk_format(uint32_t format);

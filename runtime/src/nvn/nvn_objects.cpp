@@ -467,6 +467,7 @@ uint64_t make_snapshot(uint64_t guest) {  // under objects_lock
 void drop_snapshot(uint64_t key) {  // under objects_lock
     auto o = objects().find(key);
     if (o == objects().end()) return;
+    note_replaced(key);  // a replay in flight may resolve the slot to this copy (pool_entry_at, DEBUG.md #63)
     defer_object(std::move(o->second));
     objects().erase(o);
 }

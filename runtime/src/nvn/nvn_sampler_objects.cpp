@@ -59,6 +59,11 @@ void SamplerFinalize(CPU& c) { destroy(c.x[0]); }
 void register_info(uint64_t pool, uint32_t id, const SamplerInfo& info) {
     if (auto* d = get<DescriptorPool>(pool)) {
         std::lock_guard lk(objects_lock());
+        // A replay in flight resolves the slot as of its mark (nvn_incarnation.cpp): a changed sampler keeps the
+        // one it replaces (re-registering the same sampler every frame records nothing).
+        SamplerSlot before;
+        if (auto it = d->samplers.find(id); it != d->samplers.end()) before.has = true, before.info = it->second;
+        if (!before.has || std::memcmp(&before.info, &info, sizeof info) != 0) note_sampler_change(pool, id, before);
         d->samplers[id] = info;
     }
 }
