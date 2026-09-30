@@ -1,5 +1,6 @@
 // NVN sampler states as Vulkan samplers (split from nvn_pipeline.cpp).
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <string>
 
@@ -77,11 +78,23 @@ uint64_t hash_memory(const uint8_t* p, uint64_t size) {
 void check_linear_content(Texture& t) {
     // Every 4th presented frame at most (every 4th submit was about every frame, ~1 ms); a new glyph shows 3 frames late.
     uint64_t frame = g_frame.load(std::memory_order_relaxed) + 1;
-    if (!t.stride || !t.memory || !t.image || t.image->rendered || (t.hashed_submit && t.hashed_submit + 4 > frame))
+    static const uint64_t hash_small = [] {
+        const char* e = std::getenv("NX_HASH_SMALL");
+        return e ? std::strtoull(e, nullptr, 10) : 0;
+    }();
+    bool small = hash_small && t.storage_size <= hash_small;
+    if ((!t.stride && !small) || !t.memory || !t.image || t.image->rendered ||
+        (t.hashed_submit && t.hashed_submit + 4 > frame))
         return;
     t.hashed_submit = frame;
     uint64_t h = hash_memory(reinterpret_cast<const uint8_t*>(t.memory), t.storage_size);
-    if (t.content_hash && h != t.content_hash) t.dirty = true;
+    if (t.content_hash && h != t.content_hash) {
+        t.dirty = true;
+        static int logged = 0;
+        if (!t.stride && logged++ < 100)
+            log("nvn: block-linear texture %llux%u f%x (%llu bytes) changed by the CPU", (unsigned long long)t.width,
+                t.height, t.format, (unsigned long long)t.storage_size);
+    }
     t.content_hash = h;
 }
 

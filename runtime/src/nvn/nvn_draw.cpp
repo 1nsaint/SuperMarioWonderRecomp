@@ -575,6 +575,16 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     static const char* dump_env = std::getenv("NX_DUMP_ON_TARGET");
     static const uint64_t dump_target = dump_env ? std::strtoull(dump_env, nullptr, 16) : 0;
     if (dump_target && t.colors[0] == dump_target) g_dump_request = ++g_dump_draws;
+    // NX_DUMP_ON_FS=<fs hash>[,...]: a draw with one of these fragment shaders dumps its target 0 and what it samples.
+    static const std::string dump_fs = [] { const char* e = std::getenv("NX_DUMP_ON_FS"); return std::string(e ? e : ""); }();
+    static const uint64_t dump_from = [] { const char* e = std::getenv("NX_DUMP_FROM"); return e ? std::strtoull(e, nullptr, 10) : 0; }();
+    if (!dump_fs.empty() && fs && g_frame >= dump_from && dump_fs.find(fs->hash) != std::string::npos && g_dump_draws < 400 &&
+        t.colors[0] && image_of(t.colors[0]) && (image_of(t.colors[0])->view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
+                                                           image_of(t.colors[0])->view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)) {
+        debug_dump_add(t.colors[0]);
+        for (const ResolvedTexture& r : g_resolved) debug_dump_add(r.texture);
+        g_dump_request = ++g_dump_draws;
+    }
     trace_draw(t, mode, indexed, c, vs, fs, tex_bindings, handles);
     return true;
 }

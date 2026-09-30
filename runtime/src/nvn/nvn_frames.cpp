@@ -77,6 +77,8 @@ struct ReuseKey {
 ReuseKey reuse_key(const Texture& t) {
     uint32_t swizzle = uint32_t(t.swizzle[0]) | uint32_t(t.swizzle[1]) << 8 | uint32_t(t.swizzle[2]) << 16 |
                   uint32_t(t.swizzle[3]) << 24;
+    static const bool key_swizzle = std::getenv("NX_KEY_SWIZZLE") != nullptr;  // as image_of's key (#46)
+    if (!key_swizzle) swizzle = 0;
     return {t.memory, t.format, t.width, t.height, t.depth, t.levels, t.target, t.samples, swizzle};
 }
 std::map<ReuseKey, std::pair<uint64_t, std::shared_ptr<GpuImage>>> g_reusable;  // key -> (kept at, image)

@@ -449,3 +449,39 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
         by default).
       - It broke the course's foreground flowers (dynamic-resolution targets are meant to be followed) and did not
         light the Goombas.
+46. **Images the GPU rendered, sampled as stale uploads through another texture object.**
+    - A diagnostic listed every texture upload whose memory the GPU had already rendered through a live image of the
+      same shape (removed after use; `rendered_alias` in the commit history).
+    - Cases found:
+      - the UI's text strips (608x33, 200x33 RGBA8);
+      - the 2048x2048 D16 shadow map;
+      - some dynamic-resolution targets.
+    - Two rules kept those textures from sharing the rendered image:
+      - `image_of` skipped sharing for any texture with a pool view swizzle;
+      - the storage key held the builder swizzle, and a render target and the texture sampling it often differ in it.
+    - Both date from before #44. Since #44, each texture samples with its own swizzle (`sampled_view`), so neither
+      rule is needed.
+    - Now:
+      - the swizzle is not part of the share and reuse keys;
+      - a pool swizzle does not stop sharing;
+      - only an R8 texture widened for alpha-from-red keeps its own image.
+    - Bisecting: `NX_KEY_SWIZZLE=1` and `NX_SHARE_NO_POOL_SWIZZLE=1` restore the old rules.
+    - Character select checked frame by frame against the previous run: no change except timing.
+    - Light probes (#39, #42), what the night established. Runs must last about 290 s to reach the course (the input
+      script enters it at ~175 s); earlier "course" probe traces at frame ~7100 were the world map's.
+      - The course probe chain is:
+        1. 256x256 scene faces (GPU-rendered);
+        2. a 128x128x12 cube array (layers 0-5), then prefiltered layers and mips sampled from itself;
+        3. 64x64 2-level and 5-level cubes, from a 64x64 RGBA16F direction map plus colours in the fragment uniforms
+           (c5[16], c5[17]).
+      - `NX_DUMP_ON_FS=<fs hash,...>` (only draws into cube targets, from frame `NX_DUMP_FROM`) reads back each
+        stage. `NX_DUMP_TARGET_EVERY` sets the period of `NX_DUMP_ON_TARGET`.
+      - The cube array looks right (sky, horizon). Most 64x64 probes are lit, a few are black.
+      - The black ones are drawn with all-zero colour uniforms (even w). One probe is lit at the course start and
+        re-captured black ~5 s later with zeros at the same uniform address.
+      - The 64x64 direction map is all zeros in guest memory whenever it is uploaded.
+      - Ruled out:
+        - CPU writes after the upload (`NX_HASH_SMALL=<bytes>` hashes small block-linear textures);
+        - compute write-backs in the same submit;
+        - GPU renders through another object;
+        - CPU readback of render targets.

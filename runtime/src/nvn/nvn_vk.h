@@ -65,6 +65,7 @@ struct WriteBack {
     uint64_t size;
 };
 std::vector<WriteBack> draw_take_write_backs();  // nvn_draw.cpp: this submit's, for an asynchronous submit
+void debug_dump_add(uint64_t texture);  // nvn_debug.cpp: read back at the end of this submit
 
 // nvn_frames.cpp: asynchronous submission (NX_ASYNC_GPU). Slots of command buffer, fence, descriptor pool and ring
 // stretch; retired (fence waited, write-backs copied) on reuse, when the ring is full, or when the game waits.

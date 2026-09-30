@@ -321,9 +321,16 @@ GpuImage* image_of(uint64_t guest) {
     if (t->image) return t->image.get();
     uint32_t swizzle = uint32_t(t->swizzle[0]) | uint32_t(t->swizzle[1]) << 8 | uint32_t(t->swizzle[2]) << 16 |
                   uint32_t(t->swizzle[3]) << 24;
+    // Swizzles apply when sampling (sampled_view, #44): neither the key's nor a pool view's keeps textures from sharing.
+    // With them, the shadow map and the UI's text strips were sampled as stale uploads (#46). Env: bisecting.
+    static const bool key_swizzle = std::getenv("NX_KEY_SWIZZLE") != nullptr;
+    if (!key_swizzle) swizzle = 0;
     StorageKey key{t->memory, t->format, t->width, t->height, t->depth, t->levels, t->target, t->samples, swizzle};
     static const bool share = std::getenv("NX_NO_IMAGE_SHARE") == nullptr;  // bisecting
-    if (share && t->memory && t->pool_swizzle == 0)
+    // An R8 image widened for alpha-from-red keeps its own.
+    static const bool old_rule = std::getenv("NX_SHARE_NO_POOL_SWIZZLE") != nullptr;  // bisecting
+    bool widened = t->format == 0x1 && t->pool_swizzle == 0x02010101u;
+    if (share && t->memory && (old_rule ? t->pool_swizzle == 0 : !widened))
         if (auto it = g_live_images.find(key); it != g_live_images.end())
             if (auto shared = it->second.lock(); shared && shared->image && !shared->alpha_from_r) {
                 static uint64_t shares = 0;
@@ -563,6 +570,7 @@ void log_timing(uint64_t frames) {
 }  // namespace
 
 void debug_dump_textures(uint64_t frame);  // nvn_debug.cpp
+void debug_dump_requested(uint64_t n);      // nvn_debug.cpp
 uint64_t draw_take_dump_request();          // nvn_draw.cpp
 
 namespace {
@@ -600,8 +608,7 @@ void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_
     draw_end_submit();  // asynchronous: snapshots only (the write-backs went with the submit)
     gpu_profile_collect();
     zero_draws_collect();
-    if (uint64_t n = draw_take_dump_request(); n && frame_dump_every() && n % frame_dump_every() == 0)
-        debug_dump_textures(n);
+    debug_dump_requested(draw_take_dump_request());
 }
 
 // Headless: the presented texture is only counted, logged and dumped (no swapchain).

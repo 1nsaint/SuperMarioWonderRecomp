@@ -97,8 +97,17 @@ void write_ppm(const Scratch& s, uint32_t w, uint32_t h, uint64_t frame, uint64_
 
 }  // namespace
 
+std::vector<uint64_t> g_dump_extra;  // this submit's (NX_DUMP_ON_FS)
+void debug_dump_add(uint64_t texture) {
+    if (texture && std::find(g_dump_extra.begin(), g_dump_extra.end(), texture) == g_dump_extra.end())
+        g_dump_extra.push_back(texture);
+}
+
 void debug_dump_textures(uint64_t frame) {
-    static const std::vector<uint64_t> list = dump_list();
+    static const std::vector<uint64_t> fixed = dump_list();
+    std::vector<uint64_t> list = fixed;
+    list.insert(list.end(), g_dump_extra.begin(), g_dump_extra.end());
+    g_dump_extra.clear();
     if (list.empty()) return;
     VkDevice d = vk_device();
     static VkCommandPool pool = VK_NULL_HANDLE;
@@ -119,6 +128,8 @@ void debug_dump_textures(uint64_t frame) {
     }
     for (uint64_t texture : list) {
         GpuImage* src = image_of(texture);
+        log("nvn: dump %llx at %llu: %s", (unsigned long long)texture, (unsigned long long)frame,
+            !src ? "no image" : src->layout == VK_IMAGE_LAYOUT_UNDEFINED ? "undefined" : "ok");
         if (!src || !src->image || src->layout == VK_IMAGE_LAYOUT_UNDEFINED || !(src->aspect & VK_IMAGE_ASPECT_COLOR_BIT))
             continue;
         uint32_t w = src->width, h = src->height;
@@ -191,6 +202,16 @@ void debug_dump_textures(uint64_t frame) {
         }
         s.destroy(d);
     }
+}
+
+// NX_DUMP_ON_TARGET / NX_DUMP_ON_FS (nvn_draw.cpp): the n-th requesting draw of a submit, every NX_DUMP_TARGET_EVERY-th
+// (default NX_DUMP_FRAMES) is read back when the submit completes.
+void debug_dump_requested(uint64_t n) {
+    static const uint64_t every = [] {
+        const char* e = std::getenv("NX_DUMP_TARGET_EVERY");
+        return e ? std::strtoull(e, nullptr, 10) : uint64_t(frame_dump_every());
+    }();
+    if (n && every && n % every == 0) debug_dump_textures(n);
 }
 
 // ---- presented frames (NX_DUMP_FRAMES=N) ----------------------------------------------------------------------------

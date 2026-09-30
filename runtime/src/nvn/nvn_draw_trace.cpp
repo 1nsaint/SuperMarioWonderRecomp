@@ -56,6 +56,12 @@ void trace_cube_draw(const Targets& t, const ShaderInfo* vs, const ShaderInfo* f
         (unsigned long long)g_stats.done, (unsigned long long)g_frame.load(), vs->hash.c_str(), fs ? fs->hash.c_str() : "-",
         t.color_count, (unsigned long long)t.colors[0], t.views.level[0], t.views.layer[0], (unsigned long long)t.depth,
         d ? d->width : 0, d ? d->height : 0, tex.c_str());
+    for (int bank : {4, 5})  // the probe shaders' colours (c5[16], c5[17]) and axes (c4[1])
+        if (const Range& u = g_state.uniforms[1][bank - 3]; u.address && u.size >= 288)
+            if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
+                log("  fs c%d (%llx, %llu bytes): [1] %g %g %g %g [16] %g %g %g %g [17] %g %g %g %g", bank,
+                    (unsigned long long)u.address, (unsigned long long)u.size, f[4], f[5], f[6], f[7], f[64], f[65],
+                    f[66], f[67], f[68], f[69], f[70], f[71]);
     if (const Range& u = g_state.uniforms[1][0]; u.address && u.size >= 64)  // fs c3: lod, level, probe index
         if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
             log("  fs c3: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", f[0], f[1], f[2], f[3], f[4], f[5],
