@@ -45,6 +45,12 @@ GpuImage* image_of(uint64_t texture);
 // default they are 2D / 2D-array images of height 1, which the translated shaders (1D sampled as 2D) can view (G8).
 bool vk_1d_images();
 void transition(VkCommandBuffer cb, GpuImage& img, VkImageLayout to);
+// nvn_present.cpp: the window texture drawn into the swapchain (rotated, fit, alpha 1) instead of blitted.
+bool present_pass_wanted();
+bool present_pass_targets(VkFormat format, const std::vector<VkImage>& images, VkExtent2D extent,
+                          VkSurfaceTransformFlagBitsKHR transform);
+bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop, uint32_t index);
+GpuImage* present_pass_test_target();  // NX_PRESENT_TEST: an offscreen "display" for the pass (headless dumps)
 
 // Per-submit upload memory (host visible, coherent), reset at every submit: data the replayed commands read from
 // guest memory is copied here at replay time (vertex, index, uniform, storage data, texture staging).

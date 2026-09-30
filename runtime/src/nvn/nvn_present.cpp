@@ -1,0 +1,390 @@
+// The NVN present pass (docs/nvn/ANDROID-PORT.md A2; DEBUG-2.md #68): the window texture drawn into the swapchain
+// image by a render pass instead of vkCmdBlitImage.
+// - Rotated by the swapchain's preTransform: phones scan out portrait, and a pre-rotated image goes to the display
+//   controller as is (the compositor rotates otherwise, on the GPU whenever system UI is on top).
+// - Fit with bars: a 16:9 picture on a 19.5:9 screen keeps its shape.
+// - Alpha 1: an Android surface may take the image's alpha as transparency (compositeAlpha INHERIT), and the game's
+//   final image has no meaningful alpha.
+// On by default on Android. NX_PRESENT_PASS=1 turns it on elsewhere (checking it on the Mac), =0 off (the blit).
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include "nvn_vk.h"
+
+namespace nx::nvn {
+
+using namespace nx::vk;
+
+namespace {
+
+// glslc -O --target-env=vulkan1.0 of present.vert:
+//   #version 450
+//   // A triangle covering the target; uv 0..1 across it (y down, as Vulkan framebuffer coordinates).
+//   layout(location = 0) out vec2 uv;
+//   void main() {
+//       vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));
+//       uv = p;
+//       gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+//   }
+const uint32_t kVertex[] = {
+    0x07230203, 0x00010000, 0x000d000b, 0x0000002f, 0x00000000, 0x00020011, 0x00000001, 0x0006000b, 0x00000001,
+    0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0008000f, 0x00000000,
+    0x00000004, 0x6e69616d, 0x00000000, 0x0000000c, 0x00000018, 0x00000020, 0x00040047, 0x0000000c, 0x0000000b,
+    0x0000002a, 0x00040047, 0x00000018, 0x0000001e, 0x00000000, 0x00030047, 0x0000001e, 0x00000002, 0x00050048,
+    0x0000001e, 0x00000000, 0x0000000b, 0x00000000, 0x00050048, 0x0000001e, 0x00000001, 0x0000000b, 0x00000001,
+    0x00050048, 0x0000001e, 0x00000002, 0x0000000b, 0x00000003, 0x00050048, 0x0000001e, 0x00000003, 0x0000000b,
+    0x00000004, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020,
+    0x00040017, 0x00000007, 0x00000006, 0x00000002, 0x00040015, 0x0000000a, 0x00000020, 0x00000001, 0x00040020,
+    0x0000000b, 0x00000001, 0x0000000a, 0x0004003b, 0x0000000b, 0x0000000c, 0x00000001, 0x0004002b, 0x0000000a,
+    0x0000000e, 0x00000001, 0x0004002b, 0x0000000a, 0x00000010, 0x00000002, 0x00040020, 0x00000017, 0x00000003,
+    0x00000007, 0x0004003b, 0x00000017, 0x00000018, 0x00000003, 0x00040017, 0x0000001a, 0x00000006, 0x00000004,
+    0x00040015, 0x0000001b, 0x00000020, 0x00000000, 0x0004002b, 0x0000001b, 0x0000001c, 0x00000001, 0x0004001c,
+    0x0000001d, 0x00000006, 0x0000001c, 0x0006001e, 0x0000001e, 0x0000001a, 0x00000006, 0x0000001d, 0x0000001d,
+    0x00040020, 0x0000001f, 0x00000003, 0x0000001e, 0x0004003b, 0x0000001f, 0x00000020, 0x00000003, 0x0004002b,
+    0x0000000a, 0x00000021, 0x00000000, 0x0004002b, 0x00000006, 0x00000023, 0x40000000, 0x0004002b, 0x00000006,
+    0x00000025, 0x3f800000, 0x0004002b, 0x00000006, 0x00000028, 0x00000000, 0x00040020, 0x0000002c, 0x00000003,
+    0x0000001a, 0x0005002c, 0x00000007, 0x0000002e, 0x00000025, 0x00000025, 0x00050036, 0x00000002, 0x00000004,
+    0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x0000000a, 0x0000000d, 0x0000000c, 0x000500c4,
+    0x0000000a, 0x0000000f, 0x0000000d, 0x0000000e, 0x000500c7, 0x0000000a, 0x00000011, 0x0000000f, 0x00000010,
+    0x0004006f, 0x00000006, 0x00000012, 0x00000011, 0x000500c7, 0x0000000a, 0x00000014, 0x0000000d, 0x00000010,
+    0x0004006f, 0x00000006, 0x00000015, 0x00000014, 0x00050050, 0x00000007, 0x00000016, 0x00000012, 0x00000015,
+    0x0003003e, 0x00000018, 0x00000016, 0x0005008e, 0x00000007, 0x00000024, 0x00000016, 0x00000023, 0x00050083,
+    0x00000007, 0x00000027, 0x00000024, 0x0000002e, 0x00050051, 0x00000006, 0x00000029, 0x00000027, 0x00000000,
+    0x00050051, 0x00000006, 0x0000002a, 0x00000027, 0x00000001, 0x00070050, 0x0000001a, 0x0000002b, 0x00000029,
+    0x0000002a, 0x00000028, 0x00000025, 0x00050041, 0x0000002c, 0x0000002d, 0x00000020, 0x00000021, 0x0003003e,
+    0x0000002d, 0x0000002b, 0x000100fd, 0x00010038,
+};
+
+// glslc -O --target-env=vulkan1.0 of present.frag:
+//   #version 450
+//   // Host pixel -> the picture: `rot` turns host uv into upright uv (the swapchain's preTransform undone), `box` is where
+//   // the picture sits in the upright target (uv, fit with bars), `crop` the part of the texture shown. Alpha is 1.
+//   layout(set = 0, binding = 0) uniform sampler2D src;
+//   layout(push_constant) uniform P {
+//       vec4 rot;   // mat2 columns (x, y) (z, w)
+//       vec4 off;   // xy: rot offset
+//       vec4 box;   // x0 y0 w h
+//       vec4 crop;  // u0 v0 du dv
+//   } p;
+//   layout(location = 0) in vec2 uv;
+//   layout(location = 0) out vec4 color;
+//   void main() {
+//       vec2 up = mat2(p.rot.xy, p.rot.zw) * uv + p.off.xy;
+//       vec2 b = (up - p.box.xy) / p.box.zw;
+//       if (any(lessThan(b, vec2(0.0))) || any(greaterThan(b, vec2(1.0)))) {
+//           color = vec4(0.0, 0.0, 0.0, 1.0);
+//           return;
+//       }
+//       color = vec4(texture(src, p.crop.xy + b * p.crop.zw).rgb, 1.0);
+//   }
+const uint32_t kFragment[] = {
+    0x07230203, 0x00010000, 0x000d000b, 0x00000063, 0x00000000, 0x00020011, 0x00000001, 0x0006000b, 0x00000001,
+    0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000004,
+    0x00000004, 0x6e69616d, 0x00000000, 0x00000022, 0x00000046, 0x00030010, 0x00000004, 0x00000007, 0x00030047,
+    0x0000000b, 0x00000002, 0x00050048, 0x0000000b, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x0000000b,
+    0x00000001, 0x00000023, 0x00000010, 0x00050048, 0x0000000b, 0x00000002, 0x00000023, 0x00000020, 0x00050048,
+    0x0000000b, 0x00000003, 0x00000023, 0x00000030, 0x00040047, 0x00000022, 0x0000001e, 0x00000000, 0x00040047,
+    0x00000046, 0x0000001e, 0x00000000, 0x00040047, 0x0000004c, 0x00000021, 0x00000000, 0x00040047, 0x0000004c,
+    0x00000022, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006,
+    0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000002, 0x00040017, 0x0000000a, 0x00000006, 0x00000004,
+    0x0006001e, 0x0000000b, 0x0000000a, 0x0000000a, 0x0000000a, 0x0000000a, 0x00040020, 0x0000000c, 0x00000009,
+    0x0000000b, 0x0004003b, 0x0000000c, 0x0000000d, 0x00000009, 0x00040015, 0x0000000e, 0x00000020, 0x00000001,
+    0x0004002b, 0x0000000e, 0x0000000f, 0x00000000, 0x00040020, 0x00000010, 0x00000009, 0x0000000a, 0x00040018,
+    0x00000017, 0x00000007, 0x00000002, 0x0004002b, 0x00000006, 0x00000018, 0x3f800000, 0x0004002b, 0x00000006,
+    0x00000019, 0x00000000, 0x00040020, 0x00000021, 0x00000001, 0x00000007, 0x0004003b, 0x00000021, 0x00000022,
+    0x00000001, 0x0004002b, 0x0000000e, 0x00000025, 0x00000001, 0x0004002b, 0x0000000e, 0x0000002c, 0x00000002,
+    0x00020014, 0x00000035, 0x0005002c, 0x00000007, 0x00000037, 0x00000019, 0x00000019, 0x00040017, 0x00000038,
+    0x00000035, 0x00000002, 0x0005002c, 0x00000007, 0x0000003f, 0x00000018, 0x00000018, 0x00040020, 0x00000045,
+    0x00000003, 0x0000000a, 0x0004003b, 0x00000045, 0x00000046, 0x00000003, 0x0007002c, 0x0000000a, 0x00000047,
+    0x00000019, 0x00000019, 0x00000019, 0x00000018, 0x00090019, 0x00000049, 0x00000006, 0x00000001, 0x00000000,
+    0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x0003001b, 0x0000004a, 0x00000049, 0x00040020, 0x0000004b,
+    0x00000000, 0x0000004a, 0x0004003b, 0x0000004b, 0x0000004c, 0x00000000, 0x0004002b, 0x0000000e, 0x0000004e,
+    0x00000003, 0x00040015, 0x00000061, 0x00000020, 0x00000000, 0x0004002b, 0x00000061, 0x00000062, 0x00000000,
+    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x000300f7, 0x0000005f,
+    0x00000000, 0x000300fb, 0x00000062, 0x00000060, 0x000200f8, 0x00000060, 0x00050041, 0x00000010, 0x00000011,
+    0x0000000d, 0x0000000f, 0x0004003d, 0x0000000a, 0x00000012, 0x00000011, 0x00050051, 0x00000006, 0x0000001a,
+    0x00000012, 0x00000000, 0x00050051, 0x00000006, 0x0000001b, 0x00000012, 0x00000001, 0x00050051, 0x00000006,
+    0x0000001c, 0x00000012, 0x00000002, 0x00050051, 0x00000006, 0x0000001d, 0x00000012, 0x00000003, 0x00050050,
+    0x00000007, 0x0000001e, 0x0000001a, 0x0000001b, 0x00050050, 0x00000007, 0x0000001f, 0x0000001c, 0x0000001d,
+    0x00050050, 0x00000017, 0x00000020, 0x0000001e, 0x0000001f, 0x0004003d, 0x00000007, 0x00000023, 0x00000022,
+    0x00050091, 0x00000007, 0x00000024, 0x00000020, 0x00000023, 0x00050041, 0x00000010, 0x00000026, 0x0000000d,
+    0x00000025, 0x0004003d, 0x0000000a, 0x00000027, 0x00000026, 0x0007004f, 0x00000007, 0x00000028, 0x00000027,
+    0x00000027, 0x00000000, 0x00000001, 0x00050081, 0x00000007, 0x00000029, 0x00000024, 0x00000028, 0x00050041,
+    0x00000010, 0x0000002d, 0x0000000d, 0x0000002c, 0x0004003d, 0x0000000a, 0x0000002e, 0x0000002d, 0x0007004f,
+    0x00000007, 0x0000002f, 0x0000002e, 0x0000002e, 0x00000000, 0x00000001, 0x00050083, 0x00000007, 0x00000030,
+    0x00000029, 0x0000002f, 0x0007004f, 0x00000007, 0x00000033, 0x0000002e, 0x0000002e, 0x00000002, 0x00000003,
+    0x00050088, 0x00000007, 0x00000034, 0x00000030, 0x00000033, 0x000500b8, 0x00000038, 0x00000039, 0x00000034,
+    0x00000037, 0x0004009a, 0x00000035, 0x0000003a, 0x00000039, 0x000400a8, 0x00000035, 0x0000003b, 0x0000003a,
+    0x000300f7, 0x0000003d, 0x00000000, 0x000400fa, 0x0000003b, 0x0000003c, 0x0000003d, 0x000200f8, 0x0000003c,
+    0x000500ba, 0x00000038, 0x00000040, 0x00000034, 0x0000003f, 0x0004009a, 0x00000035, 0x00000041, 0x00000040,
+    0x000200f9, 0x0000003d, 0x000200f8, 0x0000003d, 0x000700f5, 0x00000035, 0x00000042, 0x0000003a, 0x00000060,
+    0x00000041, 0x0000003c, 0x000300f7, 0x00000044, 0x00000000, 0x000400fa, 0x00000042, 0x00000043, 0x00000044,
+    0x000200f8, 0x00000043, 0x0003003e, 0x00000046, 0x00000047, 0x000200f9, 0x0000005f, 0x000200f8, 0x00000044,
+    0x0004003d, 0x0000004a, 0x0000004d, 0x0000004c, 0x00050041, 0x00000010, 0x0000004f, 0x0000000d, 0x0000004e,
+    0x0004003d, 0x0000000a, 0x00000050, 0x0000004f, 0x0007004f, 0x00000007, 0x00000051, 0x00000050, 0x00000050,
+    0x00000000, 0x00000001, 0x0007004f, 0x00000007, 0x00000055, 0x00000050, 0x00000050, 0x00000002, 0x00000003,
+    0x00050085, 0x00000007, 0x00000056, 0x00000034, 0x00000055, 0x00050081, 0x00000007, 0x00000057, 0x00000051,
+    0x00000056, 0x00050057, 0x0000000a, 0x00000058, 0x0000004d, 0x00000057, 0x00050051, 0x00000006, 0x0000005b,
+    0x00000058, 0x00000000, 0x00050051, 0x00000006, 0x0000005c, 0x00000058, 0x00000001, 0x00050051, 0x00000006,
+    0x0000005d, 0x00000058, 0x00000002, 0x00070050, 0x0000000a, 0x0000005e, 0x0000005b, 0x0000005c, 0x0000005d,
+    0x00000018, 0x0003003e, 0x00000046, 0x0000005e, 0x000200f9, 0x0000005f, 0x000200f8, 0x0000005f, 0x000100fd,
+    0x00010038,
+};
+
+struct Push {
+    float rot[4], off[4], box[4], crop[4];
+};
+
+struct Pass {
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkRenderPass render_pass = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> sets;  // one per swapchain image
+    std::vector<VkImageView> views;
+    std::vector<VkFramebuffer> framebuffers;
+    VkExtent2D extent{};
+    VkSurfaceTransformFlagBitsKHR transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    bool failed = false;
+} g;
+
+VkShaderModule module(const uint32_t* code, size_t bytes) {
+    VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    ci.codeSize = bytes;
+    ci.pCode = code;
+    VkShaderModule m = VK_NULL_HANDLE;
+    p_vkCreateShaderModule(vk_device(), &ci, nullptr, &m);
+    return m;
+}
+
+void destroy_targets() {
+    VkDevice d = vk_device();
+    for (VkFramebuffer f : g.framebuffers) p_vkDestroyFramebuffer(d, f, nullptr);
+    for (VkImageView v : g.views) p_vkDestroyImageView(d, v, nullptr);
+    g.framebuffers.clear(), g.views.clear();
+    if (g.pool) p_vkDestroyDescriptorPool(d, g.pool, nullptr);
+    g.pool = VK_NULL_HANDLE, g.sets.clear();
+}
+
+bool make_pipeline(VkFormat format) {
+    VkDevice d = vk_device();
+    VkAttachmentDescription color{};
+    color.format = format;
+    color.samples = VK_SAMPLE_COUNT_1_BIT;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;  // every pixel is written
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &ref;
+    VkSubpassDependency dep{};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rpi.attachmentCount = 1, rpi.pAttachments = &color;
+    rpi.subpassCount = 1, rpi.pSubpasses = &sub;
+    rpi.dependencyCount = 1, rpi.pDependencies = &dep;
+    if (p_vkCreateRenderPass(d, &rpi, nullptr, &g.render_pass) != VK_SUCCESS) return false;
+
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (p_vkCreateSampler(d, &si, nullptr, &g.sampler) != VK_SUCCESS) return false;
+    VkDescriptorSetLayoutBinding b{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, &g.sampler};
+    VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dli.bindingCount = 1, dli.pBindings = &b;
+    if (p_vkCreateDescriptorSetLayout(d, &dli, nullptr, &g.set_layout) != VK_SUCCESS) return false;
+    VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(Push)};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1, pli.pSetLayouts = &g.set_layout;
+    pli.pushConstantRangeCount = 1, pli.pPushConstantRanges = &push;
+    if (p_vkCreatePipelineLayout(d, &pli, nullptr, &g.layout) != VK_SUCCESS) return false;
+
+    VkShaderModule vs = module(kVertex, sizeof kVertex), fs = module(kFragment, sizeof kFragment);
+    VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                                 {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = vs, stages[0].pName = "main";
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = fs, stages[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL, rs.cullMode = VK_CULL_MODE_NONE, rs.lineWidth = 1;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState blend{};
+    blend.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1, cb.pAttachments = &blend;
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    ds.dynamicStateCount = 2, ds.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gp.stageCount = 2, gp.pStages = stages;
+    gp.pVertexInputState = &vin, gp.pInputAssemblyState = &ia, gp.pViewportState = &vp;
+    gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pColorBlendState = &cb, gp.pDynamicState = &ds;
+    gp.layout = g.layout, gp.renderPass = g.render_pass;
+    VkResult r = p_vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &gp, nullptr, &g.pipeline);
+    p_vkDestroyShaderModule(d, vs, nullptr);
+    p_vkDestroyShaderModule(d, fs, nullptr);
+    g.format = format;
+    return r == VK_SUCCESS;
+}
+
+}  // namespace
+
+bool present_pass_wanted() {
+    static const bool on = [] {
+        const char* e = std::getenv("NX_PRESENT_PASS");
+#if defined(__ANDROID__)
+        return !e || e[0] != '0';
+#else
+        return e && e[0] == '1';
+#endif
+    }();
+    return on;
+}
+
+bool present_pass_targets(VkFormat format, const std::vector<VkImage>& images, VkExtent2D extent,
+                          VkSurfaceTransformFlagBitsKHR transform) {
+    if (!present_pass_wanted() || g.failed) return false;
+    destroy_targets();
+    if (g.format != format && g.pipeline) {  // a new swapchain format: a new render pass and pipeline
+        VkDevice d = vk_device();
+        p_vkDestroyPipeline(d, g.pipeline, nullptr);
+        p_vkDestroyRenderPass(d, g.render_pass, nullptr);
+        g.pipeline = VK_NULL_HANDLE, g.render_pass = VK_NULL_HANDLE;
+    }
+    if (!g.pipeline && !make_pipeline(format)) {
+        log("nvn/vk: present pass unavailable: frames are blitted");
+        g.failed = true;
+        return false;
+    }
+    VkDevice d = vk_device();
+    uint32_t n = uint32_t(images.size());
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, n};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = n, dpi.poolSizeCount = 1, dpi.pPoolSizes = &size;
+    if (p_vkCreateDescriptorPool(d, &dpi, nullptr, &g.pool) != VK_SUCCESS) return false;
+    std::vector<VkDescriptorSetLayout> layouts(n, g.set_layout);
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = g.pool, dai.descriptorSetCount = n, dai.pSetLayouts = layouts.data();
+    g.sets.resize(n);
+    if (p_vkAllocateDescriptorSets(d, &dai, g.sets.data()) != VK_SUCCESS) return false;
+    for (VkImage img : images) {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = img, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageView v = VK_NULL_HANDLE;
+        p_vkCreateImageView(d, &vi, nullptr, &v);
+        g.views.push_back(v);
+        VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fi.renderPass = g.render_pass, fi.attachmentCount = 1, fi.pAttachments = &v;
+        fi.width = extent.width, fi.height = extent.height, fi.layers = 1;
+        VkFramebuffer fb = VK_NULL_HANDLE;
+        if (p_vkCreateFramebuffer(d, &fi, nullptr, &fb) != VK_SUCCESS) return false;
+        g.framebuffers.push_back(fb);
+    }
+    g.extent = extent, g.transform = transform;
+    return true;
+}
+
+bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop, uint32_t index) {
+    if (!g.pipeline || index >= g.framebuffers.size() || !src.view || src.levels != 1 || src.layers != 1 ||
+        src.view_type != VK_IMAGE_VIEW_TYPE_2D || !(src.aspect & VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+    transition(cb, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    VkDescriptorImageInfo ii{g.sampler, src.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = g.sets[index], w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w.pImageInfo = &ii;
+    p_vkUpdateDescriptorSets(vk_device(), 1, &w, 0, nullptr);
+
+    Push p{};
+    // Host uv -> upright uv, undoing the clockwise turn the display applies (as vk_present.cpp).
+    static const float kRot[4][6] = {{1, 0, 0, 1, 0, 0}, {0, -1, 1, 0, 0, 1}, {-1, 0, 0, -1, 1, 1}, {0, 1, -1, 0, 1, 0}};
+    int r = g.transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR    ? 1
+            : g.transform == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR ? 2
+            : g.transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR ? 3
+                                                                     : 0;
+    std::memcpy(p.rot, kRot[r], 4 * sizeof(float));
+    p.off[0] = kRot[r][4], p.off[1] = kRot[r][5];
+    // The part of the texture shown (nvnWindowSetCrop), fit into the upright target keeping its aspect.
+    float cx = 0, cy = 0, cw = float(src.width), ch = float(src.height);
+    if (crop && crop[2] > 0 && crop[3] > 0 && crop[0] + crop[2] <= int32_t(src.width) &&
+        crop[1] + crop[3] <= int32_t(src.height))
+        cx = float(crop[0]), cy = float(crop[1]), cw = float(crop[2]), ch = float(crop[3]);
+    p.crop[0] = cx / float(src.width), p.crop[1] = cy / float(src.height);
+    p.crop[2] = cw / float(src.width), p.crop[3] = ch / float(src.height);
+    bool sideways = r == 1 || r == 3;
+    float tw = float(sideways ? g.extent.height : g.extent.width), th = float(sideways ? g.extent.width : g.extent.height);
+    float scale = std::min(tw / cw, th / ch), bw = cw * scale / tw, bh = ch * scale / th;
+    p.box[0] = (1 - bw) / 2, p.box[1] = (1 - bh) / 2, p.box[2] = bw, p.box[3] = bh;
+
+    VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rb.renderPass = g.render_pass, rb.framebuffer = g.framebuffers[index], rb.renderArea = {{0, 0}, g.extent};
+    p_vkCmdBeginRenderPass(cb, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    VkViewport v{0, 0, float(g.extent.width), float(g.extent.height), 0, 1};
+    VkRect2D sc{{0, 0}, g.extent};
+    p_vkCmdSetViewport(cb, 0, 1, &v);
+    p_vkCmdSetScissor(cb, 0, 1, &sc);
+    p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipeline);
+    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &g.sets[index], 0, nullptr);
+    p_vkCmdPushConstants(cb, g.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof p, &p);
+    p_vkCmdDraw(cb, 3, 1, 0, 0);
+    p_vkCmdEndRenderPass(cb);
+    return true;
+}
+
+// NX_PRESENT_TEST=<w>x<h>[:<90|180|270>] (headless, with NX_DUMP_FRAMES): the pass draws into an offscreen image
+// of that size and transform, and that image is dumped in place of the window texture. It checks the rotation, the
+// fit and the alpha without a phone (a Galaxy S23 held sideways: 1080x2340:90).
+GpuImage* present_pass_test_target() {
+    static GpuImage img;
+    static bool tried = false;
+    if (tried) return img.image ? &img : nullptr;
+    tried = true;
+    const char* e = std::getenv("NX_PRESENT_TEST");
+    uint32_t w = 0, h = 0, deg = 0;
+    if (!e || std::sscanf(e, "%ux%u:%u", &w, &h, &deg) < 2 || !w || !h) return nullptr;
+    VkDevice d = vk_device();
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D, ci.format = VK_FORMAT_R8G8B8A8_UNORM, ci.extent = {w, h, 1};
+    ci.mipLevels = 1, ci.arrayLayers = 1, ci.samples = VK_SAMPLE_COUNT_1_BIT, ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (p_vkCreateImage(d, &ci, nullptr, &img.image) != VK_SUCCESS) return nullptr;
+    VkMemoryRequirements req{};
+    p_vkGetImageMemoryRequirements(d, img.image, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size, ai.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    p_vkAllocateMemory(d, &ai, nullptr, &img.memory);
+    p_vkBindImageMemory(d, img.image, img.memory, 0);
+    img.format = VK_FORMAT_R8G8B8A8_UNORM, img.width = w, img.height = h;
+    VkSurfaceTransformFlagBitsKHR t = deg == 90    ? VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR
+                                      : deg == 180 ? VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR
+                                      : deg == 270 ? VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR
+                                                   : VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    if (!present_pass_targets(img.format, {img.image}, {w, h}, t)) {
+        log("nvn/vk: present test: the pass is off (NX_PRESENT_PASS=1)");
+        return nullptr;
+    }
+    log("nvn/vk: present test: %ux%u, turned %u degrees", w, h, deg);
+    return &img;
+}
+
+}  // namespace nx::nvn
