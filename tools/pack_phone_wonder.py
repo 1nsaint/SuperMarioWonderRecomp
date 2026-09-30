@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Pack the Wonder data a phone needs into one zip (docs/nvn/ANDROID-PORT.md, 2.5).
 
-The zip is extracted to "Internal storage/Super Mario Bros. Wonder" (or the app's own external files folder), the
-data root the Android runtime looks in. Everything in it comes from the player's own dump and tools:
+The zip holds the folder "Super Mario Bros. Wonder" and is extracted into Internal storage (or the app's own external
+files folder): the data root the Android runtime looks in. Everything in it comes from the player's own dump and tools:
 
     analysis/main.bin, analysis/sdk.bin    the modules (tools/nso2bin.py)
     extract/romfs/...                      the RomFS (3.5 GB)
@@ -19,6 +19,10 @@ import argparse
 import os
 import sys
 import zipfile
+
+# The zip holds the folder itself: extracted into Internal storage it gives the data root the runtime looks in
+# ("/storage/emulated/0/" + the game's title, platform_android.cpp).
+TOP = "Super Mario Bros. Wonder/"
 
 CONFIG = """# Super Mario Bros. Wonder (Switch recomp) on Android. NX_* lines become environment variables.
 NX_HANDHELD=1
@@ -65,11 +69,11 @@ def main():
         return
     with zipfile.ZipFile(a.out, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
         for k, (p, name) in enumerate(files):
-            z.write(p, name)
+            z.write(p, TOP + name)
             if k % 2000 == 0:
                 print(f"  {k}/{len(files)}", flush=True)
         if not any(name == "config.txt" for _, name in files):
-            z.writestr("config.txt", CONFIG)
+            z.writestr(TOP + "config.txt", CONFIG)
     print(f"wrote {a.out} ({os.path.getsize(a.out) / 2**30:.2f} GB)")
 
 
