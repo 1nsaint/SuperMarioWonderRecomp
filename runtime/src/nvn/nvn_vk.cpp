@@ -243,8 +243,8 @@ bool make_surface() {
     if (g_surface) p_vkDestroySurfaceKHR(g_instance, g_surface, nullptr);
     if (g_window) plat::release_window(g_window);
     g_surface = VK_NULL_HANDLE;
+    g_window = plat::create_window();  // waits for a window (Android); the generation is read once it is there
     g_window_gen = plat::window_generation();
-    g_window = plat::create_window();
     uint64_t surface = 0;
     if (!check(VkResult(plat::vulkan_create_surface(g_instance, g_window, &surface, g_gipa)), "surface")) return false;
     g_surface = reinterpret_cast<VkSurfaceKHR>(surface);
