@@ -449,3 +449,262 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
         by default).
       - It broke the course's foreground flowers (dynamic-resolution targets are meant to be followed) and did not
         light the Goombas.
+46. **Images the GPU rendered, sampled as stale uploads through another texture object.**
+    - A diagnostic listed every texture upload whose memory the GPU had already rendered through a live image of the
+      same shape (removed after use; `rendered_alias` in the commit history).
+    - Cases found:
+      - the UI's text strips (608x33, 200x33 RGBA8);
+      - the 2048x2048 D16 shadow map;
+      - some dynamic-resolution targets.
+    - Two rules kept those textures from sharing the rendered image:
+      - `image_of` skipped sharing for any texture with a pool view swizzle;
+      - the storage key held the builder swizzle, and a render target and the texture sampling it often differ in it.
+    - Both date from before #44. Since #44, each texture samples with its own swizzle (`sampled_view`), so neither
+      rule is needed.
+    - Now:
+      - the swizzle is not part of the share and reuse keys;
+      - a pool swizzle does not stop sharing;
+      - only an R8 texture widened for alpha-from-red keeps its own image.
+    - Bisecting: `NX_KEY_SWIZZLE=1` and `NX_SHARE_NO_POOL_SWIZZLE=1` restore the old rules.
+    - Character select checked frame by frame against the previous run: no change except timing.
+    - Light probes (#39, #42), what the night established. Runs must last about 290 s to reach the course (the input
+      script enters it at ~175 s); earlier "course" probe traces at frame ~7100 were the world map's.
+      - The course probe chain is:
+        1. 256x256 scene faces (GPU-rendered);
+        2. a 128x128x12 cube array (layers 0-5), then prefiltered layers and mips sampled from itself;
+        3. 64x64 2-level and 5-level cubes, from a 64x64 RGBA16F direction map plus colours in the fragment uniforms
+           (c5[16], c5[17]).
+      - `NX_DUMP_ON_FS=<fs hash,...>` (only draws into cube targets, from frame `NX_DUMP_FROM`) reads back each
+        stage. `NX_DUMP_TARGET_EVERY` sets the period of `NX_DUMP_ON_TARGET`.
+      - The cube array looks right (sky, horizon). Most 64x64 probes are lit, a few are black.
+      - The black ones are drawn with all-zero colour uniforms (even w). One probe is lit at the course start and
+        re-captured black ~5 s later with zeros at the same uniform address.
+      - The 64x64 direction map is all zeros in guest memory whenever it is uploaded.
+      - Ruled out:
+        - CPU writes after the upload (`NX_HASH_SMALL=<bytes>` hashes small block-linear textures);
+        - compute write-backs in the same submit;
+        - GPU renders through another object;
+        - CPU readback of render targets.
+47. **Deferred clears (nvn_clears.cpp).**
+    - Before: a clear of targets other than the open pass's began a pass with every attachment loaded, then cleared
+      with a `vkCmdClearAttachments` quad. That was ~36 passes per course frame, each a full-resolution load on a
+      tile GPU.
+    - Now the clear stays pending. The next pass on the same targets begins with loadOp CLEAR (same render area, so
+      the same pixels as the quad).
+    - Anything else first gets the clear done in a pass of its own, with no draw:
+      - a pass on other targets;
+      - a draw sampling a cleared image;
+      - a dispatch, a copy, a snapshot, or the submit's end.
+    - `NX_EAGER_CLEARS=1` restores the old way.
+    - `Targets` are now compared field by field (`targets_same`); a memcmp also compared the padding after
+      `color_count`. `NX_TARGETS_MEMCMP=1` restores the memcmp in draws.
+    - Matching a pending clear into a pass on more targets with the same area (`NX_CLEARS_SUBSET=1`) measured no
+      faster, so it is off.
+    - Course average (headless, synchronous): replay 7.9 → 7.4 ms, GPU wait 13.1 → 12.5-13.0 ms, 44.7 → 46-47 fps.
+      Runs vary by ±1 ms with the character the input script happens to pick.
+    - GPU profile of the course (`NX_GPU_PROFILE=1`): ~3 ms/frame between passes (~66 gaps), and 1080p shading.
+      The biggest passes are fs 4601469d (1.5 ms) and f8a4447a (2x 0.85 ms).
+    - Open: an intermittent band of horizontal garbage across the course's middle layer (seen in 2 of 9 course runs,
+      both after a respawn, in docked and handheld mode). Not caused by the clear matching; being bisected.
+48. **Handheld mode (`NX_HANDHELD=1`) and `nvnWindowSetCrop`.**
+    - `GetOperationMode` / `GetPerformanceMode` report handheld and normal (both am and apm), and the default display
+      resolution is 1280x720.
+    - The game then renders its 3D at 720p into its 1920x1080 window textures and crops to 1280x720 with
+      `nvnWindowSetCrop`. That call was a stub; it now sets the part of the window texture blitted to the window.
+    - Course: GPU wait 9.7 ms against 12.5-13, and 52-57 fps against 46-47 docked.
+    - Docked stays the default (the Switch's docked picture).
+    - Async GPU (`NX_ASYNC_GPU=2` + `MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0`) was retested: menus hold 60, but the
+      loads became slow enough that the input script never reached the course. It stays off.
+49. **WriteTexels images keep their texels; FMZ in the translator.**
+    - An image given texels by `nvnTextureWriteTexels` is not uploaded again from guest memory when a pool flush
+      marks it dirty. Those texels never reach guest memory here, so the re-upload wiped them.
+      `NX_TEXELS_REUPLOAD=1` restores the old behaviour.
+    - `tools/maxwell/spirv_harness/translator/spirv-fmz.patch`:
+      - Ryujinx decodes Maxwell's FMZ mode on FMUL/FFMA and ignores it. The patch makes a zero factor give 0 (FFMA:
+        c) even against Inf/NaN.
+      - A full batch changes 21 blocks, all compute (particle effects).
+      - No visible change in the course; kept for correctness.
+    - Debug tools:
+      - `NX_DUMP_ON_FS=<fs,...>` (`NX_DUMP_FROM`, `NX_DUMP_ANY`, `NX_DUMP_TARGET_EVERY`): reads back a draw's
+        target and inputs at the submit's end.
+      - `NX_SNAP_FOLLOW=<fs>@<draw>|@f<frame>` (`NX_SNAP_FOLLOW_COUNT`, `NX_SNAP_FOLLOW_NOSNAP`): logs and
+        snapshots the draws of a pass one by one.
+50. **Sampler state was lost (the biggest remaining glitch source; docs/nvn/GLITCH-PLAN.md G1).**
+    - Commit c41b534 split `nvn_sampler.cpp` and overwrote the file that held the sampler objects:
+      - `nvnSamplerInitialize` / `Finalize`;
+      - `nvnSamplerPoolRegisterSampler` / `RegisterSamplerBuilder`;
+      - the `nvnSamplerGet*` getters.
+    - They fell back to trace stubs, so every texture sampled with `SamplerInfo{}`:
+      - nearest filtering;
+      - clamp to edge;
+      - mip 0 only;
+      - shadow compare ALWAYS.
+    - Restored as `nvn_sampler_objects.cpp`. Result:
+      - **The dark Goombas, tree and characters (#26, #39, #42) are lit.** Their shaders read the SSAO target with
+        `textureLod(ao, uv, 1.0)`. The game renders AO only into level 1, so mip 0 (never written) made AO 0 and
+        the lighting fell to its floor.
+      - Smooth sky (#28).
+      - The world map's repeating textures are back (grass, flower beds, water).
+    - The #49 rule that let only render targets (flags 0x8) reuse destroyed images is reverted: the AO targets have
+      flags 0 and depend on reuse (#42).
+    - A duplicated `nvn_sampler.cpp` line in CMakeLists.txt is removed.
+
+![Course](../media/wonder/33-course-samplers-restored-goombas-lit.png)
+![World map](../media/wonder/34-world-map-samplers-restored.png)
+51. **R11G11B10F uploads, fresh render targets, unwritten attachments (GLITCH-PLAN G3/G4).**
+    - **Uploads.** NVN 0x3f is stored as RGBA16F, but uploads copied its 4-byte texels as 8-byte ones. The copy read
+      twice the data (rows side by side, other uploads in the bottom half), which fits the garbage band after a
+      respawn.
+      - Uploads now widen each texel to four halves (same exponent bias, wider mantissas, alpha 1).
+      - Any copy that would read past the staged data is logged ("upload short") and cleared instead.
+      - Upload code moved to `nvn_upload.cpp`.
+    - **Fresh render targets** (flags 0x8, never written by the GPU, no texel writes) are cleared instead of uploaded
+      from guest memory, which never holds GPU output here. `NX_RT_UPLOAD=1` restores the upload;
+      `NX_ALIAS_MAGENTA=1` clears them magenta to find them.
+    - **Unwritten attachments** (layout UNDEFINED) begin their pass with loadOp CLEAR (colour 0, depth 1), not a LOAD
+      of recycled memory (`NX_UNDEFINED_LOAD=1`).
+    - **`drain_objects`** runs under the GPU lock in `gpu_submit` / `gpu_present`, so no object is freed while
+      another holder of the lock replays.
+    - **R11G11B10F semantics.**
+      - Sampled alpha reads 1.
+      - On such attachments, DST_ALPHA blends become ONE and ONE_MINUS_DST_ALPHA becomes ZERO.
+      - `view_format` compares host texel sizes.
+      - `NX_R11G11B10_RAW=1` restores the old behaviour.
+    - Course and character select unchanged except where they should be (Peach lit, no upload short); course
+      ~44 fps.
+52. **1D textures, masked clears, alpha to coverage, copies within one image (GLITCH-PLAN G6/G7/G8/G10).**
+    - **1D textures.** NVN 1D and 1D-array textures (targets 0/3) are 2D / 2D-array images of height 1. Ryujinx samples
+      1D as 2D, so a Vulkan 1D image's 2D view was refused and those draws read the black dummy. `NX_1D_IMAGES=1`
+      restores the old images.
+    - **Masked clears.** A colour clear with some channels masked off runs as a fullscreen draw with that write mask
+      (`nvn_mask_clear.cpp`, two tiny glslc shaders). `NX_CLEARS_NO_MASK=1` restores the old clear. No course clear
+      used a partial mask in the test runs.
+    - **Scissored clears are off.** Clipping clears to the bound scissor left whole regions of the course uncleared
+      (huge black and white shapes); the character select was unaffected. `NX_CLEARS_SCISSOR=1` turns it back on for
+      study.
+    - **`nvnCommandBufferBindMultisampleState`** is no longer a stub. Its alpha-to-coverage enable goes to the
+      pipeline key and `alphaToCoverageEnable` (`NX_NO_ALPHA_TO_COVERAGE=1`).
+    - **Copies within one image.** A copy between two subresources of one image (two texture objects sharing it,
+      #36) is no longer dropped; it runs in GENERAL layout with explicit barriers (`NX_COPY_NO_SAME_IMAGE=1`).
+    - "Too bad!" is drawn hollow by design (see #56): not a masked clear (none happened).
+53. **Compute results within a submit (GLITCH-PLAN G5, `nvn_written.cpp`).**
+    - The problem:
+      - a storage buffer a dispatch writes was a private copy of guest memory, written back only after the submit;
+      - later draws and dispatches in the same submit read the old guest bytes;
+      - a second writer's write-back overwrote the first's.
+    - Now each submit keeps one copy per written guest range:
+      - writers reuse or merge copies;
+      - reads that overlap one (uniform, storage, vertex, index) bind that copy, composing on the GPU when a read
+        only partly overlaps;
+      - an indirect dispatch whose arguments were written in the submit uses `vkCmdDispatchIndirect`;
+      - each range is written back once.
+    - `NX_COMPUTE_SEPARATE=1` restores the old copies.
+    - Course: ~6,200 bindings of written copies per log period, no regression, 45.7 fps (fewer copies).
+54. **NaN semantics, fast math, and the intermittent band (GLITCH-PLAN G9, G3).**
+    - **NaN translator patch** (`translator/spirv-nan.patch`, not in the build):
+      - What it does: float Clamp/Min/Max emitted as GLSL.std.450 NClamp/NMin/NMax, Maxwell's NaN-dropping `.SAT`
+        and FMNMX.
+      - Batch: changes 10,304 of 12,717 blocks, all valid.
+      - Course run: horizontal streaks along the horizon, a black and white patch near the ground, replay 7.8 →
+        11 ms (new Metal compiles).
+      - The same streaks then appeared with the old shaders too, so the patch is not proven to cause them. It is
+        kept out anyway: no visible gain.
+    - **`MVK_CONFIG_FAST_MATH_ENABLED=0`:** no visual change, course 39.8 fps (against 44-46). It stays on.
+    - **The horizon band.**
+      - Rows of garbage across the course's background layer appear in about every other 290 s run.
+      - `NX_ALIAS_MAGENTA=1` showed no fresh render target being sampled.
+      - Serializing texture re-initialization with the replay (`NX_REINIT_WAITS_REPLAY=1`, experiment): no band in
+        the run that played, but another run hung at boot, and the course ran at 32 fps. It stays opt-in.
+      - The race it points at: other game threads re-initialize dynamic-resolution texture structs while a submit
+        is replayed, so `get<Texture>` returns the new incarnation mid-replay. It needs a proper design (per-submit
+        incarnations): in progress.
+55. **Texture incarnations: a submit sees each texture as it was when the submit started (`nvn_incarnation.cpp`).**
+    - Two races between the replay and the game's other threads:
+      - `nvnTextureInitialize` put an empty Texture in the registry and filled it over ~15 guest calls with no lock.
+        A replay could look it up half-built (new size, memory 0) and give it an image no target shares.
+      - A struct re-initialized or finalized mid-replay made `get<Texture>` switch to the new incarnation between
+        two draws of one submit.
+    - Now:
+      - a texture is built locally and published in one locked step; Finalize is one step too;
+      - each replaced object is recorded with an epoch;
+      - `gpu_submit` marks the epoch (`ReplayScope`), and replay-side `get<>` resolves to the object that was
+        current at that mark;
+      - retired objects are freed by `drain_objects`, under the GPU lock, with their records.
+    - Measured: 640-750 thousand replay lookups per course run hit a texture changed mid-replay.
+    - `NX_TEXTURE_RACE_OLD=1` restores the old behaviour.
+    - The horizon band is not this: it still appeared in 1 of 3 runs. Up close it is stretched geometry with
+      sparkles around it, and it lasts the whole run once it appears: a GPU-simulated effect whose state went bad.
+      `NX_TRACE_NAN=1` logs non-finite or huge floats in compute write-backs, with the shader.
+56. **The game records frame N+1 while frame N is replayed: pool slots at the replay's mark, selective write-back.**
+    - Measured: 98.5% of `nvnTexturePoolRegisterTexture` calls (236 k of 240 k in a run) happen while another thread
+      replays a submit. Wonder has a recording thread and a submit thread, so our synchronous replay of frame N runs
+      while the next frame's textures are re-initialized and its pool slots registered.
+    - **Pool slots.**
+      - `texture_for` read the pools' maps with no lock, and as they were at that instant.
+      - Each registration now records the entry it replaces, with an epoch (`note_pool_change`).
+      - The replay reads the slot as it was at its mark (`pool_entry_at`), under the objects lock, like #55 does for
+        texture objects.
+      - In the test runs no lookup needed an older entry: the game registers the next frame in other slots. The lock
+        and the history stay for safety.
+    - **Write-backs.**
+      - A compute shader's storage range was copied back whole after the submit. The range is often larger than
+        what the shader writes, and the recording thread writes the rest of those buffers meanwhile, so stale bytes
+        went over them.
+      - Now each written range keeps the guest bytes it was made from, and only the words the GPU changed go back
+        (`apply_write_back`).
+      - `NX_WRITE_BACK_WHOLE=1` restores the old whole-range copy.
+    - **Still open: the horizon band.** It still appeared in 1 of 4 runs after both changes. One run showed the
+      fence stumps exploded into huge beams before the band, so it is mesh data, not a texture. Next:
+      `private/wonder/band_hunt.sh` snapshots every draw of the main pass, cropped to the band (`NX_SNAP_CROP`), to
+      name the draw.
+    - **"Too bad!" is hollow by design.**
+      - Its font (`fcpx/NewMarioFontOutlineLL`, face `NinNewSuperMarioBrosT53ou`) is an outline typeface: rasterised
+        with FreeType it gives the same ring letters.
+      - The Miss layout has nothing that fills the letters: two capture panes, one of them a blurred black shadow.
+      - Only the soft shadow may be weaker than on hardware (the blur chain, GLITCH-PLAN G10).
+57. **The replay's mark is the end of the lists' recording, not the start of the submit.**
+    - #55 took the mark when the submit started. But the recording thread runs ahead of the submit thread, by more
+      than a frame when our replay is slower than 60 fps (the course: 45 fps). By the time a submit starts, the next
+      frames' textures and pool slots are already there, and the mark included them.
+    - How often that phase was bad depended on the run, which is why the glitches were intermittent:
+      - a band of stretched geometry at the horizon;
+      - exploded meshes;
+      - a white or striped foreground layer.
+    - Now:
+      - `nvnCommandBufferEndRecording` stamps each list with the epoch;
+      - `gpu_submit` marks the replay with the newest stamp of its lists (`ReplayScope(lists_epoch)`);
+      - the mark never goes back;
+      - deferred objects carry the epoch at which they were retired, and `drain_objects` frees only those at or
+        before the last mark, with their records.
+    - `NX_MARK_AT_SUBMIT=1` restores #55's mark.
+    - Result: 4 course runs of 290 s, 28 course frames, no band, no exploded mesh, no white foreground (before:
+      about 1 run in 3). 44.6-46.7 fps.
+    - The 60 fps plan from the performance study is in docs/nvn/PERF-PLAN.md.
+58. **The character-select blur (GLITCH-PLAN G10, issue #42): the chain runs, and the game's own stream clears it.**
+    - Corrections to G10:
+      - The blur is a one-shot capture in the frame after the first button press (layout `TitleBlurBG`), not a
+        per-frame pass.
+      - `multi_filter_expand` is never bound because `Blur00.baglmf` disables every expand unit.
+      - The halftone dots and the grey mask are drawn. Only the blurred picture is missing.
+    - The chain, as replayed (`NX_TRACE_PASSES`, `NX_TRACE_CMDS`, snapshots):
+      1. `ClearColor` of the work target A (1920x1080 RGBA8);
+      2. a quad copies the framebuffer into A. A snapshot right after shows the whole title picture;
+      3. `SetRenderTargets(A)` again, then `ClearColor(0, 0, 0, 0)` with mask 0xF, in the same command list;
+      4. `multi_filter_reduce` samples A into 480x270, then the gaussian passes and the copy into the pane texture.
+         All of them come out black.
+    - Step 3 is in the game's recorded stream, and we replay it as recorded. The bound channel mask is 0xF too, and
+      the scissor is the whole target.
+    - Ruled out: uniforms (`NX_TRACE_UUB`), sampler and view (`NX_TRACE_SAMPLERS`), deferred clears, fresh-target
+      clears, image sharing, dedup.
+    - Open question: whether the hardware skips or restricts that clear (an NVN clear rule we do not know), or
+      whether the console's picture is sharp under the mask and dots too. It needs a capture from a real console.
+    - New switches:
+      - `NX_TRACE_PASSES=<draw>`: pass begins (load ops), ends (reason) and clears.
+      - `NX_TRACE_CMDS=<draw>`: every replayed op.
+      - `NX_TRACE_UUB=<draw>`: uniform updates.
+      - `NX_TRACE_SAMPLERS=1`: sampler and view of each sampled texture in `NX_TRACE_DRAWS`.
+    - In the `NX_TRACE_DRAWS` log, the detail lines printed after a `draw N:` line describe draw N+1.
+    - `NX_TRACE_GLYPHS` crashes on draws that are not text (it reads the glyph atlas at the draw's UVs): use it only
+      with `NX_TRACE_FS_HASH` of a text shader.
+
+Continued in [DEBUG-2.md](DEBUG-2.md) (entries 59 onward).

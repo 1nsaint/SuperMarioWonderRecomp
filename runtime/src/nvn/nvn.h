@@ -63,28 +63,48 @@ struct ObjectsLock {
 ObjectsLock& objects_lock();
 std::unordered_map<uint64_t, std::unique_ptr<Object>>& objects();
 
+// Texture incarnations (nvn_incarnation.cpp, docs/nvn/DEBUG.md #55). Game threads re-initialize and finalize texture
+// structs while another thread replays a submit (Wonder's dynamic-resolution targets, every frame). A replay resolves
+// every texture as it was when the submit began: each re-initialization or finalization records the incarnation it
+// retires, with an epoch, and a replay's lookups (t_replay_mark != 0) return the one current at its mark. Retired
+// objects live on as deferred objects until drain_objects, which also forgets the records. Game threads (mark 0)
+// always see the current one. NX_TEXTURE_RACE_OLD=1: no records, no marks (the old behaviour).
+inline thread_local uint64_t t_replay_mark = 0;  // the replaying thread's mark; 0 outside a replay
+bool texture_race_old();
+Object* find_object(uint64_t guest, uint64_t mark);  // under objects_lock (shared)
+void note_replaced(uint64_t guest);                  // under objects_lock (alone): guest's object is about to change
+void purge_incarnations(uint64_t upto);              // under objects_lock (alone), from drain_objects: records <= upto
+uint64_t current_epoch();                            // the epoch of the last recorded change
+uint64_t replay_floor();                             // the last replay's mark: objects retired up to it can go
+// A submit's replay (gpu_submit, under the GPU lock): takes the mark, then drains the deferred objects no replay
+// needs any more. `lists_epoch`: the newest epoch at which the submit's command lists ended recording (0: unknown).
+struct ReplayScope {
+    explicit ReplayScope(uint64_t lists_epoch);
+    ~ReplayScope();
+};
+
 // A per-thread cache of the last lookups of each type, valid until anything takes the lock alone: a recorded command
 // looks up its command buffer, a replayed draw the same texture 5-10 times, and libc++'s shared lock is a mutex and a
 // condition variable that the game threads and the replay contend on (~20% of the main thread's own CPU in the
-// course, docs/nvn/DEBUG.md #44). The generation is read before the lookup: a concurrent change invalidates it.
+// course, docs/nvn/DEBUG.md #44). The generation is read before the lookup: a concurrent change invalidates it. The
+// replay mark is part of the key: a thread that replays (the render thread) also calls the game-side procs.
 template <typename T>
 T* get(uint64_t guest) {
     struct Entry {
-        uint64_t guest = 0, generation = 0;
+        uint64_t guest = 0, generation = 0, mark = 0;
         T* object = nullptr;
     };
     thread_local Entry cache[8];
     ObjectsLock& ol = objects_lock();
-    uint64_t gen = ol.generation.load(std::memory_order_acquire);
+    uint64_t gen = ol.generation.load(std::memory_order_acquire), mark = t_replay_mark;
     Entry& e = cache[((guest >> 3) ^ (guest >> 11)) & 7];
-    if (e.generation == gen && e.guest == guest) return e.object;
+    if (e.generation == gen && e.guest == guest && e.mark == mark) return e.object;
     T* p;
     {
         std::shared_lock lk(ol);
-        auto it = objects().find(guest);
-        p = it == objects().end() ? nullptr : dynamic_cast<T*>(it->second.get());
+        p = dynamic_cast<T*>(find_object(guest, mark));
     }
-    e = {guest, gen, p};
+    e = {guest, gen, mark, p};
     return p;
 }
 
@@ -92,6 +112,7 @@ T* get(uint64_t guest) {
 // while a replay may still hold a pointer from get<T>() (nvn_trace.cpp). Under objects_lock.
 void defer_object(std::unique_ptr<Object> o);
 void drain_objects();
+void wait_submits_so_far();  // nvn_queue.cpp: until the submits made so far were replayed (DEBUG.md #59)
 
 template <typename T>
 T& make(uint64_t guest) {
@@ -100,6 +121,13 @@ T& make(uint64_t guest) {
     if (slot) defer_object(std::move(slot));
     slot = std::make_unique<T>();
     return static_cast<T&>(*slot);
+}
+
+// Installs a fully built object at `guest` (the one there goes to defer_object). Under objects_lock (alone).
+inline void publish_locked(uint64_t guest, std::unique_ptr<Object> o) {
+    auto& slot = objects()[guest];
+    if (slot) defer_object(std::move(slot));
+    slot = std::move(o);
 }
 
 inline void destroy(uint64_t guest) {
@@ -150,6 +178,9 @@ struct Texture : Object {
         std::vector<uint8_t> data;  // rows of whole blocks, tightly packed
     };
     std::vector<TexelWrite> writes;  // under objects_lock()
+    // Whether `writes` holds anything: set and cleared with it, under objects_lock() alone, and read without the lock
+    // (every sampled texture of every replayed draw asks; docs/nvn/PERF-PLAN.md).
+    std::atomic<bool> has_writes{false};
     // The CPU wrote the texture's memory (nvnMemoryPoolFlushMappedRange over it, e.g. a glyph cache): upload again.
     std::atomic<bool> dirty{false};
     // The swizzle of the texture-pool view it is registered with (4 NVNtextureSwizzle bytes, 0: none).
@@ -165,6 +196,7 @@ struct Texture : Object {
 struct Window : Object {
     std::vector<uint64_t> textures;  // guest NVNtexture*
     int active = 0, next = 0, interval = 1;
+    int32_t crop[4] = {};  // nvnWindowSetCrop: x, y, width, height of the texture shown (0 wide: all of it)
 };
 
 // ---- samplers and descriptor pools --------------------------------------------------------------------------------
@@ -191,9 +223,32 @@ struct DescriptorPool : Object {  // an NVNtexturePool or NVNsamplerPool
     std::map<uint32_t, SamplerInfo> samplers;  // id -> sampler state
 };
 
+// A texture pool slot as a replay must see it (nvn_incarnation.cpp, DEBUG.md #56): the game registers the next
+// frame's slots from its recording thread while a submit is replayed, so each change records the entry it replaces.
+struct PoolEntry {
+    bool has = false, has_view = false;
+    uint64_t texture = 0, snapshot = 0;
+    ViewInfo view;
+};
+void note_pool_change(uint64_t pool, uint32_t id, const PoolEntry& before);  // objects_lock held exclusively
+// objects_lock held: the slot's entry at `mark` when it changed since (false: the current entry is the one).
+bool pool_entry_at(uint64_t pool, uint32_t id, uint64_t mark, PoolEntry& out);
+bool mark_empty_old();  // NX_MARK_EMPTY_OLD=1: a slot or object empty at the mark stays empty (bisecting, #64)
+// The same for sampler pool slots (DEBUG.md #63): recorded only when the sampler changes.
+struct SamplerSlot {
+    bool has = false;
+    SamplerInfo info;
+};
+void note_sampler_change(uint64_t pool, uint32_t id, const SamplerSlot& before);  // objects_lock held exclusively
+bool sampler_entry_at(uint64_t pool, uint32_t id, uint64_t mark, SamplerSlot& out);
+
 // NVNformat -> VkFormat, and whether it is color (0), depth (1), stencil (2) or both (3) (nvn_format.cpp).
 VkFormat vk_format(uint32_t format);
 uint32_t format_aspect(uint32_t format);
+// Bytes per texel of a Vulkan format as buffer-image copies count them (nvn_format.cpp); 0 for block-compressed and
+// combined depth/stencil formats, whose NVN size (format_block) is the host's. Differs from the NVN size where a
+// format is stored wider than the game's: 0x3f R11G11B10F is 4 bytes in NVN, RGBA16F (8) here.
+uint32_t vk_block_bytes(VkFormat format);
 
 // NVN enums -> Vulkan (nvn_enums.cpp).
 VkBlendFactor vk_blend_factor(uint32_t f);
@@ -221,6 +276,7 @@ struct Cmd {
         BindImage, DispatchCompute,
         SetStencilRef, SetStencilMask, SetStencilValueMask, SetPolygonOffsetClamp, SetDepthBounds, SetDepthClamp,
         BindDeferred,  // mask: 0 textures, 1 images, 2 uniform buffers, 3 storage buffers; a[0] the guest array
+        BindMultisampleState,  // n: alpha to coverage enabled (nvn_state.cpp)
     } op;
     uint32_t n = 0, mask = 0;
     uint64_t a[9] = {};  // textures (render targets: colors then depth), handles, GPU addresses, sizes, ...
@@ -233,6 +289,7 @@ struct CmdList {
     std::vector<Cmd> cmds;
     std::vector<std::vector<uint8_t>> blobs;
     uint64_t handle = 0;     // its NVNcommandHandle
+    uint64_t epoch = 0;      // the texture epoch when its recording ended (nvn_incarnation.cpp): what its draws name
     uint32_t skinned = 0;    // NX_TRACE_SKINLISTS: binds of skinned programs (a vertex input at location 6) in it
 };
 // NX_TRACE_SKINLISTS (nvn_cmd.cpp): follows the lists that bind skinned programs, from recording to replay.
@@ -264,6 +321,9 @@ struct DepthStencilInfo {
 struct PolygonInfo {
     uint32_t cull = 0, front = 0, mode = 0, offset_enables = 0;
 };
+// nvn_raster.cpp: an EQUAL colour pass after a depth pre-pass (tested, not written), drawn with a small depth bias
+// toward the camera (DEBUG.md #60). NX_EQUAL_SLACK=<units> (default 4, 0: off); the slope term is 1 per unit of it.
+bool equal_slack_pass(const DepthStencilInfo& d);
 
 struct TargetViews {  // SetRenderTargets' blob: level and layer per color target (0..7) and depth (8)
     uint8_t level[9] = {};
@@ -289,7 +349,8 @@ uint64_t worker_run(std::function<void()> job);
 void worker_wait(uint64_t serial);
 uint64_t worker_last();
 void worker_finish();
-void gpu_present(uint64_t texture);  // guest NVNtexture* of a window texture
+// guest NVNtexture* of a window texture; crop: the part shown (x, y, w, h; w 0: all), scaled to the window.
+void gpu_present(uint64_t texture, const int32_t* crop = nullptr);
 // With NX_ASYNC_GPU submits run while the game goes on (nvn_frames.cpp): the serial of the last one, and a wait until
 // it completed with its results in guest memory (true if it had to wait). Synchronous: 0, and nothing to wait for.
 uint64_t gpu_serial();

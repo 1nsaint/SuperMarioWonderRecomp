@@ -180,18 +180,30 @@ ObjectsLock& objects_lock() {
     return m;
 }
 
-std::vector<std::unique_ptr<Object>>& deferred_objects() {
-    static std::vector<std::unique_ptr<Object>> v;
+std::vector<std::pair<uint64_t, std::unique_ptr<Object>>>& deferred_objects() {  // (epoch when retired, object)
+    static std::vector<std::pair<uint64_t, std::unique_ptr<Object>>> v;
     return v;
 }
 
-void defer_object(std::unique_ptr<Object> o) { deferred_objects().push_back(std::move(o)); }
+void defer_object(std::unique_ptr<Object> o) { deferred_objects().push_back({current_epoch(), std::move(o)}); }
 
 void drain_objects() {
+    // Only what no replay can name any more: retired at or before the last replay's mark (nvn_incarnation.cpp). A
+    // later submit's lists were recorded after that, so they cannot mean those objects.
     std::vector<std::unique_ptr<Object>> dead;
     {
         std::lock_guard lk(objects_lock());
-        dead.swap(deferred_objects());
+        uint64_t upto = replay_floor();
+        auto& all = deferred_objects();
+        size_t keep = 0;
+        for (auto& [epoch, o] : all) {
+            if (epoch <= upto)
+                dead.push_back(std::move(o));
+            else
+                all[keep++] = {epoch, std::move(o)};
+        }
+        all.resize(keep);
+        purge_incarnations(upto);  // the records point at objects freed here
     }
 }  // destructors run here, outside the lock (a Texture's takes the graveyard lock)
 

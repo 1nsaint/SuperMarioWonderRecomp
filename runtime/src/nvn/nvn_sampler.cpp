@@ -1,7 +1,8 @@
 // NVN sampler states as Vulkan samplers (split from nvn_pipeline.cpp).
 #include <algorithm>
-#include <map>
-#include <string>
+#include <cstdlib>
+#include <cstring>
+#include <unordered_map>
 
 #include "nvn_pipeline.h"
 
@@ -28,9 +29,13 @@ VkSamplerAddressMode vk_wrap(uint32_t w) {  // NVN: 0 clamp, 1 repeat, 2 mirror 
 // ---- samplers -------------------------------------------------------------------------------------------------------
 
 VkSampler sampler_for(const SamplerInfo& s, bool shadow) {
-    static std::map<std::string, VkSampler> cache;
-    std::string key(reinterpret_cast<const char*>(&s), sizeof s);
-    key += shadow ? '1' : '0';
+    // Asked per texture binding of every draw: the key is the state's bytes and the flag (what the std::string key
+    // of before held, compared the same way), hashed; no allocation on a hit.
+    using Key = ByteKey<sizeof(SamplerInfo) + 1>;
+    static std::unordered_map<Key, VkSampler, ByteKeyHash> cache;
+    Key key;
+    std::memcpy(key.b, &s, sizeof s);
+    key.b[sizeof s] = shadow ? '1' : '0';
     auto& v = cache[key];
     if (v) return v;
     VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -77,11 +82,23 @@ uint64_t hash_memory(const uint8_t* p, uint64_t size) {
 void check_linear_content(Texture& t) {
     // Every 4th presented frame at most (every 4th submit was about every frame, ~1 ms); a new glyph shows 3 frames late.
     uint64_t frame = g_frame.load(std::memory_order_relaxed) + 1;
-    if (!t.stride || !t.memory || !t.image || t.image->rendered || (t.hashed_submit && t.hashed_submit + 4 > frame))
+    static const uint64_t hash_small = [] {
+        const char* e = std::getenv("NX_HASH_SMALL");
+        return e ? std::strtoull(e, nullptr, 10) : 0;
+    }();
+    bool small = hash_small && t.storage_size <= hash_small;
+    if ((!t.stride && !small) || !t.memory || !t.image || t.image->rendered ||
+        (t.hashed_submit && t.hashed_submit + 4 > frame))
         return;
     t.hashed_submit = frame;
     uint64_t h = hash_memory(reinterpret_cast<const uint8_t*>(t.memory), t.storage_size);
-    if (t.content_hash && h != t.content_hash) t.dirty = true;
+    if (t.content_hash && h != t.content_hash) {
+        t.dirty = true;
+        static int logged = 0;
+        if (!t.stride && logged++ < 100)
+            log("nvn: block-linear texture %llux%u f%x (%llu bytes) changed by the CPU", (unsigned long long)t.width,
+                t.height, t.format, (unsigned long long)t.storage_size);
+    }
     t.content_hash = h;
 }
 

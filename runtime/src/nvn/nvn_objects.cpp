@@ -13,12 +13,15 @@
 
 namespace nx::nvn {
 
+std::recursive_mutex& gpu_lock();  // nvn_vk.cpp
+
 // ---- GPU virtual addresses --------------------------------------------------------------------------------------
 
 namespace {
 
 std::mutex g_gpu_lock;
 std::map<uint64_t, MemoryPool*> g_pools_by_gpu;  // gpu start -> pool
+std::atomic<uint64_t> g_pools_generation{1};     // bumped with every change of the map, under g_gpu_lock
 uint64_t g_gpu_next = 0x100000000ull;  // NVN GPU addresses are 40-bit; keep 0 and low values invalid
 
 }  // namespace
@@ -32,21 +35,32 @@ uint64_t gpu_alloc(uint64_t size) {
 
 void pool_register(MemoryPool* p) {
     std::lock_guard lk(g_gpu_lock);
-    g_pools_by_gpu[p->gpu] = p;
+    g_pools_by_gpu[p->gpu] = p, g_pools_generation.fetch_add(1);
 }
 
 void pool_unregister(MemoryPool* p) {
     std::lock_guard lk(g_gpu_lock);
-    g_pools_by_gpu.erase(p->gpu);
+    g_pools_by_gpu.erase(p->gpu), g_pools_generation.fetch_add(1);
 }
 
+// Asked for every buffer a replayed draw binds, mostly in the same few pools: each thread keeps the last ranges it
+// found, good until a pool is registered or unregistered (a pool's address and size are final when it registers).
 MemoryPool* pool_at_gpu(uint64_t gpu, uint64_t* offset) {
+    thread_local struct { uint64_t generation, start, size; MemoryPool* pool; } hits[8] = {};
+    thread_local uint32_t next = 0;
+    uint64_t generation = g_pools_generation.load(std::memory_order_acquire);
+    for (const auto& h : hits)
+        if (h.generation == generation && gpu - h.start < h.size) {
+            if (offset) *offset = gpu - h.start;
+            return h.pool;
+        }
     std::lock_guard lk(g_gpu_lock);
     auto it = g_pools_by_gpu.upper_bound(gpu);
     if (it == g_pools_by_gpu.begin()) return nullptr;
     --it;
     MemoryPool* p = it->second;
     if (gpu - p->gpu >= p->size) return nullptr;
+    hits[next++ & 7] = {g_pools_generation.load(std::memory_order_relaxed), p->gpu, p->size, p};
     if (offset) *offset = gpu - p->gpu;
     return p;
 }
@@ -98,6 +112,7 @@ void MemoryPoolInitialize(CPU& c) {
 }
 
 void MemoryPoolFinalize(CPU& c) {
+    wait_submits_so_far();              // a submit replayed on another thread may still read it
     worker_finish();                    // the replay thread may still read it
     gpu_wait(gpu_write_back_serial());  // NX_ASYNC_GPU: no compute result lands in freed memory
     if (auto* p = get<MemoryPool>(c.x[0])) pool_unregister(p);
@@ -174,6 +189,7 @@ void MemoryPoolFlushMappedRange(CPU& c) {
 }
 // The CPU is about to read what the GPU wrote: with NX_ASYNC_GPU, compute results still in flight are waited for.
 void MemoryPoolInvalidateMappedRange(CPU&) {
+    wait_submits_so_far();  // a submit replayed on another thread: its results first (nvn_queue.cpp)
     worker_finish();  // compute results reach guest memory when their submit is replayed and done
     gpu_wait(gpu_write_back_serial());
 }
@@ -242,18 +258,31 @@ bool trace_textures() {
 uint64_t keep_for_slots(uint64_t guest);  // below, with the pool registrations
 void hand_image_to_snapshots(uint64_t guest);  // below
 
+// NX_REINIT_WAITS_REPLAY=1 (experiment): texture objects are re-initialized and finalized only between replays, never
+// while a submit is being replayed on another thread (the intermittent course band, DEBUG.md #54).
+std::unique_lock<std::recursive_mutex> reinit_guard() {
+    static const bool wait = std::getenv("NX_REINIT_WAITS_REPLAY") != nullptr;
+    return wait ? std::unique_lock<std::recursive_mutex>(gpu_lock()) : std::unique_lock<std::recursive_mutex>();
+}
+
 void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBuilder*)
+    auto guard = reinit_guard();
     uint64_t guest = c.x[0], builder = c.x[1];
     // Re-initializing a texture a pool slot still names (without finalizing it: Wonder reuses the structs of its
     // dynamic-resolution targets every frame) keeps the old one for those slots, as the pool's descriptor copy
     // would: replayed later, a frame's draws sampled another frame's AO and ambient-light buffers (dark course
     // actors, docs/nvn/DEBUG.md #39).
-    {
+    // The new incarnation is built aside and published whole, in the section that retires the old one (#55): a replay
+    // on another thread could see a texture half built (a size, memory 0) or a gap with none. NX_TEXTURE_RACE_OLD=1:
+    // the old one goes first and the new one is filled in place.
+    static const bool old = texture_race_old();
+    std::unique_ptr<Texture> fresh = old ? nullptr : std::make_unique<Texture>();
+    if (old) {
         std::lock_guard lk(objects_lock());
         keep_for_slots(guest);
         hand_image_to_snapshots(guest);
     }
-    auto& t = make<Texture>(guest);
+    auto& t = old ? make<Texture>(guest) : *fresh;
     t.target = uint32_t(driver(c, "nvnTextureBuilderGetTarget", {builder}));
     t.format = uint32_t(driver(c, "nvnTextureBuilderGetFormat", {builder}));
     t.flags = uint32_t(driver(c, "nvnTextureBuilderGetFlags", {builder}));
@@ -267,7 +296,7 @@ void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBu
     t.pool = driver(c, "nvnTextureBuilderGetMemoryPool", {builder});
     t.offset = driver(c, "nvnTextureBuilderGetMemoryOffset", {builder});
     t.storage_size = texture_storage_size(c, builder);
-    {
+    if (old) {
         std::lock_guard lk(objects_lock());
         pool_textures()[t.pool].insert(guest);
     }
@@ -302,6 +331,14 @@ void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBu
             "swizzle %u%u%u%u", (unsigned long long)guest, (unsigned long long)t.memory, t.target, t.format, t.width, t.height, t.depth, t.levels,
             t.samples, t.flags, (unsigned long long)t.storage_size, t.block_height_gobs, t.swizzle[0], t.swizzle[1],
             t.swizzle[2], t.swizzle[3]);
+    if (!old) {
+        std::lock_guard lk(objects_lock());
+        note_replaced(guest);
+        keep_for_slots(guest);
+        hand_image_to_snapshots(guest);
+        pool_textures()[t.pool].insert(guest);
+        publish_locked(guest, std::move(fresh));
+    }
     c.x[0] = 1;
 }
 
@@ -374,15 +411,22 @@ void expire_kept() {
 }
 
 void TextureFinalize(CPU& c) {
+    auto guard = reinit_guard();
     uint64_t guest = c.x[0];
     if (trace_textures()) log("nvn: texture %llx finalized", (unsigned long long)guest);
+    static const bool old = texture_race_old();
     {
         std::lock_guard lk(objects_lock());
+        note_replaced(guest);  // a replay in flight keeps resolving it (#55)
         hand_image_to_snapshots(guest);
         uint64_t kept = keep_for_slots(guest);
         for (auto& [pool, set] : pool_textures()) set.erase(guest);
         expire_kept();
         if (kept) return;
+        if (!old) {  // in the same section (#55)
+            if (auto o = objects().find(guest); o != objects().end()) defer_object(std::move(o->second)), objects().erase(o);
+            return;
+        }
     }
     destroy(guest);
 }
@@ -423,6 +467,7 @@ uint64_t make_snapshot(uint64_t guest) {  // under objects_lock
 void drop_snapshot(uint64_t key) {  // under objects_lock
     auto o = objects().find(key);
     if (o == objects().end()) return;
+    note_replaced(key);  // a replay in flight may resolve the slot to this copy (pool_entry_at, DEBUG.md #63)
     defer_object(std::move(o->second));
     objects().erase(o);
 }
@@ -499,6 +544,7 @@ void write_texels(CPU& c, uint64_t row_stride, uint64_t image_stride) {
         log("nvn: WriteTexels #%llu into %llx (%ux%u fmt %#x): %ux%ux%u at %u,%u,%u level %u", (unsigned long long)n,
             (unsigned long long)c.x[0], t->width, t->height, t->format, w.w, w.h, w.d, w.x, w.y, w.z, w.level);
     t->writes.push_back(std::move(w));
+    t->has_writes.store(true, std::memory_order_release);
 }
 
 void TextureWriteTexels(CPU& c) { write_texels(c, 0, 0); }
@@ -554,8 +600,14 @@ void TexturePoolRegister(CPU& c) {
         if (auto* t = get<Texture>(c.x[2])) t->pool_swizzle = v.swizzle;
     if (auto* d = get<DescriptorPool>(c.x[0])) {
         std::lock_guard lk(objects_lock());
-        uint64_t old = d->textures.count(uint32_t(c.x[1])) ? d->textures[uint32_t(c.x[1])] : 0;
-        d->textures[uint32_t(c.x[1])] = c.x[2];
+        uint32_t id = uint32_t(c.x[1]);
+        PoolEntry before;  // what a replay in flight still has to see in this slot (nvn_incarnation.cpp)
+        if (auto it = d->textures.find(id); it != d->textures.end()) before.has = true, before.texture = it->second;
+        if (auto it = d->snapshots.find(id); it != d->snapshots.end()) before.snapshot = it->second;
+        if (auto it = d->views.find(id); it != d->views.end()) before.has_view = true, before.view = it->second;
+        note_pool_change(c.x[0], id, before);
+        uint64_t old = before.texture;
+        d->textures[id] = c.x[2];
         if (auto s = d->snapshots.find(uint32_t(c.x[1])); s != d->snapshots.end()) drop_snapshot(s->second);
         if (uint64_t snap = make_snapshot(c.x[2])) d->snapshots[uint32_t(c.x[1])] = snap;
         auto& slots = g_registered[c.x[2]];  // re-registered every frame: keep each slot once

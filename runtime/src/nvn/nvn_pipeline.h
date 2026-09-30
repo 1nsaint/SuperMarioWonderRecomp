@@ -3,6 +3,8 @@
 // use). Used by nvn_draw.cpp, under the GPU lock.
 #pragma once
 
+#include <cstddef>
+#include <cstring>
 #include <vector>
 
 #include "nvn_shaders.h"
@@ -11,6 +13,37 @@
 namespace nx::nvn {
 
 bool vk_depth_clip_control();
+
+// Cache keys that are compared byte for byte (a PipelineKey with its padding, a SamplerInfo and a flag): the bytes,
+// a 64-bit hash of them for an unordered_map, and the exact comparison that confirms a hit. Four lanes: one multiply
+// chain over a 704-byte PipelineKey would cost what the lookup saves.
+inline uint64_t hash_bytes(const unsigned char* p, size_t size) {
+    constexpr uint64_t kMul = 0x9E3779B97F4A7C15ull;
+    uint64_t h[4] = {size, 1, 2, 3}, w[4];
+    for (; size >= 32; p += 32, size -= 32) {
+        std::memcpy(w, p, 32);
+        for (int l = 0; l < 4; l++) h[l] = (h[l] ^ w[l]) * kMul, h[l] ^= h[l] >> 32;
+    }
+    uint64_t r = h[0];
+    for (int l = 1; l < 4; l++) r = (r ^ h[l]) * kMul, r ^= r >> 32;
+    while (size) {
+        size_t n = size < 8 ? size : 8;
+        uint64_t t = 0;
+        std::memcpy(&t, p, n);
+        r = (r ^ t) * kMul, r ^= r >> 32;
+        p += n, size -= n;
+    }
+    return r;
+}
+template <size_t N>
+struct ByteKey {
+    unsigned char b[N];
+    bool operator==(const ByteKey& o) const { return std::memcmp(b, o.b, N) == 0; }
+};
+struct ByteKeyHash {
+    template <size_t N>
+    size_t operator()(const ByteKey<N>& k) const { return size_t(hash_bytes(k.b, N)); }
+};
 
 // The four descriptor sets of the translator's scheme (0 uniform buffers, 1 storage buffers, 2 textures, 3 images)
 // for a set of stages, and the pipeline layout over them.
@@ -37,8 +70,13 @@ struct PipelineKey {
     uint32_t color_count = 0;
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
     uint32_t depth_clamp = 0;  // SetDepthClamp (applied only where the device has the depthClamp feature)
+    uint32_t ufloat_colors = 0;  // bit k: colour target k is R11G11B10F (no alpha: destination alpha reads 1)
+    uint32_t alpha_to_coverage = 0;  // BindMultisampleState (G7)
 };
 VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout);
+bool depth_remap();  // NX_CLIP_Z_PATCH: clip z -w..w mapped in the vertex shaders, not by VK_EXT_depth_clip_control
+bool patch_clip_z(const std::vector<uint32_t>& in, std::vector<uint32_t>& out);  // nvn_spirv_clip.cpp
+void clip_z_module(const ShaderInfo* s, std::vector<uint32_t>& code);             // patch_clip_z if depth_remap
 
 // Integer vertex inputs (nvn_spirv_patch.cpp): the kind of an NVN attribute format (0 float, 1 unsigned bits,
 // 2 signed bits), and a copy of a module with those locations declared as integers and bitcast to float on load.
@@ -76,6 +114,11 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
 // The image behind a texture with its contents in place (uploaded, CPU writes applied, never-written ones cleared);
 // null for an unknown texture. Records transfers: outside render passes.
 GpuImage* ensure_contents(VkCommandBuffer cb, uint64_t texture);
+// nvn_upload.cpp: the texture's pool memory untiled (or taken row by row, pitch-linear) into the image, every level
+// and layer; cleared instead when the copies would read past what was staged. Marks it uploaded.
+void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img);
+// Every level and layer to zero (colour; magenta with `magenta`), depth and stencil to 0. Leaves TRANSFER_DST.
+void clear_image(VkCommandBuffer cb, GpuImage& img, bool magenta = false);
 // A single level and layer of an image, for rendering to.
 void sampled_ready_log();
 void check_linear_content(Texture& t);  // nvn_sampler.cpp

@@ -94,13 +94,27 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
         case Cmd::BindPolygonState:
             if (auto* p = blob(sizeof(PolygonInfo))) std::memcpy(&s.polygon, p, sizeof s.polygon);
             break;
+        case Cmd::BindMultisampleState: s.alpha_to_coverage = c.n != 0; break;
         case Cmd::SetBlendColor: std::memcpy(s.blend_color, c.f, sizeof s.blend_color); break;
         case Cmd::UpdateUniformBuffer: {  // (buffer address, size, offset, data): written in order, like the GPU
             uint64_t off = c.a[2];
+            // NX_TRACE_UUB=<first draw>: logs 40 updates from that draw on.
+            static const char* uub = std::getenv("NX_TRACE_UUB");
+            static const uint64_t uub_from = uub ? std::strtoull(uub, nullptr, 10) : 0;
+            static int uub_n = 0;
+            if (uub && g_stats.done >= uub_from && uub_n++ < 1500 && c.blob < list.blobs.size()) {
+                const auto& b = list.blobs[c.blob];
+                float f[8] = {};
+                std::memcpy(f, b.data(), std::min<size_t>(b.size(), sizeof f));
+                log("uub before draw %llu: buffer %llx size %llu offset %llu data %zu bytes: %g %g %g %g | %g %g %g %g",
+                    (unsigned long long)g_stats.done, (unsigned long long)c.a[0], (unsigned long long)c.a[1],
+                    (unsigned long long)off, b.size(), f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+            }
             if (c.blob < list.blobs.size())
                 if (uint8_t* p = const_cast<uint8_t*>(guest_bytes(c.a[0] + off))) {
                     std::memcpy(p, list.blobs[c.blob].data(), list.blobs[c.blob].size());
                     dedup_invalidate(p, list.blobs[c.blob].size());
+                    written_cpu_write(p, list.blobs[c.blob].size());
                 }
             break;
         }
@@ -114,6 +128,7 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
                 uint64_t v[2] = {++reports, fake ? submit_start_ns() : plat::monotonic_ns()};
                 std::memcpy(p, v, sizeof v);
                 dedup_invalidate(p, sizeof v);
+                written_cpu_write(p, sizeof v);
             }
             break;
         }

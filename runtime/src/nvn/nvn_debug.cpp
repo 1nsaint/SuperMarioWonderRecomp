@@ -97,8 +97,17 @@ void write_ppm(const Scratch& s, uint32_t w, uint32_t h, uint64_t frame, uint64_
 
 }  // namespace
 
+std::vector<uint64_t> g_dump_extra;  // this submit's (NX_DUMP_ON_FS)
+void debug_dump_add(uint64_t texture) {
+    if (texture && std::find(g_dump_extra.begin(), g_dump_extra.end(), texture) == g_dump_extra.end())
+        g_dump_extra.push_back(texture);
+}
+
 void debug_dump_textures(uint64_t frame) {
-    static const std::vector<uint64_t> list = dump_list();
+    static const std::vector<uint64_t> fixed = dump_list();
+    std::vector<uint64_t> list = fixed;
+    list.insert(list.end(), g_dump_extra.begin(), g_dump_extra.end());
+    g_dump_extra.clear();
     if (list.empty()) return;
     VkDevice d = vk_device();
     static VkCommandPool pool = VK_NULL_HANDLE;
@@ -119,6 +128,8 @@ void debug_dump_textures(uint64_t frame) {
     }
     for (uint64_t texture : list) {
         GpuImage* src = image_of(texture);
+        log("nvn: dump %llx at %llu: %s", (unsigned long long)texture, (unsigned long long)frame,
+            !src ? "no image" : src->layout == VK_IMAGE_LAYOUT_UNDEFINED ? "undefined" : "ok");
         if (!src || !src->image || src->layout == VK_IMAGE_LAYOUT_UNDEFINED || !(src->aspect & VK_IMAGE_ASPECT_COLOR_BIT))
             continue;
         uint32_t w = src->width, h = src->height;
@@ -191,6 +202,16 @@ void debug_dump_textures(uint64_t frame) {
         }
         s.destroy(d);
     }
+}
+
+// NX_DUMP_ON_TARGET / NX_DUMP_ON_FS (nvn_draw.cpp): the n-th requesting draw of a submit, every NX_DUMP_TARGET_EVERY-th
+// (default NX_DUMP_FRAMES) is read back when the submit completes.
+void debug_dump_requested(uint64_t n) {
+    static const uint64_t every = [] {
+        const char* e = std::getenv("NX_DUMP_TARGET_EVERY");
+        return e ? std::strtoull(e, nullptr, 10) : uint64_t(frame_dump_every());
+    }();
+    if (n && every && n % every == 0) debug_dump_textures(n);
 }
 
 // ---- presented frames (NX_DUMP_FRAMES=N) ----------------------------------------------------------------------------
@@ -348,6 +369,7 @@ struct Snap {
     Scratch s;
     uint32_t w = 0, h = 0;
     uint64_t draw = 0;
+    uint32_t raw_format = 0;  // NX_SNAP_RAW: the texels as stored (4-byte formats), written as .raw
 };
 std::vector<Snap> g_snaps;
 
@@ -373,21 +395,49 @@ void debug_snapshot(VkCommandBuffer cb, GpuImage& img, uint64_t draw) {
     if (!img.image || !(img.aspect & VK_IMAGE_ASPECT_COLOR_BIT)) return;
     Snap snap;
     snap.w = img.width, snap.h = img.height, snap.draw = draw;
+    // NX_SNAP_CROP=x,y,w,h (fractions of the image): only that part (8 MB per whole 1080p snapshot otherwise).
+    static float crop[4] = {0, 0, 1, 1};
+    static const bool cropped = [] {
+        const char* e = std::getenv("NX_SNAP_CROP");
+        return e && std::sscanf(e, "%f,%f,%f,%f", &crop[0], &crop[1], &crop[2], &crop[3]) == 4;
+    }();
+    int32_t x0 = 0, y0 = 0;
+    if (cropped) {
+        x0 = int32_t(crop[0] * img.width), y0 = int32_t(crop[1] * img.height);
+        snap.w = std::max(1u, std::min(uint32_t(crop[2] * img.width), img.width - uint32_t(x0)));
+        snap.h = std::max(1u, std::min(uint32_t(crop[3] * img.height), img.height - uint32_t(y0)));
+    }
     if (!make_scratch(snap.s, snap.w, snap.h)) {
         snap.s.destroy(vk_device());
         return;
     }
     VkImageLayout back = img.layout;
     transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    // NX_SNAP_RAW=1: 4-byte formats (R32F depth copies, RG16F, ...) as stored, to frames/00000_<draw>.raw (u32 width,
+    // height, VkFormat, then the texels): an RGBA8 blit rounds small floats to 0..2.
+    static const bool raw = std::getenv("NX_SNAP_RAW") != nullptr;
+    if (raw && (img.format == VK_FORMAT_R32_SFLOAT || img.format == VK_FORMAT_R16G16_SFLOAT ||
+                img.format == VK_FORMAT_R32_UINT || img.format == VK_FORMAT_R8G8B8A8_UNORM)) {
+        VkBufferImageCopy r{};
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.imageOffset = {x0, y0, 0};
+        r.imageExtent = {snap.w, snap.h, 1};
+        p_vkCmdCopyImageToBuffer(cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, snap.s.buffer, 1, &r);
+        if (back != VK_IMAGE_LAYOUT_UNDEFINED) transition(cb, img, back);
+        snap.raw_format = uint32_t(img.format);
+        g_snaps.push_back(snap);
+        return;
+    }
     GpuImage dst;
     dst.image = snap.s.image;
     dst.format = VK_FORMAT_R8G8B8A8_UNORM;
     transition(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkImageBlit blit{};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.srcOffsets[1] = {int32_t(snap.w), int32_t(snap.h), 1};
+    blit.srcOffsets[0] = {x0, y0, 0};
+    blit.srcOffsets[1] = {x0 + int32_t(snap.w), y0 + int32_t(snap.h), 1};
     blit.dstSubresource = blit.srcSubresource;
-    blit.dstOffsets[1] = blit.srcOffsets[1];
+    blit.dstOffsets[1] = {int32_t(snap.w), int32_t(snap.h), 1};
     p_vkCmdBlitImage(cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, snap.s.image,
                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
     transition(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -403,7 +453,20 @@ bool debug_snapshots_pending() { return !g_snaps.empty(); }
 
 void debug_snapshots_write() {  // after the submit's fence
     for (Snap& snap : g_snaps) {
-        write_ppm(snap.s, snap.w, snap.h, 0, snap.draw);  // frames/00000_<draw in hex>.ppm
+        void* p = nullptr;
+        if (snap.raw_format && p_vkMapMemory(vk_device(), snap.s.buffer_memory, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS) {
+            char name[64];
+            std::snprintf(name, sizeof name, "/frames/00000_%llx.raw", (unsigned long long)snap.draw);
+            if (FILE* f = plat::fopen_utf8(plat::data_root() + name, "wb")) {
+                uint32_t head[3] = {snap.w, snap.h, snap.raw_format};
+                std::fwrite(head, 4, 3, f);
+                std::fwrite(p, 4, size_t(snap.w) * snap.h, f);
+                std::fclose(f);
+            }
+            p_vkUnmapMemory(vk_device(), snap.s.buffer_memory);
+        } else if (!snap.raw_format) {
+            write_ppm(snap.s, snap.w, snap.h, 0, snap.draw);  // frames/00000_<draw in hex>.ppm
+        }
         snap.s.destroy(vk_device());
     }
     g_snaps.clear();

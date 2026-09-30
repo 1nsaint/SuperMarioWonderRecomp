@@ -10,7 +10,6 @@
 #include <unordered_map>
 
 #include "nvn_pipeline.h"
-#include "nvn_tiling.h"
 
 namespace nx::nvn {
 
@@ -25,6 +24,11 @@ VkFormat view_format(const GpuImage& img, uint32_t nvn) {
     uint32_t bw = 1, bh = 1, bytes = 0, iw = 1, ih = 1, ibytes = 0;
     format_block(nvn, bw, bh, bytes);
     format_block(img.nvn_format, iw, ih, ibytes);
+    // The sizes of the host formats: R11G11B10F is 4 bytes in NVN but RGBA16F here, and a 4-byte view (RGBA8, R32F)
+    // of an 8-byte image is no valid view (G4, docs/nvn/DEBUG.md #50). NX_VIEW_NVN_SIZES=1: the NVN sizes (bisecting).
+    static const bool nvn_sizes = std::getenv("NX_VIEW_NVN_SIZES") != nullptr;
+    if (!nvn_sizes && vk_block_bytes(f) && vk_block_bytes(img.format))
+        bytes = vk_block_bytes(f), ibytes = vk_block_bytes(img.format);
     bool ok = f != VK_FORMAT_UNDEFINED && format_aspect(nvn) == 0 && bw == iw && bh == ih && bytes == ibytes;
     static std::set<std::pair<uint32_t, uint32_t>> logged;
     if (logged.insert({img.nvn_format, nvn}).second && logged.size() <= 40)
@@ -54,6 +58,7 @@ VkShaderModule module_of(const ShaderInfo* s, const uint8_t* kinds = nullptr, ui
         bool is_patched = false;
         const uint8_t* int_kinds = k != std::string(16, '\0') ? reinterpret_cast<const uint8_t*>(k.data()) : nullptr;
         std::vector<uint32_t> code = patched_spirv(s, int_kinds, unwritten, &is_patched);
+        if (s->stage == ShaderStage::Vertex) clip_z_module(s, code);  // NX_CLIP_Z_PATCH (nvn_spirv_clip.cpp)
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         ci.codeSize = code.size() * 4;
         ci.pCode = code.data();
@@ -89,8 +94,16 @@ VkImageViewType view_type(const ImageShape& s) {  // SPIR-V Dim: 0 1D, 1 2D, 2 3
 }
 
 // Views made for sampling and for rendering, by image; forget_image_views() drops an image's before it is freed.
-std::map<std::tuple<VkImage, VkImageViewType, uint32_t, uint64_t, uint64_t>, VkImageView> g_sampled_views;
+using SampledKey = std::tuple<VkImage, VkImageViewType, uint32_t, uint64_t, uint64_t>;
+std::map<SampledKey, VkImageView> g_sampled_views;
 std::map<std::tuple<VkImage, uint32_t, uint32_t, VkFormat>, VkImageView> g_attachment_views;
+// In front of g_sampled_views (a tree walk per sampled texture of every draw): copies of entries it holds, by a hash
+// of the key (view null: an empty slot). forget_image_views, the only place entries go, empties the image's slots.
+struct ViewHit {
+    SampledKey key{};
+    VkImageView view = VK_NULL_HANDLE;
+};
+ViewHit g_view_hits[256];
 
 bool identity(const VkComponentMapping& m) {
     auto id = [](VkComponentSwizzle s, VkComponentSwizzle own) { return s == VK_COMPONENT_SWIZZLE_IDENTITY || s == own; };
@@ -98,8 +111,10 @@ bool identity(const VkComponentMapping& m) {
            id(m.a, VK_COMPONENT_SWIZZLE_A);
 }
 
+
 // Views Metal accepts of an image: cubes only of cube images with 6 layers per cube, 3D only of 3D images (a 2D
-// view of a 3D image is for rendering a slice), 1D of 1D. A shader declaring another shape than the texture it gets
+// view of a 3D image is for rendering a slice), 1D of 1D (only with NX_1D_IMAGES: NVN 1D textures are 2D images of
+// height 1, since the translator samples them as 2D, G8). A shader declaring another shape than the texture it gets
 // (a samplerCube given a 2D texture) reads the dummy instead: Metal aborts on the view.
 bool view_compatible(const GpuImage& img, VkImageViewType type, uint32_t layers) {
     bool cube_img = img.view_type == VK_IMAGE_VIEW_TYPE_CUBE || img.view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
@@ -134,8 +149,12 @@ VkImageView view_of(GpuImage& img, VkImageViewType type, const ViewInfo& view) {
     if (type == img.view_type && identity(m) && whole && format == img.format) return img.view;
     auto& cache = g_sampled_views;
     uint64_t range = uint64_t(base) | uint64_t(levels) << 16 | uint64_t(min_layer) << 32 | uint64_t(view.layers) << 48;
-    auto& v = cache[{img.image, type, uint32_t(m.r) | uint32_t(m.g) << 8 | uint32_t(m.b) << 16 | uint32_t(m.a) << 24,
-                     range, uint64_t(format)}];
+    uint32_t mapping = uint32_t(m.r) | uint32_t(m.g) << 8 | uint32_t(m.b) << 16 | uint32_t(m.a) << 24;
+    SampledKey key{img.image, type, mapping, range, uint64_t(format)};
+    uint64_t h = uintptr_t(img.image) >> 4 ^ range * 31 ^ mapping ^ uint64_t(type) << 5 ^ uint64_t(format);
+    ViewHit& hit = g_view_hits[(h ^ h >> 8) & 255];
+    if (hit.view && hit.key == key) return hit.view;
+    auto& v = cache[key];
     if (!v) {
         VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         ci.image = img.image;
@@ -153,74 +172,15 @@ VkImageView view_of(GpuImage& img, VkImageViewType type, const ViewInfo& view) {
                                base, levels, min_layer, layers};
         if (p_vkCreateImageView(vk_device(), &ci, nullptr, &v) != VK_SUCCESS) v = img.view;
     }
+    if (v) hit = {key, v};  // never a null one: those are tried again
     return v;
 }
 
-// Untiles the texture's pool memory and copies it into the image (every level and layer).
-void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
-    img.uploaded = true;
-    if (gpu_profile_on()) gpu_profile_mark(cb, "texture uploads");
-    if (!t.memory || !t.storage_size) return;
-    if (std::getenv("NX_TRACE_UPLOADS") && t.storage_size >= (1u << 20)) {
-        const uint8_t* m = reinterpret_cast<const uint8_t*>(t.memory);
-        size_t nz = 0;
-        for (uint64_t k = 0; k < t.storage_size; k += 64) nz += m[k] != 0;
-        log("nvn: upload %ux%u fmt %#x stride %u: %zu of %llu sampled bytes non-zero", t.width, t.height, t.format,
-            t.stride, nz, (unsigned long long)(t.storage_size / 64));
-    }
-    uint32_t bw = 1, bh = 1, bytes = 4;
-    format_block(t.format, bw, bh, bytes);
-    std::vector<uint8_t> linear;
-    std::vector<VkBufferImageCopy> copies;
-    uint32_t layers = img.view_type == VK_IMAGE_VIEW_TYPE_3D ? std::max(1u, t.depth) : img.layers;
-    if (img.alpha_from_r && t.stride) {  // R8 pitch-linear -> RGBA8 (255, 255, 255, R), level 0
-        const uint8_t* src = reinterpret_cast<const uint8_t*>(t.memory);
-        uint64_t rows = uint64_t(img.height) * layers;
-        if (uint64_t(t.stride) * rows > t.storage_size) rows = t.storage_size / t.stride;
-        Upload u = upload_alloc(rows * img.width * 4, 16);
-        for (uint64_t y = 0; y < rows; y++) {
-            const uint8_t* s = src + y * t.stride;
-            uint32_t* d = reinterpret_cast<uint32_t*>(u.ptr + y * img.width * 4);
-            for (uint32_t x = 0; x < img.width; x++) d[x] = 0x00FFFFFFu | (uint32_t(s[x]) << 24);
-        }
-        VkBufferImageCopy r{};
-        r.bufferOffset = u.offset;
-        r.imageSubresource = {img.aspect, 0, 0, img.layers};
-        r.imageExtent = {img.width, uint32_t(std::min<uint64_t>(rows, img.height)), 1};
-        transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
-        return;
-    }
-    if (t.stride) {  // pitch-linear: rows as they are
-        uint64_t rows = (img.height + bh - 1) / bh;
-        Upload u = upload(reinterpret_cast<const void*>(t.memory), uint64_t(t.stride) * rows * layers, 16);
-        VkBufferImageCopy r{};
-        r.bufferOffset = u.offset;
-        r.bufferRowLength = t.stride / bytes * bw;
-        r.imageSubresource = {img.aspect, 0, 0, img.layers};
-        r.imageExtent = {img.width, img.height, 1};
-        transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
-        return;
-    }
-    auto levels = deswizzle_texture(reinterpret_cast<const uint8_t*>(t.memory), t.storage_size, img.width,
-                                    img.height, layers, img.levels, bw, bh, bytes, linear, t.block_height_gobs);
-    if (levels.empty()) {
-        log("nvn/vk: texture %ux%u format %#x: could not untile (%llu bytes)", img.width, img.height, t.format,
-            (unsigned long long)t.storage_size);
-        return;
-    }
-    Upload u = upload(linear.data(), linear.size(), 16);
-    for (uint32_t k = 0; k < levels.size(); k++) {
-        VkBufferImageCopy r{};
-        r.bufferOffset = u.offset + levels[k].offset;
-        r.imageSubresource = {img.aspect, k, 0, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? 1u : img.layers};
-        r.imageExtent = {levels[k].width, levels[k].height, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? layers : 1u};
-        copies.push_back(r);
-    }
-    transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(copies.size()),
-                             copies.data());
+// R11G11B10F (0x3f) has no alpha, stored here as RGBA16F: sampling reads alpha 1 and blending takes destination
+// alpha as 1, as Maxwell does (G4, docs/nvn/DEBUG.md #50). NX_R11G11B10_RAW=1: the stored alpha (bisecting).
+bool ufloat_raw() {
+    static const bool raw = std::getenv("NX_R11G11B10_RAW") != nullptr;
+    return raw;
 }
 
 }  // namespace
@@ -229,8 +189,10 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
 
 const ProgramLayout& program_layout(const std::vector<const ShaderInfo*>& stages) {
     static std::map<std::vector<const ShaderInfo*>, ProgramLayout> cache;
+    static const std::pair<const std::vector<const ShaderInfo*>, ProgramLayout>* last = nullptr;  // entries stay
+    if (last && last->first == stages) return last->second;  // runs of draws use one program
     auto it = cache.find(stages);
-    if (it != cache.end()) return it->second;
+    if (it != cache.end()) return (last = &*it)->second;
     std::map<uint32_t, VkDescriptorSetLayoutBinding> sets[4];
     for (const ShaderInfo* s : stages)
         for (const DescriptorBinding& b : s->refl.bindings) {
@@ -257,10 +219,15 @@ const ProgramLayout& program_layout(const std::vector<const ShaderInfo*>& stages
 // ---- graphics pipelines ---------------------------------------------------------------------------------------------
 
 VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout) {
-    static std::map<std::string, VkPipeline> cache;
-    std::string k(reinterpret_cast<const char*>(&key), sizeof key);
-    auto it = cache.find(k);
-    if (it != cache.end()) return it->second;
+    // By the key's bytes, as before, but hashed (nvn_pipeline.h) instead of a ~700-byte std::string built and
+    // compared down a tree per draw; and the last entry first: consecutive draws mostly share their state.
+    using Key = ByteKey<sizeof(PipelineKey)>;
+    static std::unordered_map<Key, VkPipeline, ByteKeyHash> cache;
+    static const std::pair<const Key, VkPipeline>* last = nullptr;  // entries are never erased
+    if (last && std::memcmp(&key, last->first.b, sizeof key) == 0) return last->second;
+    Key k;
+    std::memcpy(k.b, &key, sizeof key);
+    if (auto it = cache.find(k); it != cache.end()) return (last = &*it)->second;
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     uint32_t nstages = 0;
@@ -329,7 +296,7 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     clip.negativeOneToOne = VK_TRUE;  // NVN depth mode 0 (Wonder): clip-space z in -1..1
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = vp.scissorCount = 1;
-    if (vk_depth_clip_control()) vp.pNext = &clip;
+    if (vk_depth_clip_control() && !depth_remap()) vp.pNext = &clip;
 
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = key.polygon.mode == 0 ? VK_POLYGON_MODE_POINT : key.polygon.mode == 1 ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
@@ -345,10 +312,16 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     // LINE 1, FILL 2), and the bit of the mode drawn with decides. Factor, units and clamp are dynamic (SetDepthBias
     // at each draw, nvn_raster.cpp): the game sets them on the command buffer, not in the state object.
     uint32_t offset_bit = key.polygon.mode <= 2 ? 1u << key.polygon.mode : 4u;
-    rs.depthBiasEnable = key.polygon.offset_enables & offset_bit ? VK_TRUE : VK_FALSE;
+    rs.depthBiasEnable = key.polygon.offset_enables & offset_bit || equal_slack_pass(key.depth) ? VK_TRUE : VK_FALSE;
 
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    // BindMultisampleState's alpha to coverage (G7; single-sampled targets: alpha under 0.5 drops the fragment),
+    // logged once per pipeline that has it. NX_NO_ALPHA_TO_COVERAGE=1: off, as when it was a stub.
+    static const bool no_a2c = std::getenv("NX_NO_ALPHA_TO_COVERAGE") != nullptr;
+    ms.alphaToCoverageEnable = key.alpha_to_coverage && !no_a2c ? VK_TRUE : VK_FALSE;
+    if (key.alpha_to_coverage)
+        log("nvn/vk: alpha to coverage%s: fs %s", no_a2c ? " (off)" : "", key.fs ? key.fs->hash.c_str() : "-");
 
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     bool has_depth = key.depth_format != VK_FORMAT_UNDEFINED;
@@ -372,12 +345,22 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     VkPipelineColorBlendAttachmentState att[8]{};
     for (uint32_t k = 0; k < key.color_count; k++) {
         const BlendTarget& b = key.blend[k];
+        // An R11G11B10F target's destination alpha is 1 on Maxwell; the RGBA16F image holds what the shader wrote.
+        bool ufloat = (key.ufloat_colors >> k & 1) && !ufloat_raw();
+        auto factor = [ufloat](uint32_t f) {
+            VkBlendFactor v = vk_blend_factor(f);
+            if (!ufloat) return v;
+            return v == VK_BLEND_FACTOR_DST_ALPHA             ? VK_BLEND_FACTOR_ONE
+                   : v == VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA ? VK_BLEND_FACTOR_ZERO
+                   : v == VK_BLEND_FACTOR_SRC_ALPHA_SATURATE  ? VK_BLEND_FACTOR_ZERO  // min(As, 1 - 1)
+                                                              : v;
+        };
         att[k].blendEnable = key.color.blend_enable[k] ? VK_TRUE : VK_FALSE;
-        att[k].srcColorBlendFactor = vk_blend_factor(b.src_rgb);
-        att[k].dstColorBlendFactor = vk_blend_factor(b.dst_rgb);
+        att[k].srcColorBlendFactor = factor(b.src_rgb);
+        att[k].dstColorBlendFactor = factor(b.dst_rgb);
         att[k].colorBlendOp = vk_blend_op(b.eq_rgb);
-        att[k].srcAlphaBlendFactor = vk_blend_factor(b.src_a);
-        att[k].dstAlphaBlendFactor = vk_blend_factor(b.dst_a);
+        att[k].srcAlphaBlendFactor = factor(b.src_a);
+        att[k].dstAlphaBlendFactor = factor(b.dst_a);
         att[k].alphaBlendOp = vk_blend_op(b.eq_a);
         att[k].colorWriteMask = key.mask.mask[k] & 0xF;
     }
@@ -419,19 +402,24 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
         log("nvn/vk: pipeline for %s + %s failed", key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
     else if (g_trace)
         log("nvn/vk: pipeline %zu: %s + %s", cache.size() + 1, key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
-    return cache[k] = p;
+    return (last = &*cache.emplace(k, p).first)->second;
 }
 
 // ---- sampled textures -------------------------------------------------------------------------------------------------
 
 // Pending nvnTextureWriteTexels regions go to the image (a transfer: outside render passes).
 void apply_texel_writes(VkCommandBuffer cb, Texture& t, GpuImage& img) {
+    // Nothing queued (nearly always): no lock. Every sampled texture of every draw comes here, and taking the
+    // registry lock alone also invalidated every thread's get<T> cache each time (docs/nvn/PERF-PLAN.md).
+    if (!t.has_writes.load(std::memory_order_acquire)) return;
     std::vector<Texture::TexelWrite> writes;
     {
         std::lock_guard lk(objects_lock());
         writes.swap(t.writes);
+        t.has_writes.store(false, std::memory_order_release);
     }
     if (writes.empty()) return;
+    img.texels = true;
     VkImageLayout back = img.layout;
     transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     bool is3d = img.view_type == VK_IMAGE_VIEW_TYPE_3D;
@@ -462,10 +450,7 @@ bool sampled_ready(uint64_t texture) {
     if (!t || !t->image) return g_not_ready[0]++, false;  // no image yet (missing textures are the caller's)
     check_linear_content(*t);
     if (t->dirty && !t->image->rendered) return g_not_ready[1]++, false;
-    {
-        std::shared_lock lk(objects_lock());  // readers only: an exclusive lock here contended with the game's threads
-        if (!t->writes.empty()) return g_not_ready[2]++, false;
-    }
+    if (t->has_writes.load(std::memory_order_acquire)) return g_not_ready[2]++, false;  // no lock (nvn.h)
     const GpuImage& img = *t->image;
     bool ok = img.rendered ? img.layout == VK_IMAGE_LAYOUT_GENERAL
                            : img.uploaded && img.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -506,7 +491,21 @@ GpuImage* ensure_contents(VkCommandBuffer cb, uint64_t texture) {
     GpuImage* img = t ? image_of(texture) : nullptr;
     if (!img) return nullptr;
     bool dirty = t->dirty.exchange(false);
-    if (!img->rendered && (!img->uploaded || dirty)) upload_texture(cb, *t, *img);
+    static const bool reupload = std::getenv("NX_TEXELS_REUPLOAD") != nullptr;  // bisecting: the old way
+    bool upload = !img->rendered && (!img->uploaded || (dirty && (!img->texels || reupload)));
+    // A render target (COMPRESSIBLE, flag 0x8) the GPU never wrote through this image: its guest memory never holds
+    // GPU output here (another target over the same memory left only stale data), so it starts cleared, not uploaded
+    // (G3 cause 2, docs/nvn/DEBUG.md #50). NX_RT_UPLOAD=1: uploaded as before; NX_ALIAS_MAGENTA=1: cleared magenta.
+    static const bool rt_upload = std::getenv("NX_RT_UPLOAD") != nullptr;
+    static const bool magenta = std::getenv("NX_ALIAS_MAGENTA") != nullptr;
+    if (upload && !rt_upload && (t->flags & 0x8) && !img->uploaded && !img->texels && !dirty) {
+        if (!t->has_writes.load(std::memory_order_acquire)) {
+            clear_image(cb, *img, magenta);
+            img->uploaded = true;
+            upload = false;
+        }
+    }
+    if (upload) upload_texture(cb, *t, *img);
     apply_texel_writes(cb, *t, *img);
     if (img->layout == VK_IMAGE_LAYOUT_UNDEFINED) {  // never written: black, not garbage
         transition(cb, *img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -534,14 +533,24 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
     // The swizzle belongs to the texture (its builder, or its pool view), not to the image: an image may be shared
     // with or inherited from another texture over the same memory (#36, #42), whose swizzle differs. With the
     // image's, the UI's single-channel masks lost their alpha and drew as rectangles (docs/nvn/DEBUG.md #44).
+    // The slot's own view decides: pool_swizzle is whichever slot registered the texture last (the world map's player
+    // mask read as G G G G: a flat silhouette, DEBUG-2.md #67). NX_POOL_SWIZZLE_ANY=1: as before.
+    static const bool pool_any = std::getenv("NX_POOL_SWIZZLE_ANY") != nullptr;
     ViewInfo vi = view ? *view : ViewInfo{};
     if (!vi.swizzle && !img->alpha_from_r)
         if (Texture* t = get<Texture>(texture)) {
-            uint32_t s = t->pool_swizzle.load();
+            uint32_t s = pool_any || !view ? t->pool_swizzle.load() : 0u;
             if (!s)
                 for (int k = 0; k < 4; k++) s |= uint32_t(std::min<uint8_t>(t->swizzle[k], 5)) << (8 * k);
             vi.swizzle = s;
         }
+    // R11G11B10F: a channel reading A (NVNtextureSwizzle 5) reads ONE (1), after the texture's swizzle (G4).
+    if (!ufloat_raw() && !img->alpha_from_r && (img->nvn_format == 0x3f || vi.format == 0x3f)) {
+        uint32_t s = vi.swizzle ? vi.swizzle : 0x05040302u;  // 0: identity (R G B A)
+        for (int k = 0; k < 4; k++)
+            if ((s >> (8 * k) & 0xFF) == 5) s = (s & ~(0xFFu << (8 * k))) | (1u << (8 * k));
+        vi.swizzle = s;
+    }
     VkImageView v = view_of(*img, view_type(shape), vi);
     if (!v) {
         *layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -681,6 +690,8 @@ void forget_image_views(const GpuImage& img) {
         }
     };
     drop(g_sampled_views, std::make_tuple(img.image, VkImageViewType(0), 0u, uint64_t(0), uint64_t(0)));
+    for (ViewHit& h : g_view_hits)
+        if (std::get<0>(h.key) == img.image) h = {};
     drop(g_attachment_views, std::make_tuple(img.image, 0u, 0u, VkFormat(0)));
 }
 

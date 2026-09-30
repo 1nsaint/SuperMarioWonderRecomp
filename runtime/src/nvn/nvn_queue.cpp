@@ -1,9 +1,16 @@
 // NVN queues, command buffers, windows and syncs (docs/NVN.md, N3). Synchronously every command completes at
 // submit: fences are signaled right away, the window hands out its textures in turn, and presents are counted. With
-// NX_ASYNC_GPU a fence is the submit it follows, and waiting for it waits for that submit (nvn_frames.cpp). Return
+// NX_ASYNC_GPU a fence is the submit it follows, and waiting for it waits for that submit (nvn_frames.cpp). With
+// NX_PIPELINED the GPU work is in flight when a submit returns but its compute results are in guest memory, so
+// syncs and nvnQueueFinish have nothing to wait for, as synchronously (gpu_serial() is 0). Return
 // values follow the SDK driver (nvnSyncWait sdk+45a960: 0 once the fence has passed; nvnWindowAcquireTexture
 // sdk+45e050: 0 on success).
 #include <algorithm>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <array>
+#include <cstring>
 #include <cstdlib>
 #include <atomic>
 #include <vector>
@@ -13,14 +20,60 @@
 
 namespace nx::nvn {
 
+// Submits the game made and submits whose replay (and GPU work, write-backs) finished. The game records the next frame
+// on one thread while another submits the last one, and our replay runs inside nvnQueueSubmitCommands: a fence the
+// game waits on must not pass before the submits it follows were replayed, or the game rewrites the next frame's
+// vertex and uniform data while this one is still read (the horizon band, exploded meshes, DEBUG.md #59).
+// NX_SYNC_LOOSE=1: the old behaviour (fences passed at once).
+namespace {
+std::mutex g_sub_lock;
+std::condition_variable g_sub_cv;
+uint64_t g_sub_called = 0, g_sub_done = 0;
+std::atomic<uint64_t> g_sub_blocked{0};
+
+bool sync_loose() {
+    static const bool on = std::getenv("NX_SYNC_LOOSE") != nullptr;
+    return on;
+}
+
+void submit_done() {
+    {
+        std::lock_guard lk(g_sub_lock);
+        g_sub_done++;
+    }
+    g_sub_cv.notify_all();
+}
+
+// Waits until the submits up to `seq` were replayed (2 s at most: a hung replay is logged, not waited forever).
+void wait_submits(uint64_t seq) {
+    if (sync_loose() || !seq) return;
+    std::unique_lock lk(g_sub_lock);
+    if (g_sub_done >= seq) return;
+    uint64_t n = ++g_sub_blocked;
+    if (n == 1 || n % 1000 == 0) log("nvn: %llu CPU waits blocked on a submit still being replayed", (unsigned long long)n);
+    if (!g_sub_cv.wait_for(lk, std::chrono::seconds(2), [seq] { return g_sub_done >= seq; }))
+        log("nvn: a CPU wait gave up after 2 s on submit %llu (%llu done)", (unsigned long long)seq,
+            (unsigned long long)g_sub_done);
+}
+
+uint64_t submits_called() {
+    std::lock_guard lk(g_sub_lock);
+    return g_sub_called;
+}
+}  // namespace
+
+// MemoryPoolInvalidateMappedRange / Finalize (nvn_objects.cpp): the CPU reads or frees what submits made so far use.
+void wait_submits_so_far() { wait_submits(submits_called()); }
+
 namespace {
 
 // ---- syncs ------------------------------------------------------------------------------------------------------
 
 struct Sync : Object {
     std::atomic<bool> signaled{false};
-    std::atomic<uint64_t> serial{0};  // NX_ASYNC_GPU: the submit it waits for (0: none)
+    std::atomic<uint64_t> serial{0};  // NX_ASYNC_GPU: the submit it waits for (0: none; always 0 otherwise)
     std::atomic<uint64_t> job{0};     // the replay-thread job that fences it (0: none)
+    std::atomic<uint64_t> seq{0};     // the submits it follows (wait_submits); 0: none
 };
 
 void SyncInitialize(CPU& c) {  // NVNboolean (NVNsync*, NVNdevice*)
@@ -31,13 +84,14 @@ void SyncInitialize(CPU& c) {  // NVNboolean (NVNsync*, NVNdevice*)
 void SyncFinalize(CPU& c) { destroy(c.x[0]); }
 
 void signal_sync(uint64_t guest) {
-    if (auto* s = get<Sync>(guest)) s->serial = 0, s->job = 0, s->signaled = true;
+    if (auto* s = get<Sync>(guest)) s->serial = 0, s->job = 0, s->seq = 0, s->signaled = true;
 }
 
 // NVNsyncWaitResult (const NVNsync*, u64 timeout). Always 0 (already signaled), as before: a fenced submit is waited
 // for whatever the timeout, 2 s at most (then the GPU hung and the process ends). Correct results before latency.
 void SyncWait(CPU& c) {
     auto* s = get<Sync>(c.x[0]);
+    if (s) wait_submits(s->seq.load());
     if (s) worker_wait(s->job);
     if (uint64_t serial = s ? s->serial.load() : 0) gpu_wait(serial);
     c.x[0] = 0;
@@ -70,10 +124,18 @@ void QueueSubmitCommands(CPU& c) {  // (NVNqueue*, int count, const NVNcommandHa
     // NX_DEFERRED_SNAPSHOT=1: read the Deferred arrays here; by default they are read when the submit is replayed.
     static const bool snap = std::getenv("NX_DEFERRED_SNAPSHOT") != nullptr;
     auto deferred = snap ? std::make_shared<const DeferredValues>(deferred_snapshot(lists)) : nullptr;
-    worker_run([lists = std::move(lists), deferred] { gpu_submit(lists, deferred); });
+    {
+        std::lock_guard lk(g_sub_lock);
+        g_sub_called++;
+    }
+    worker_run([lists = std::move(lists), deferred] {
+        gpu_submit(lists, deferred);
+        submit_done();
+    });
 }
 void QueueFlush(CPU&) {}
 void QueueFinish(CPU&) {
+    wait_submits(submits_called());
     worker_finish();
     gpu_wait(gpu_serial());
 }
@@ -82,6 +144,7 @@ void QueueFenceSync(CPU& c) {
     uint64_t guest = c.x[1];  // the fence goes after the work queued so far: its serial is taken on the replay thread
     if (auto* s = get<Sync>(guest)) {
         s->signaled = true;
+        s->seq = submits_called();
         s->job = worker_run([guest] {
             if (auto* s = get<Sync>(guest)) s->serial = gpu_serial();
         });
@@ -200,7 +263,8 @@ void QueuePresentTexture(CPU& c) {
         worker_wait(queued[next_slot]);
         if (int(c.x[2]) >= 0 && size_t(c.x[2]) < w->textures.size()) {
             uint64_t texture = w->textures[size_t(c.x[2])];
-            queued[next_slot] = worker_run([texture] { gpu_present(texture); });
+            std::array<int32_t, 4> crop{w->crop[0], w->crop[1], w->crop[2], w->crop[3]};
+            queued[next_slot] = worker_run([texture, crop] { gpu_present(texture, crop.data()); });
             next_slot ^= 1;
         }
         pace_present(w->interval);
@@ -210,8 +274,22 @@ void QueuePresentTexture(CPU& c) {
     g_frame++;
 }
 
+// (NVNwindow*, int x, int y, int width, int height): the part of the window textures shown. In handheld mode
+// (NX_HANDHELD) the game renders 1280x720 into its 1920x1080 window textures and crops to it.
+void WindowSetCrop(CPU& c) {
+    if (auto* w = get<Window>(c.x[0])) {
+        int32_t v[4] = {int32_t(c.x[1]), int32_t(c.x[2]), int32_t(c.x[3]), int32_t(c.x[4])};
+        if (std::memcmp(v, w->crop, sizeof v) != 0) {
+            static int logged = 0;
+            if (logged++ < 20) log("nvn: window crop %d,%d %dx%d", v[0], v[1], v[2], v[3]);
+            std::memcpy(w->crop, v, sizeof v);
+        }
+    }
+}
+
 }  // namespace
 
+NX_HLE("nvnWindowSetCrop", WindowSetCrop);
 NX_HLE("nvnSyncInitialize", SyncInitialize);
 NX_HLE("nvnSyncFinalize", SyncFinalize);
 NX_HLE("nvnSyncWait", SyncWait);

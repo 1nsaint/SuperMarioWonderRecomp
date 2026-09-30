@@ -21,6 +21,9 @@ struct GpuImage {
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     bool rendered = false;  // written by the GPU: never re-uploaded from guest memory
     bool uploaded = false;  // filled from the texture's pool memory
+    // Given texels by nvnTextureWriteTexels: those never reach guest memory here, so it is not uploaded from there
+    // again (a pool flush over it wiped the light probes' direction map, docs/nvn/DEBUG.md #49).
+    bool texels = false;
     VkComponentMapping swizzle{};  // for sampling (attachment views stay identity)
     bool storage = false;          // created with VK_IMAGE_USAGE_STORAGE_BIT (compute shaders write it)
     // An R8 texture always read as (1, 1, 1, R) (a glyph cache): stored as RGBA8 (255, 255, 255, R) and sampled
@@ -38,6 +41,9 @@ uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want);
 
 // The image behind an NVN texture (guest NVNtexture*), made on first use.
 GpuImage* image_of(uint64_t texture);
+// NX_1D_IMAGES=1 (bisecting, nvn_pipeline.cpp): NVN 1D and 1D-array textures as Vulkan 1D images, the old way. By
+// default they are 2D / 2D-array images of height 1, which the translated shaders (1D sampled as 2D) can view (G8).
+bool vk_1d_images();
 void transition(VkCommandBuffer cb, GpuImage& img, VkImageLayout to);
 
 // Per-submit upload memory (host visible, coherent), reset at every submit: data the replayed commands read from
@@ -47,6 +53,11 @@ struct Upload {
     uint64_t offset = 0;
     uint8_t* ptr = nullptr;
 };
+// What it is bound as, and GPU copies within it and dispatch arguments read from it (nvn_written.cpp).
+constexpr VkBufferUsageFlags kUploadUsage =
+    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+    VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
 Upload upload_alloc(uint64_t size, uint64_t align);
 Upload upload(const void* data, uint64_t size, uint64_t align);
 
@@ -63,22 +74,46 @@ struct WriteBack {
     uint8_t* from;
     uint8_t* to;
     uint64_t size;
+    // The guest bytes as they were when the copy was made: only what the GPU changed goes back (nvn_written.cpp).
+    std::shared_ptr<std::vector<uint8_t>> before;
 };
+void apply_write_back(const WriteBack& w);  // nvn_written.cpp
 std::vector<WriteBack> draw_take_write_backs();  // nvn_draw.cpp: this submit's, for an asynchronous submit
+void debug_dump_textures(uint64_t frame);  // nvn_debug.cpp: NX_DUMP_TEXTURES and the requested ones
+void debug_dump_requested(uint64_t n);      // nvn_debug.cpp: NX_DUMP_ON_TARGET / NX_DUMP_ON_FS
+void debug_dump_add(uint64_t texture);  // nvn_debug.cpp: read back at the end of this submit
 
-// nvn_frames.cpp: asynchronous submission (NX_ASYNC_GPU). Slots of command buffer, fence, descriptor pool and ring
-// stretch; retired (fence waited, write-backs copied) on reuse, when the ring is full, or when the game waits.
-bool async_gpu();
+// nvn_frames.cpp: submits that are not waited for (NX_PIPELINED, NX_ASYNC_GPU). Slots of command buffers, fences,
+// descriptor pool and ring stretch; retired (fences waited, write-backs copied if not yet) on reuse, when the ring is
+// full, or when something waits for them.
+bool async_gpu();  // the slots are in use (either mode)
+bool pipelined();  // NX_PIPELINED: fences not waited for, write-backs copied before gpu_submit returns
 void frame_init(VkCommandPool pool, VkBuffer ring, uint8_t* ring_ptr, uint64_t ring_size);
-VkCommandBuffer frame_begin(bool replay);  // replay: submits with write-backs retired first
+VkCommandBuffer frame_begin(bool replay);  // NX_ASYNC_GPU, replay: submits with write-backs retired first
 VkSemaphore frame_acquire_semaphore();
 VkSemaphore frame_rendered_semaphore(uint32_t image);
 void frame_submit(VkSemaphore wait, VkSemaphore signal, std::vector<WriteBack> write_backs, bool wait_done);
 void frame_wait_all();
 uint64_t frame_upload_used();
-uint64_t frame_take_wait_ns();
+uint64_t frame_completed();  // the serial of the last retired submit (for free_retired_images)
 Upload frame_upload_alloc(uint64_t size, uint64_t align);
 VkDescriptorSet frame_descriptor_set(VkDescriptorSetLayout layout);
+// Pipelined: a submit with dispatches is split after the last one; its first part is queued at once and carries the
+// write-backs. frame_plan_split counts the submit's DispatchCompute commands and returns the last top-level list that
+// has one (SIZE_MAX: no split). frame_split ends the first part and returns the command buffer of the rest (once per
+// submit; outside the mode it returns `cb`). frame_after_dispatch is for replay_list, after each DispatchCompute: it
+// splits right after the last one. frame_cb: the command buffer to go on with (after a call that may have split).
+size_t frame_plan_split(const std::vector<std::shared_ptr<CmdList>>& lists);
+VkCommandBuffer frame_split(VkCommandBuffer cb);
+VkCommandBuffer frame_after_dispatch(VkCommandBuffer cb);
+VkCommandBuffer frame_cb(VkCommandBuffer cb);
+// Host time inside vkQueueSubmit (with vkEndCommandBuffer: Metal encoding) and inside vkWaitForFences, running
+// totals in every mode (the synchronous path adds its own).
+struct FrameTimes {
+    uint64_t encode_ns = 0, fence_ns = 0;
+};
+FrameTimes& frame_times();
+void frame_log(uint64_t frames);  // the mode's counters, with the timing log
 void free_retired_images(uint64_t completed);
 // A GPU-written image of a destroyed texture with the same memory and shape (nvn_frames.cpp), or null.
 std::shared_ptr<GpuImage> reuse_image(const Texture& t);  // images of textures destroyed before submit `completed` + 1
@@ -97,6 +132,17 @@ struct Targets {
     uint64_t depth = 0;
     TargetViews views;  // level and layer of each (index 8: depth)
 };
+// Field by field: a memcmp also compared the padding after color_count, which a copy need not keep.
+inline bool targets_same(const Targets& a, const Targets& b) {
+    if (a.color_count != b.color_count || a.depth != b.depth) return false;
+    for (uint32_t k = 0; k < 9; k++) {
+        if (k < 8 && a.colors[k] != b.colors[k]) return false;
+        if (a.views.level[k] != b.views.level[k] || a.views.layer[k] != b.views.layer[k] ||
+            a.views.format[k] != b.views.format[k])
+            return false;
+    }
+    return true;
+}
 void draw_begin_submit();
 void draw_end_submit();  // after the GPU finished the submit
 void draw_log_stats();
@@ -105,7 +151,24 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
 // 4 clear larger than the pass, 5 copy, 6 snapshot, 7 SetRenderTargets (NX_TARGETS_BREAK).
 void draw_end_rendering(VkCommandBuffer cb, int reason = 0);  // before transfers (clears, copies, present) and at the end
 // ClearColor / ClearDepthStencil inside the render pass of the current targets (nvn_draw.cpp).
-void draw_clear(VkCommandBuffer cb, const Targets& targets, const Cmd& c);
+void draw_clear(VkCommandBuffer cb, const Targets& targets, const Cmd& c);  // nvn_clears.cpp
+// nvn_clears.cpp: clears pending as the next pass's loadOps; nvn_draw.cpp: the open pass, for it.
+bool clears_pending_image(const GpuImage* img);
+bool clears_pending_other(const Targets& t);
+uint32_t clears_apply(const Targets& t, VkRenderingAttachmentInfo* colors, VkRenderingAttachmentInfo& depth,
+                      VkRenderingAttachmentInfo& stencil);
+void clears_flush(VkCommandBuffer cb);  // outside a pass: the pending clears in a pass of their own
+void clears_begin_submit();
+void clears_log();
+void pass_end_only(VkCommandBuffer cb, int reason);  // draw_end_rendering without the pending clears
+bool pass_open_on(const Targets& t);
+VkExtent2D pass_extent();
+void pass_begin(VkCommandBuffer cb, const Targets& t);
+void pass_mark_written(uint32_t bits);
+// nvn_mask_clear.cpp: colour target `slot` of the open pass on `t` cleared to `rgba` in `rect`, only the channels in
+// `mask` (bit 0 r .. 3 a) written, by a fullscreen draw. False (nothing recorded) for integer targets or no pipeline.
+bool mask_clear(VkCommandBuffer cb, const Targets& t, uint32_t slot, uint32_t mask, const float rgba[4],
+                const VkRect2D& rect);
 // nvn_replay.cpp: a command list into `cb` (`depth`: CallList nesting).
 void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth);
 
@@ -132,6 +195,9 @@ void gpu_profile_log(uint64_t frames);
 
 namespace replay {
 void dedup_reset();  // nvn_dedup.cpp
+bool written_separate();         // nvn_written.cpp (nvn_draw_state.h)
+uint64_t written_bind_count();   // nvn_written.cpp: written_bind calls so far (a dispatch bound storage it writes)
+void trace_nan_write_back(const uint8_t* from, const uint8_t* to, uint64_t size);  // nvn_draw_trace.cpp
 }
 
 }  // namespace nx::nvn

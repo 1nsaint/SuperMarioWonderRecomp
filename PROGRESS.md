@@ -18,10 +18,77 @@ NVN implemented over Vulkan (MoltenVK).
 | N4 textures and samplers | #11 | **working**: untiling + upload (BNTX block heights), ASTC/BCn, samplers, swizzles, views (levels/layers) |
 | N5 Maxwell shaders → SPIR-V | #12 | **done**: 12,717/12,717 blocks offline + the 34 embedded in main; runtime cache by hash |
 | N6 pipeline state and draws | #13 | **working**: pipelines, descriptor sets, dynamic rendering, texture views; **the title screen renders correctly** |
-| N7 whole game, performance | #14 | not started |
+| N7 whole game, performance | #14 | **in progress**: title, menus, world map and the first course render correctly; 60 fps in menus and in the course (headless, pipelined fences) |
 | NA AudioRenderer (`audren:u`) | — (new) | **renders in process** (the sdk's own server + DSP code, DFC); output to the Mac next |
 
 ## Log
+
+### 2026-09-30 (evening): 60 fps in the course (headless), W7 fixes
+
+![Course at 60 fps](docs/media/wonder/38-course-60fps-pipelined.png)
+
+- **60.0 fps steady** in course 1-1 headless (it was 48-58).
+  - Cause: pipelined fences, now on by default. The frame's GPU work is no longer waited for, and compute results
+    still reach guest memory before the submit returns.
+  - `NX_PIPELINED=0` restores the synchronous path.
+- Glitches from the gameplay recording (milestone W7):
+  - the game's waits now cover submits being replayed (horizon band, exploded meshes);
+  - EQUAL colour passes get a small depth bias (black silhouettes, wedges);
+  - a slot or object empty at the replay mark uses the current one (green silhouettes);
+  - replay-mark gaps closed (snapshots, sampler slots);
+  - windowed present mode: MAILBOX, else IMMEDIATE.
+- A regression was caught and fixed in the same series: an empty sampler slot at the mark lost the ground's grass.
+- Details: [docs/nvn/DEBUG-2.md](docs/nvn/DEBUG-2.md), entries 59-64.
+- Next: windowed validation with the user (glitches and 60 fps on screen).
+
+### 2026-09-30 (day): the course renders correctly (samplers restored), glitch plan W6
+
+![Course](docs/media/wonder/33-course-samplers-restored-goombas-lit.png)
+![World map](docs/media/wonder/34-world-map-samplers-restored.png)
+
+Five read-only studies of the remaining glitches gave one plan, [docs/nvn/GLITCH-PLAN.md](docs/nvn/GLITCH-PLAN.md)
+(milestone W6, issues #33-#42). What landed (docs/nvn/DEBUG.md #46-#55):
+
+- **Sampler objects restored (#50).** A file split in c41b534 had dropped every sampler proc, so all textures sampled
+  nearest, clamped, mip 0 only, with shadow compare ALWAYS.
+  - Goombas, the tree and the characters are lit: their shaders read the AO target at LOD 1, the only level the game
+    renders.
+  - The sky is smooth, and the map's repeating textures are back.
+- **Images shared across swizzles (#46).** The UI's text strips and the shadow map are no longer sampled as stale
+  uploads.
+- **Deferred clears (#47).** Clears become the next pass's loadOp CLEAR.
+- **Handheld mode (#48).** `NX_HANDHELD=1` gives 720p and 52-57 fps in the course; `nvnWindowSetCrop` is implemented.
+- **Uploads and fresh targets (#51).**
+  - R11G11B10F uploads are widened to the RGBA16F host format.
+  - Fresh render targets and unwritten attachments are cleared, not uploaded or loaded.
+- **Smaller state fixes (#52).**
+  - 1D textures are 2D images of height 1.
+  - Channel-masked clears.
+  - Alpha to coverage.
+  - Copies within one image.
+- **Compute results shared within a submit (#53).**
+- **Texture incarnations per submit (#55).** 640-750 thousand replay lookups per run had hit a texture re-initialized
+  mid-replay.
+- **Translator.** FMZ honoured on FMUL/FFMA (#49, 21 compute blocks).
+
+- **The game records frame N+1 while frame N is replayed (#56, #57).** 98.5% of the texture-pool registrations
+  happen during a replay.
+  - The replay now resolves textures and pool slots as they were when its command lists ended recording.
+  - Compute write-backs copy back only the words the GPU changed.
+  - This removed the intermittent glitches: the band at the horizon, exploded meshes, a white foreground layer.
+    4 runs, 28 course frames, all clean (before: about 1 run in 3).
+
+![Course](docs/media/wonder/36-course-tree-goombas.png)
+
+Course (docked 1080p, headless): 42-47 fps.
+
+Open:
+
+- **Character-select blur (#42).** The chain runs once, and the game's own command stream clears its capture
+  (DEBUG #58). The mask and halftone dots are drawn. It needs a capture from a real console to know what is right.
+- **"Too bad!"** is an outline by design (its font is an outline face, DEBUG #56).
+- **Button glyph font.** Needs `master_key_16` from the user's console.
+- **60 fps docked.** The plan is in [docs/nvn/PERF-PLAN.md](docs/nvn/PERF-PLAN.md).
 
 ### 2026-09-30 (night): 60 fps in menus, the course at ~30 fps
 

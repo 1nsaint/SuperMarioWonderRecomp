@@ -56,6 +56,18 @@ void trace_cube_draw(const Targets& t, const ShaderInfo* vs, const ShaderInfo* f
         (unsigned long long)g_stats.done, (unsigned long long)g_frame.load(), vs->hash.c_str(), fs ? fs->hash.c_str() : "-",
         t.color_count, (unsigned long long)t.colors[0], t.views.level[0], t.views.layer[0], (unsigned long long)t.depth,
         d ? d->width : 0, d ? d->height : 0, tex.c_str());
+    for (int bank : {4, 5}) {  // the probe shaders' axes (c4[1..3]), colours (c5[16..21]) and LUT rows (c5[8..10])
+        const Range& u = g_state.uniforms[1][bank - 3];
+        const float* f = u.address ? reinterpret_cast<const float*>(guest_bytes(u.address)) : nullptr;
+        std::string rows;
+        for (int r : {0, 1, 2, 3, 8, 16, 17, 18, 19})
+            if (f && uint64_t(r) * 16 + 16 <= u.size) {
+                char b[96];
+                std::snprintf(b, sizeof b, " [%d] %g %g %g %g", r, f[4 * r], f[4 * r + 1], f[4 * r + 2], f[4 * r + 3]);
+                rows += b;
+            }
+        log("  fs c%d (%llx, %llu bytes):%s", bank, (unsigned long long)u.address, (unsigned long long)u.size, rows.c_str());
+    }
     if (const Range& u = g_state.uniforms[1][0]; u.address && u.size >= 64)  // fs c3: lod, level, probe index
         if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
             log("  fs c3: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", f[0], f[1], f[2], f[3], f[4], f[5],
@@ -63,6 +75,88 @@ void trace_cube_draw(const Targets& t, const ShaderInfo* vs, const ShaderInfo* f
 }
 
 }  // namespace
+
+namespace {
+std::map<uint64_t, std::string> g_nan_writers;  // storage address -> the last compute shader bound to it
+bool trace_nan_on() {
+    static const bool on = std::getenv("NX_TRACE_NAN") != nullptr;
+    return on;
+}
+}  // namespace
+
+void trace_nan_dispatch(const ShaderInfo* cs) {
+    if (!trace_nan_on()) return;
+    for (const Range& r : g_state.storage[5])
+        if (r.address) g_nan_writers[reinterpret_cast<uintptr_t>(guest_bytes(r.address))] = cs->hash;
+}
+
+void trace_nan_write_back(const uint8_t* from, const uint8_t* to, uint64_t size) {
+    static int logged = 0;
+    if (!trace_nan_on() || logged >= 200) return;
+    uint64_t bad = 0, first = 0;
+    auto* f = reinterpret_cast<const uint32_t*>(from);
+    for (uint64_t k = 0; k < size / 4; k++) {
+        uint32_t e = f[k] >> 23 & 0xFF;
+        if (e == 0xFF || (e >= 127 + 40 && e != 0xFF)) {  // Inf/NaN, or |x| >= 2^40 (also integers that look so)
+            if (!bad) first = k;
+            bad++;
+        }
+    }
+    if (!bad) return;
+    std::string who;
+    auto it = g_nan_writers.upper_bound(reinterpret_cast<uintptr_t>(to) + size - 1);
+    if (it != g_nan_writers.begin() && (--it)->first + 0 >= reinterpret_cast<uintptr_t>(to)) who = it->second;
+    logged++;
+    log("nan: frame %llu write-back %p (%llu bytes): %llu suspicious floats, first at word %llu = %08x, cs %s",
+        (unsigned long long)g_frame.load(), (void*)to, (unsigned long long)size, (unsigned long long)bad,
+        (unsigned long long)first, f[first], who.c_str());
+}
+
+void trace_pass(const char* what, const Targets& t, uint32_t a, uint32_t b) {
+    static const char* env = std::getenv("NX_TRACE_PASSES");
+    static const uint64_t from = env ? std::strtoull(env, nullptr, 10) : 0;
+    static int n = 0;
+    if (!env || g_stats.done < from || n++ >= 4000) return;
+    Texture* c0 = t.color_count && t.colors[0] ? get<Texture>(t.colors[0]) : nullptr;
+    log("pass: %s %x %x after draw %llu: %u colours, 0 = %llx (%ux%u f%x L%u l%u view f%x) depth %llx", what, a, b,
+        (unsigned long long)g_stats.done, t.color_count, (unsigned long long)t.colors[0], c0 ? c0->width : 0,
+        c0 ? c0->height : 0, c0 ? c0->format : 0, t.views.level[0], t.views.layer[0], t.views.format[0],
+        (unsigned long long)t.depth);
+}
+
+// NX_SNAP_FOLLOW=<fs hash>@<first draw>: from the first draw with that fragment shader, the next 48 draws into its
+// colour target 0 are logged (shaders, textures) and snapshotted after (frames/00000_<draw>.ppm): which draw of a
+// pass paints what.
+bool snap_follow(const Targets& t, const ShaderInfo* vs, const ShaderInfo* fs, const std::vector<uint64_t>& handles) {
+    static const std::string env = std::getenv("NX_SNAP_FOLLOW") ? std::getenv("NX_SNAP_FOLLOW") : "";
+    static const uint64_t from = env.find('@') != std::string::npos ? std::strtoull(env.c_str() + env.find('@') + 1, nullptr, 10) : 0;
+    static uint64_t target = 0;
+    static int left = 0;
+    if (env.empty() || !t.color_count) return false;
+    static const int count = std::getenv("NX_SNAP_FOLLOW_COUNT") ? std::atoi(std::getenv("NX_SNAP_FOLLOW_COUNT")) : 48;
+    static const bool by_frame = env.find("@f") != std::string::npos;  // <hash>@f<presented frame>
+    static const uint64_t frame_from = by_frame ? std::strtoull(env.c_str() + env.find("@f") + 2, nullptr, 10) : 0;
+    bool started = by_frame ? g_frame >= frame_from : g_stats.done >= from;
+    if (!target && started && ((fs && env.compare(0, 16, fs->hash) == 0) || env.compare(0, 16, vs->hash) == 0))
+        target = t.colors[0], left = count;  // the vertex shader's hash matches too
+    if (!target || t.colors[0] != target || left <= 0) return false;
+    left--;
+    std::string tex;
+    for (size_t k = 0; k < handles.size(); k++) {
+        uint64_t texture = 0;
+        SamplerInfo si;
+        texture_for(handles[k], texture, si);
+        Texture* tx = texture ? get<Texture>(texture) : nullptr;
+        char b[96];
+        std::snprintf(b, sizeof b, " t%zu=%llx(%ux%u f%x%s)", k, (unsigned long long)texture, tx ? tx->width : 0,
+                      tx ? tx->height : 0, tx ? tx->format : 0, tx && tx->image && tx->image->rendered ? " rt" : "");
+        tex += b;
+    }
+    log("follow: draw %llu vs %s fs %s%s", (unsigned long long)g_stats.done, vs->hash.c_str(), fs ? fs->hash.c_str() : "-",
+        tex.c_str());
+    static const bool nosnap = std::getenv("NX_SNAP_FOLLOW_NOSNAP") != nullptr;  // log only (8 MB per snapshot)
+    return !nosnap;
+}
 
 void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, const ShaderInfo* vs,
                 const ShaderInfo* fs, const TexBindings& tex_bindings, const std::vector<uint64_t>& handles) {
@@ -80,23 +174,46 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
     static const char* target_env = std::getenv("NX_TRACE_TARGET");
     static const uint64_t trace_target = target_env ? std::strtoull(target_env, nullptr, 16) : 0;
     static uint64_t traced = 0;
-    // NX_TRACE_FS_HASH=<hash>: only draws with that fragment shader.
+    // NX_TRACE_FS_HASH=<hash>[,<hash>...]: only draws with those fragment shaders.
     static const char* fs_env = std::getenv("NX_TRACE_FS_HASH");
     static const uint64_t trace_count = std::getenv("NX_TRACE_COUNT") ? std::strtoull(std::getenv("NX_TRACE_COUNT"), nullptr, 10) : 80;
     if (trace_env && g_stats.done >= trace_from && traced < trace_count && (!trace_target || t.colors[0] == trace_target) &&
-        (!fs_env || (fs && fs->hash == fs_env))) {
+        (!fs_env || (fs && std::strstr(fs_env, fs->hash.c_str())))) {  // one hash or a comma list
         traced++;
+        // NX_TRACE_VERTS=1: the first 3 vertices of stream 0 as floats and halves (8 words each at most).
+        if (std::getenv("NX_TRACE_VERTS") && !g_state.streams.empty())
+            if (const Range& vb = g_state.vertex_buffers[0]; vb.address)
+                if (const auto* w = reinterpret_cast<const uint32_t*>(guest_bytes(vb.address))) {
+                    uint32_t stride = g_state.streams[0].stride, words = std::min<uint32_t>(stride / 4, 8);
+                    for (uint32_t v = 0; v < 3 && uint64_t(v + 1) * stride <= vb.size; v++) {
+                        std::string line;
+                        for (uint32_t k = 0; k < words; k++) {
+                            uint32_t x = w[v * stride / 4 + k];
+                            float f;
+                            std::memcpy(&f, &x, 4);
+                            char b[48];
+                            std::snprintf(b, sizeof b, " %g[%08x]", f, x);
+                            line += b;
+                        }
+                        log("  vertex %u (stride %u):%s", v, stride, line.c_str());
+                    }
+                }
         std::string tex;
         for (size_t k = 0; k < tex_bindings.size(); k++) {
             uint64_t texture = 0;
             SamplerInfo si;
-            texture_for(handles[k], texture, si);
+            ViewInfo vw;
+            texture_for(handles[k], texture, si, &vw);
             Texture* tx = texture ? get<Texture>(texture) : nullptr;
             char b[96];
-            if (std::getenv("NX_TRACE_GLYPHS"))
-                log("  sampler for t%zu: min %u mag %u wrap %u/%u/%u compare %u/%u reduction %u lod %g..%g bias %g aniso %g",
+            if (std::getenv("NX_TRACE_GLYPHS") || std::getenv("NX_TRACE_SAMPLERS"))  // NX_TRACE_SAMPLERS: only these
+                log("  sampler for t%zu: min %u mag %u wrap %u/%u/%u compare %u/%u reduction %u lod %g..%g bias %g aniso %g; "
+                    "view levels %u+%u layers %u+%u swizzle %08x format %#x; texture levels %u swizzle %u%u%u%u pool %08x",
                     k, si.min_filter, si.mag_filter, si.wrap[0], si.wrap[1], si.wrap[2], si.compare_mode, si.compare_func,
-                    si.reduction, si.lod_min, si.lod_max, si.lod_bias, si.max_anisotropy);
+                    si.reduction, si.lod_min, si.lod_max, si.lod_bias, si.max_anisotropy, vw.base_level, vw.levels,
+                    vw.min_layer, vw.layers, vw.swizzle, vw.format, tx ? tx->levels : 0, tx ? tx->swizzle[0] : 0,
+                    tx ? tx->swizzle[1] : 0, tx ? tx->swizzle[2] : 0, tx ? tx->swizzle[3] : 0,
+                    tx ? tx->pool_swizzle.load() : 0);
             std::snprintf(b, sizeof b, " t%zu=%llx:%llx(%ux%u f%x%s)", k, (unsigned long long)handles[k],
                           (unsigned long long)texture, tx ? tx->width : 0, tx ? tx->height : 0, tx ? tx->format : 0,
                           tx && tx->image && tx->image->rendered ? " rt" : "");

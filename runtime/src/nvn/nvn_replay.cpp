@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "nvn_draw_state.h"
 #include "nvn_vk.h"
 
 namespace nx::nvn {
@@ -13,6 +14,14 @@ using namespace nx::vk;
 void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth) {
     if (skin_lists_on()) skin_list_replayed(list, depth);
     for (const Cmd& c : list.cmds) {
+        // NX_TRACE_CMDS=<first draw>: the ops replayed from that draw on (20000), with n, mask and a[0].
+        static const char* tc = std::getenv("NX_TRACE_CMDS");
+        static const uint64_t tc_from = tc ? std::strtoull(tc, nullptr, 10) : 0;
+        static int tc_n = 0;
+        if (tc && replay::g_stats.done >= tc_from && tc_n++ < 20000)
+            log("cmd after draw %llu: op %u n %u mask %x a0 %llx a1 %llx i %d %d %d %d f %g %g %g %g depth %d",
+                (unsigned long long)replay::g_stats.done, unsigned(c.op), c.n, c.mask, (unsigned long long)c.a[0],
+                (unsigned long long)c.a[1], c.i[0], c.i[1], c.i[2], c.i[3], c.f[0], c.f[1], c.f[2], c.f[3], depth);
         switch (c.op) {
             case Cmd::SetRenderTargets: {  // the pass ends only when a draw or clear needs other targets
                 static const bool always = std::getenv("NX_TARGETS_BREAK") != nullptr;  // bisecting: the old way
@@ -29,9 +38,10 @@ void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth
             case Cmd::ClearDepthStencil: draw_clear(cb, st, c); break;
             case Cmd::CallList:
                 if (depth < 8) {
-                    if (auto l = command_list(c.a[0]))
+                    if (auto l = command_list(c.a[0])) {
                         replay_list(cb, st, *l, depth + 1);
-                    else {
+                        cb = frame_cb(cb);  // NX_PIPELINED: the called list may have split the submit
+                    } else {
                         static int missing = 0;
                         if (++missing <= 5) log("nvn: called handle %llx is unknown", (unsigned long long)c.a[0]);
                     }
@@ -43,7 +53,11 @@ void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth
                 replay_copy(cb, c, list);
                 if (gpu_profile_on()) gpu_profile_mark(cb, "outside passes (clears, uploads, copies)");
                 break;
-            default: draw_command(cb, c, list, st); break;
+            default:
+                draw_command(cb, c, list, st);
+                // NX_PIPELINED: after the submit's last dispatch the rest goes into a second command buffer.
+                if (c.op == Cmd::DispatchCompute) cb = frame_after_dispatch(cb);
+                break;
         }
     }
 }

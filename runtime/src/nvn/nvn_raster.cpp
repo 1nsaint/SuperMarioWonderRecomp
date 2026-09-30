@@ -53,6 +53,33 @@ void SetDepthClamp(CPU& c) {
 
 }  // namespace
 
+namespace {
+float equal_slack_units() {
+    static const char* env = std::getenv("NX_EQUAL_SLACK");
+    static const float units = env ? float(std::atof(env)) : 4.0f;
+    return units;
+}
+}  // namespace
+
+// The colour pass after a pre-pass tests EQUAL (taken as LESS_OR_EQUAL, nvn_pipeline.cpp) against depth another
+// vertex shader wrote: Metal compiles the two apart, and where the colour pass lands a few ulps behind, the pixel
+// keeps the pre-pass's clear (black silhouettes, black/white wedges on slopes). A bias toward the camera of a few
+// units, plus one per unit of slope, covers that; it lets through only what lies within that distance of the
+// surface the pre-pass kept.
+// GREATER without depth writes is the same case the other way (DEBUG-2.md #65): the world map's "behind scenery"
+// silhouette draws the player again with GREATER after the G-buffer wrote it with LESS, and must fail where the player
+// is visible. With the two vertex shaders a few ulps apart it passed over the whole player (a flat purple figure, no
+// Luigi). The same bias toward the camera makes those ties fail. Off unless NX_GREATER_SLACK=1: it did not bring the
+// player back (the map composites it from its own target, issue #50), so it stays an experiment.
+bool equal_slack_pass(const DepthStencilInfo& d) {
+    static const bool greater = [] {
+        const char* e = std::getenv("NX_GREATER_SLACK");
+        return e && e[0] == '1';
+    }();
+    if (d.depth_write || equal_slack_units() == 0.0f) return false;
+    return d.depth_func == 3 || (d.depth_func == 5 && greater);
+}
+
 namespace replay {
 
 bool raster_command(const Cmd& c) {
@@ -86,7 +113,7 @@ bool raster_command(const Cmd& c) {
 }
 
 // Before each draw (every pipeline declares these dynamic, nvn_pipeline.cpp, so they must all be set).
-void raster_dynamic(VkCommandBuffer cb) {
+void raster_dynamic(VkCommandBuffer cb, bool slack) {
     const State& s = g_state;
     auto set = [&](PFN_vkCmdSetStencilReference fn, const uint8_t* v) {  // the three setters share the signature
         if (v[0] == v[1]) {
@@ -111,7 +138,9 @@ void raster_dynamic(VkCommandBuffer cb) {
     static const float units_scale = scale_env ? float(std::atof(scale_env)) : 1.0f;
     // A non-zero clamp needs the depthBiasClamp feature (MoltenVK has it: Metal's setDepthBias clamp).
     float clamp = vk_features().depthBiasClamp ? s.bias_clamp : 0.0f;
-    p_vkCmdSetDepthBias(cb, s.bias_units * units_scale, clamp, s.bias_factor);
+    float units = s.bias_units * units_scale, factor = s.bias_factor;
+    if (slack) units -= equal_slack_units(), factor -= equal_slack_units() / 4.0f, clamp = 0.0f;
+    p_vkCmdSetDepthBias(cb, units, clamp, factor);
 }
 
 }  // namespace replay
