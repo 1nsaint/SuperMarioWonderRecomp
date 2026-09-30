@@ -403,3 +403,9 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
       then runs at 20-30 fps with longer frames.
     - Kept as diagnostics: `NX_FAKE_GPU_TIME`, `NX_MAX_INTERVAL`, `NX_TRACE_CUBES` (writes into cube images), and the
       present-interval logs.
+    **#40 data** (`nvn passes ended` log, by reason, same route):
+    - Without the replay thread: 183 k passes ended by a draw, 341 k by a clear of other targets, 2.8 M draws.
+    - With it: 657 k by a draw, 261 k by clears, 1.7 M draws.
+    - The extra breaks are draws whose targets differ from the open pass: the command stream itself alternates targets
+      more when the submit does not wait for the replay. Probably the game changes behaviour (its dynamic resolution or
+      its pacing) when submits return at once. To study next.

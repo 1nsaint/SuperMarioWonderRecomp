@@ -16,7 +16,7 @@ void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth
         switch (c.op) {
             case Cmd::SetRenderTargets: {  // the pass ends only when a draw or clear needs other targets
                 static const bool always = std::getenv("NX_TARGETS_BREAK") != nullptr;  // bisecting: the old way
-                if (always) draw_end_rendering(cb);
+                if (always) draw_end_rendering(cb, 7);
                 st.color_count = c.n;
                 for (uint32_t k = 0; k < 8; k++) st.colors[k] = k < c.n ? c.a[k] : 0;
                 st.depth = c.a[8];
@@ -38,7 +38,7 @@ void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth
                 }
                 break;
             case Cmd::CopyTextureToTexture:
-                draw_end_rendering(cb);
+                draw_end_rendering(cb, 5);
                 if (gpu_profile_on()) gpu_profile_mark(cb, "texture copies");
                 replay_copy(cb, c, list);
                 if (gpu_profile_on()) gpu_profile_mark(cb, "outside passes (clears, uploads, copies)");

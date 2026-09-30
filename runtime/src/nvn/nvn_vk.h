@@ -101,7 +101,9 @@ void draw_begin_submit();
 void draw_end_submit();  // after the GPU finished the submit
 void draw_log_stats();
 void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const Targets& targets);
-void draw_end_rendering(VkCommandBuffer cb);  // before transfers (clears, copies, present) and at the end
+// reason (counted in the `nvn passes ended` log): 0 submit end, 1 draw, 2 dispatch, 3 clear of other targets,
+// 4 clear larger than the pass, 5 copy, 6 snapshot, 7 SetRenderTargets (NX_TARGETS_BREAK).
+void draw_end_rendering(VkCommandBuffer cb, int reason = 0);  // before transfers (clears, copies, present) and at the end
 // ClearColor / ClearDepthStencil inside the render pass of the current targets (nvn_draw.cpp).
 void draw_clear(VkCommandBuffer cb, const Targets& targets, const Cmd& c);
 // nvn_replay.cpp: a command list into `cb` (`depth`: CallList nesting).

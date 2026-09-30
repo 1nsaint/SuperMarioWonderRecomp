@@ -69,6 +69,7 @@ namespace {
 bool g_rendering = false;
 Targets g_pass;           // what the open pass renders to
 uint32_t g_pass_written = 0;
+uint64_t g_pass_ends[8];  // passes ended, by draw_end_rendering reason
 uint64_t g_submit_ns = 0;  // when the submit being replayed started
 // gather_textures' resolution of each texture binding, used by build_sets for the same draw: pool lookups and object
 // lookups (each under the object lock) were done twice or three times per binding (a large share of the replay).
@@ -363,7 +364,7 @@ void dispatch(VkCommandBuffer cb, const Cmd& c) {
     const ProgramLayout& layout = program_layout(stages);
     VkPipeline pipeline = compute_pipeline(cs, layout);
     if (!pipeline) return;
-    draw_end_rendering(cb);
+    draw_end_rendering(cb, 2);
     std::vector<std::pair<const ShaderInfo*, const DescriptorBinding*>> tex_bindings;
     std::vector<uint64_t> handles;
     gather_textures(stages, tex_bindings, handles);
@@ -417,7 +418,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             t.color_count && t.colors[0])
             if (GpuImage* img = image_of(t.colors[0])) {
                 taken++;
-                draw_end_rendering(cb);
+                draw_end_rendering(cb, 6);
                 debug_snapshot(cb, *img, 0xB0000000ull + g_stats.total);
             }
     }
@@ -428,7 +429,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     bool targets_changed = !g_rendering || std::memcmp(&g_pass, &t, sizeof t) != 0;
     if (g_rendering && (need_break || targets_changed)) {
         (targets_changed ? g_stats.breaks_targets : g_stats.breaks_textures)++;
-        draw_end_rendering(cb);
+        draw_end_rendering(cb, 1);
     }
 
     Descriptors d;
@@ -555,7 +556,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                        snap_fs.find(vs->hash) != std::string::npos) &&
                       ++snap_count;  // the vertex shader's hash matches too
     if ((snap_by_fs || debug_snap_wanted(g_stats.done)) && t.color_count && t.colors[0])
-        if (GpuImage* snap = image_of(t.colors[0])) draw_end_rendering(cb), debug_snapshot(cb, *snap, g_stats.done);
+        if (GpuImage* snap = image_of(t.colors[0])) draw_end_rendering(cb, 6), debug_snapshot(cb, *snap, g_stats.done);
     // NX_DUMP_ON_TARGET=<hex NVNtexture*>: every NX_DUMP_FRAMES-th draw into it asks for NX_DUMP_TEXTURES to be read
     // back right after this submit (before later frames change them).
     static const char* dump_env = std::getenv("NX_DUMP_ON_TARGET");
@@ -591,6 +592,11 @@ uint64_t recorded_draws();
 void draw_log_stats() {
     dedup_log();
     sampled_ready_log();
+    log("nvn passes ended: %llu submit end, %llu draw, %llu dispatch, %llu clear of other targets, %llu clear larger than "
+        "the pass, %llu copy, %llu snapshot, %llu SetRenderTargets", (unsigned long long)g_pass_ends[0],
+        (unsigned long long)g_pass_ends[1], (unsigned long long)g_pass_ends[2], (unsigned long long)g_pass_ends[3],
+        (unsigned long long)g_pass_ends[4], (unsigned long long)g_pass_ends[5], (unsigned long long)g_pass_ends[6],
+        (unsigned long long)g_pass_ends[7]);
     Stats& t = g_stats;
     log("nvn draws: %llu recorded, %llu replayed:", (unsigned long long)recorded_draws(), (unsigned long long)t.total);
     log("nvn draws: %llu total, %llu done, %llu no program, %llu no vertex shader, %llu no pipeline, %llu no indices",
@@ -600,8 +606,9 @@ void draw_log_stats() {
         (unsigned long long)t.breaks_textures, (unsigned long long)t.breaks_targets, (unsigned long long)t.dispatches);
 }
 
-void draw_end_rendering(VkCommandBuffer cb) {
+void draw_end_rendering(VkCommandBuffer cb, int reason) {
     if (!g_rendering) return;
+    g_pass_ends[reason & 7]++;
     p_vkCmdEndRendering(cb);
     g_rendering = false;
     gpu_profile_mark(cb, "outside passes (clears, uploads, copies)");
@@ -626,13 +633,13 @@ void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
         if (!a.aspectMask) return;
         a.clearValue.depthStencil = {c.f[0], uint32_t(c.i[0])};
     }
-    if (g_rendering && std::memcmp(&g_pass, &t, sizeof t) != 0) draw_end_rendering(cb);
+    if (g_rendering && std::memcmp(&g_pass, &t, sizeof t) != 0) draw_end_rendering(cb, 3);
     if (!g_rendering) begin_rendering(cb, t);
     uint32_t level = color ? t.views.level[c.n] : t.views.level[8];
     VkExtent2D full{std::max(1u, img->width >> level), std::max(1u, img->height >> level)};
     if (full.width > g_pass_extent.width || full.height > g_pass_extent.height) {
         // The pass is smaller than this target (a larger shared depth buffer): clear all of it, outside the pass.
-        draw_end_rendering(cb);
+        draw_end_rendering(cb, 4);
         transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);
         VkImageSubresourceRange r{a.aspectMask, std::min<uint32_t>(level, img->levels - 1), 1,
                                   std::min<uint32_t>(color ? t.views.layer[c.n] : t.views.layer[8], img->layers - 1), 1};
