@@ -38,6 +38,26 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
         case Cmd::BindStorageBuffer:
             if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 16) s.storage[c.i[0]][c.i[1]] = {c.a[0], c.a[1]};
             break;
+        case Cmd::BindDeferred: {
+            const DeferredValues* dv = current_deferred();
+            auto it = dv ? dv->find(c.a[0]) : DeferredValues::const_iterator{};
+            uint32_t words = c.mask >= 2 ? 2 : 1;
+            int st = c.i[0];
+            if (st < 0 || st >= kStages) break;
+            for (uint32_t k = 0; k < c.n; k++) {
+                auto value = [&](uint32_t w) {  // the submit's snapshot, else the memory now
+                    size_t at = size_t(k) * words + w;
+                    return dv && it != dv->end() && at < it->second.size() ? it->second[at]
+                                                                            : ld<uint64_t>(c.a[0] + 8 * at);
+                };
+                int slot = c.i[1] + int(k);
+                if (c.mask == 0 && slot >= 0 && slot < 32) s.textures[st][slot] = value(0);
+                if (c.mask == 1 && slot >= 0 && slot < 16) s.images[st][slot] = value(0);
+                if (c.mask == 2 && slot >= 0 && slot < 18) s.uniforms[st][slot] = {value(0), value(1)};
+                if (c.mask == 3 && slot >= 0 && slot < 16) s.storage[st][slot] = {value(0), value(1)};
+            }
+            break;
+        }
         case Cmd::BindTexture:
             if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 32) s.textures[c.i[0]][c.i[1]] = c.a[0];
             break;

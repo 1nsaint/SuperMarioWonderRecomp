@@ -63,7 +63,15 @@ namespace {
 bool g_rendering = false;
 Targets g_pass;           // what the open pass renders to
 uint32_t g_pass_written = 0;
-uint64_t g_submit_ns = 0;  // when the submit being replayed started  // targets the open pass's draws wrote: bit c colour c, bit 8 depth
+uint64_t g_submit_ns = 0;  // when the submit being replayed started
+// gather_textures' resolution of each texture binding, used by build_sets for the same draw: pool lookups and object
+// lookups (each under the object lock) were done twice or three times per binding (a large share of the replay).
+struct ResolvedTexture {
+    uint64_t texture = 0;
+    SamplerInfo sampler;
+    ViewInfo view;
+};
+std::vector<ResolvedTexture> g_resolved;  // targets the open pass's draws wrote: bit c colour c, bit 8 depth
 VkExtent2D g_pass_extent{};
 
 int api_stage(ShaderStage s) { return s == ShaderStage::Fragment ? 1 : s == ShaderStage::Compute ? 5 : 0; }
@@ -225,10 +233,9 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
     }
     for (size_t k = 0; k < tex_bindings.size(); k++) {
         auto [s, b] = tex_bindings[k];
-        uint64_t texture = 0;
-        SamplerInfo si;
-        ViewInfo view;
-        texture_for(handles[k], texture, si, &view);
+        uint64_t texture = k < g_resolved.size() ? g_resolved[k].texture : 0;
+        SamplerInfo si = k < g_resolved.size() ? g_resolved[k].sampler : SamplerInfo{};
+        ViewInfo view = k < g_resolved.size() ? g_resolved[k].view : ViewInfo{};
         VkDescriptorImageInfo ii{};
         ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         ii.imageView = texture ? sampled_view(cb, texture, b->image, &view, &ii.imageLayout) : dummy_view(cb, b->image);
@@ -280,6 +287,7 @@ bool gather_textures(const std::vector<const ShaderInfo*>& shaders,
             if (b.set == 3) need_break = true;  // storage images change layout
         }
     handles.assign(tex_bindings.size(), 0);
+    g_resolved.assign(tex_bindings.size(), ResolvedTexture{});
     for (size_t k = 0; k < tex_bindings.size(); k++) {
         auto [s, b] = tex_bindings[k];
         int st = api_stage(s->stage);
@@ -294,13 +302,15 @@ bool gather_textures(const std::vector<const ShaderInfo*>& shaders,
         handles[k] = handle;
         uint64_t texture = 0;
         SamplerInfo si;
-        texture_for(handle, texture, si);
+        ViewInfo view;
+        texture_for(handle, texture, si, &view);
         // A pool entry naming a texture that no longer exists samples the dummy, like no texture: it ended the
         // render pass at every draw (~1.4M times in a run, docs/nvn/DEBUG.md #34).
         if (Texture* sampled = texture ? get<Texture>(texture) : nullptr)
             sampled->last_sampled = g_submit_ns;
         else
             texture = 0;
+        g_resolved[k] = {texture, si, view};
         if (texture ? !sampled_ready(texture) : !dummy_ready(b->image)) need_break = true;
         // Sampling one of the open pass's targets (a depth buffer read back by the character lighting) needs what
         // was rendered stored first: a fresh pass. SetRenderTargets used to end every pass, which did this by chance

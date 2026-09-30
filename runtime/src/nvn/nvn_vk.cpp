@@ -320,7 +320,8 @@ GpuImage* image_of(uint64_t guest) {
     if (!t) return nullptr;
     if (t->image) return t->image.get();
     StorageKey key{t->memory, t->format, t->width, t->height, t->depth, t->levels, t->target, t->samples};
-    if (t->memory && t->pool_swizzle == 0)
+    static const bool share = std::getenv("NX_NO_IMAGE_SHARE") == nullptr;  // bisecting
+    if (share && t->memory && t->pool_swizzle == 0)
         if (auto it = g_live_images.find(key); it != g_live_images.end())
             if (auto shared = it->second.lock(); shared && shared->image && !shared->alpha_from_r) {
                 static uint64_t shares = 0;
@@ -562,7 +563,14 @@ void log_timing(uint64_t frames) {
 void debug_dump_textures(uint64_t frame);  // nvn_debug.cpp
 uint64_t draw_take_dump_request();          // nvn_draw.cpp
 
-void gpu_submit(CPU&, const std::vector<std::shared_ptr<CmdList>>& lists) {
+namespace {
+std::shared_ptr<const DeferredValues> g_deferred;  // the submit being replayed (replay thread only)
+}
+const DeferredValues* current_deferred() { return g_deferred.get(); }
+
+void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_ptr<const DeferredValues> deferred) {
+    drain_objects();  // nothing replays now: objects the game destroyed can go
+    g_deferred = std::move(deferred);
     std::lock_guard lk(g_gpu);
     if (!init()) return;
     bool async = async_gpu();
@@ -617,6 +625,7 @@ void present_headless(uint64_t texture) {
 }
 
 void gpu_present(uint64_t texture) {
+    drain_objects();
     std::lock_guard lk(g_gpu);
     if (!init()) return;
     if (!async_gpu()) free_retired_images(UINT64_MAX);

@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -59,17 +60,26 @@ T* get(uint64_t guest) {
     return it == objects().end() ? nullptr : dynamic_cast<T*>(it->second.get());
 }
 
+// Objects the game destroys or re-creates are freed on the replay thread between two jobs (drain_objects), never
+// while a replay may still hold a pointer from get<T>() (nvn_trace.cpp). Under objects_lock.
+void defer_object(std::unique_ptr<Object> o);
+void drain_objects();
+
 template <typename T>
 T& make(uint64_t guest) {
     std::lock_guard lk(objects_lock());
     auto& slot = objects()[guest];
+    if (slot) defer_object(std::move(slot));
     slot = std::make_unique<T>();
     return static_cast<T&>(*slot);
 }
 
 inline void destroy(uint64_t guest) {
     std::lock_guard lk(objects_lock());
-    objects().erase(guest);
+    auto it = objects().find(guest);
+    if (it == objects().end()) return;
+    defer_object(std::move(it->second));
+    objects().erase(it);
 }
 
 // ---- memory ---------------------------------------------------------------------------------------------------
@@ -181,6 +191,7 @@ struct Cmd {
         DrawArrays, DrawElements, ReportCounter, SetRasterizerDiscard, SetRenderEnable, CopyTextureToTexture,
         BindImage, DispatchCompute,
         SetStencilRef, SetStencilMask, SetStencilValueMask, SetPolygonOffsetClamp, SetDepthBounds, SetDepthClamp,
+        BindDeferred,  // mask: 0 textures, 1 images, 2 uniform buffers, 3 storage buffers; a[0] the guest array
     } op;
     uint32_t n = 0, mask = 0;
     uint64_t a[9] = {};  // textures (render targets: colors then depth), handles, GPU addresses, sizes, ...
@@ -237,7 +248,18 @@ void record(uint64_t cmdbuf, Cmd cmd, const void* blob = nullptr, size_t size = 
 
 // ---- the GPU (nvn_vk.cpp) -------------------------------------------------------------------------------------
 
-void gpu_submit(CPU& c, const std::vector<std::shared_ptr<CmdList>>& lists);
+// *Deferred binds read their array when the work is submitted (nvn_binds.cpp): the values of each array a submit
+// uses, taken on the game's thread at nvnQueueSubmitCommands, keyed by array address.
+using DeferredValues = std::unordered_map<uint64_t, std::vector<uint64_t>>;
+DeferredValues deferred_snapshot(const std::vector<std::shared_ptr<CmdList>>& lists);
+void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_ptr<const DeferredValues> deferred = {});
+const DeferredValues* current_deferred();  // the submit being replayed
+// nvn_worker.cpp: the replay thread. worker_run queues a job (runs it at once when the thread is off) and returns its
+// serial (0: done); worker_wait waits for a serial; worker_finish for everything queued so far.
+uint64_t worker_run(std::function<void()> job);
+void worker_wait(uint64_t serial);
+uint64_t worker_last();
+void worker_finish();
 void gpu_present(uint64_t texture);  // guest NVNtexture* of a window texture
 // With NX_ASYNC_GPU submits run while the game goes on (nvn_frames.cpp): the serial of the last one, and a wait until
 // it completed with its results in guest memory (true if it had to wait). Synchronous: 0, and nothing to wait for.

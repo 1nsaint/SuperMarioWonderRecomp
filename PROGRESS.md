@@ -23,6 +23,36 @@ NVN implemented over Vulkan (MoltenVK).
 
 ## Log
 
+### 2026-09-30 (night): 60 fps in menus, the course at ~30 fps
+
+![Title](docs/media/wonder/27-title-60fps.png)
+![Character select](docs/media/wonder/28-character-select-60fps.png)
+![World map](docs/media/wonder/29-world-map.png)
+![Course 1-1 (actors still dark)](docs/media/wonder/30-course-sky-fixed-actors-dark.png)
+
+- **Speed.**
+  - Title, menus, character select and the world map run at 55-60 fps; they were at ~15 fps yesterday.
+  - The first course runs at 30-44 fps.
+  - Changes (docs/nvn/DEBUG.md #30-#37):
+    - uploads reused within a submit (60 → 12 MB per frame);
+    - clears inside render passes;
+    - missing pool textures no longer end the render pass (1.4 M breaks per run);
+    - the kernel's spin naps limited to Hades (the job system's yields cost 1 ms each);
+    - game threads at interactive QoS;
+    - a frame limiter at the window's present interval;
+    - mailbox present;
+    - one texture resolution per draw.
+- **Rendering fixes.**
+  - Characters: the 2D menu art and the 3D models on the map render with the right colours.
+  - Live textures over the same memory share one image (#36).
+  - Stencil reference and masks, depth bias and depth clamp are applied (#38).
+  - Review fixes: host scratch data is not shared between draws, and clears honour their masks and sizes.
+- **Open.**
+  - The course's actors render dark (#39): they sample the AO and ambient-light targets of another frame.
+  - The course is at ~30 fps: the game switches its present interval between 1 and 2, and the frame is ~23 ms of
+    replay plus GPU.
+  - Tried and kept off by default, documented: the replay thread (#40), Deferred binds (#41), kept pool textures (#38).
+
 ### 2026-09-29 (night): real colours, two crashes fixed
 
 ![Before / after](docs/media/wonder/26-colours-before-after.png)

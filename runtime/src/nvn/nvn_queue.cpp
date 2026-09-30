@@ -20,6 +20,7 @@ namespace {
 struct Sync : Object {
     std::atomic<bool> signaled{false};
     std::atomic<uint64_t> serial{0};  // NX_ASYNC_GPU: the submit it waits for (0: none)
+    std::atomic<uint64_t> job{0};     // the replay-thread job that fences it (0: none)
 };
 
 void SyncInitialize(CPU& c) {  // NVNboolean (NVNsync*, NVNdevice*)
@@ -30,13 +31,14 @@ void SyncInitialize(CPU& c) {  // NVNboolean (NVNsync*, NVNdevice*)
 void SyncFinalize(CPU& c) { destroy(c.x[0]); }
 
 void signal_sync(uint64_t guest) {
-    if (auto* s = get<Sync>(guest)) s->serial = 0, s->signaled = true;
+    if (auto* s = get<Sync>(guest)) s->serial = 0, s->job = 0, s->signaled = true;
 }
 
 // NVNsyncWaitResult (const NVNsync*, u64 timeout). Always 0 (already signaled), as before: a fenced submit is waited
 // for whatever the timeout, 2 s at most (then the GPU hung and the process ends). Correct results before latency.
 void SyncWait(CPU& c) {
     auto* s = get<Sync>(c.x[0]);
+    if (s) worker_wait(s->job);
     if (uint64_t serial = s ? s->serial.load() : 0) gpu_wait(serial);
     c.x[0] = 0;
 }
@@ -65,13 +67,25 @@ void QueueSubmitCommands(CPU& c) {  // (NVNqueue*, int count, const NVNcommandHa
                 (unsigned long long)ld<uint64_t>(c.x[2] + 8 * k), l ? l->cmds.size() : 0);
         }
     if ((submitted & 1023) == 0) log("nvn: %llu handles submitted, %llu unknown", (unsigned long long)submitted, (unsigned long long)missing);
-    gpu_submit(c, lists);
+    // NX_DEFERRED_SNAPSHOT=1: read the Deferred arrays here; by default they are read when the submit is replayed.
+    static const bool snap = std::getenv("NX_DEFERRED_SNAPSHOT") != nullptr;
+    auto deferred = snap ? std::make_shared<const DeferredValues>(deferred_snapshot(lists)) : nullptr;
+    worker_run([lists = std::move(lists), deferred] { gpu_submit(lists, deferred); });
 }
 void QueueFlush(CPU&) {}
-void QueueFinish(CPU&) { gpu_wait(gpu_serial()); }
+void QueueFinish(CPU&) {
+    worker_finish();
+    gpu_wait(gpu_serial());
+}
 // (NVNqueue*, NVNsync*, NVNsyncCondition, int flags): every condition taken as "all previous work complete".
 void QueueFenceSync(CPU& c) {
-    if (auto* s = get<Sync>(c.x[1])) s->serial = gpu_serial(), s->signaled = true;
+    uint64_t guest = c.x[1];  // the fence goes after the work queued so far: its serial is taken on the replay thread
+    if (auto* s = get<Sync>(guest)) {
+        s->signaled = true;
+        s->job = worker_run([guest] {
+            if (auto* s = get<Sync>(guest)) s->serial = gpu_serial();
+        });
+    }
 }
 void QueueWaitSync(CPU& c) { c.x[0] = 1; }  // NVNboolean (NVNqueue*, const NVNsync*): one queue, in order
 
@@ -124,7 +138,12 @@ void WindowGetPresentInterval(CPU& c) {
 }
 
 void WindowSetPresentInterval(CPU& c) {
-    if (auto* w = get<Window>(c.x[0])) w->interval = int(c.x[1]);
+    if (auto* w = get<Window>(c.x[0])) {
+        static int logged = 0;
+        if (w->interval != int(c.x[1]) && logged++ < 50)
+            log("nvn: window present interval %d -> %d (frame %llu)", w->interval, int(c.x[1]), (unsigned long long)g_frame.load());
+        w->interval = int(c.x[1]);
+    }
 }
 
 // (NVNqueue*, NVNwindow*, int textureIndex)
@@ -144,7 +163,15 @@ void pace_present(int interval) {
 
 void QueuePresentTexture(CPU& c) {
     if (auto* w = get<Window>(c.x[1])) {
-        if (int(c.x[2]) >= 0 && size_t(c.x[2]) < w->textures.size()) gpu_present(w->textures[size_t(c.x[2])]);
+        // At most two presents queued: the game runs at most two frames ahead of the replay.
+        static uint64_t queued[2] = {};
+        static int next_slot = 0;
+        worker_wait(queued[next_slot]);
+        if (int(c.x[2]) >= 0 && size_t(c.x[2]) < w->textures.size()) {
+            uint64_t texture = w->textures[size_t(c.x[2])];
+            queued[next_slot] = worker_run([texture] { gpu_present(texture); });
+            next_slot ^= 1;
+        }
         pace_present(w->interval);
     }
     uint64_t n = ++g_presents;

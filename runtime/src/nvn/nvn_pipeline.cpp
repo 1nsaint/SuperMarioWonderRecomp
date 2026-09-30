@@ -482,7 +482,7 @@ bool sampled_ready(uint64_t texture) {
     check_linear_content(*t);
     if (t->dirty && !t->image->rendered) return g_not_ready[1]++, false;
     {
-        std::lock_guard lk(objects_lock());
+        std::shared_lock lk(objects_lock());  // readers only: an exclusive lock here contended with the game's threads
         if (!t->writes.empty()) return g_not_ready[2]++, false;
     }
     const GpuImage& img = *t->image;

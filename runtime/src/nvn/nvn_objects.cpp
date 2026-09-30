@@ -98,6 +98,7 @@ void MemoryPoolInitialize(CPU& c) {
 }
 
 void MemoryPoolFinalize(CPU& c) {
+    worker_finish();                    // the replay thread may still read it
     gpu_wait(gpu_write_back_serial());  // NX_ASYNC_GPU: no compute result lands in freed memory
     if (auto* p = get<MemoryPool>(c.x[0])) pool_unregister(p);
     destroy(c.x[0]);
@@ -172,7 +173,10 @@ void MemoryPoolFlushMappedRange(CPU& c) {
     }
 }
 // The CPU is about to read what the GPU wrote: with NX_ASYNC_GPU, compute results still in flight are waited for.
-void MemoryPoolInvalidateMappedRange(CPU&) { gpu_wait(gpu_write_back_serial()); }
+void MemoryPoolInvalidateMappedRange(CPU&) {
+    worker_finish();  // compute results reach guest memory when their submit is replayed and done
+    gpu_wait(gpu_write_back_serial());
+}
 
 // ---- buffers ----------------------------------------------------------------------------------------------------
 
@@ -227,8 +231,26 @@ void BufferInvalidateMappedRange(CPU&) {}
 
 // ---- textures ---------------------------------------------------------------------------------------------------
 
+// NX_TRACE_TEXTURES=1 (or =<frame>: from that presented frame on) logs texture inits, finalizations and pool
+// registrations.
+bool trace_textures() {
+    static const char* e = std::getenv("NX_TRACE_TEXTURES");
+    static const uint64_t from = e ? std::strtoull(e, nullptr, 10) : 0;
+    return e && g_frame >= from;
+}
+
+uint64_t keep_for_slots(uint64_t guest);  // below, with the pool registrations
+
 void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBuilder*)
     uint64_t guest = c.x[0], builder = c.x[1];
+    // Re-initializing a texture a pool slot still names (without finalizing it: Wonder reuses the structs of its
+    // dynamic-resolution targets every frame) keeps the old one for those slots, as the pool's descriptor copy
+    // would: replayed later, a frame's draws sampled another frame's AO and ambient-light buffers (dark course
+    // actors, docs/nvn/DEBUG.md #39).
+    {
+        std::lock_guard lk(objects_lock());
+        keep_for_slots(guest);
+    }
     auto& t = make<Texture>(guest);
     t.target = uint32_t(driver(c, "nvnTextureBuilderGetTarget", {builder}));
     t.format = uint32_t(driver(c, "nvnTextureBuilderGetFormat", {builder}));
@@ -273,9 +295,9 @@ void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBu
         t.memory = pool_host(*p, t.offset);
         t.gpu = p->gpu + t.offset;
     }
-    if (g_trace || std::getenv("NX_TRACE_TEXTURES"))
-        log("nvn: texture %llx: target %u format %#x %ux%ux%u levels %u samples %u flags %x size %llx block height %u "
-            "swizzle %u%u%u%u", (unsigned long long)guest, t.target, t.format, t.width, t.height, t.depth, t.levels,
+    if (g_trace || trace_textures())
+        log("nvn: texture %llx: memory %llx target %u format %#x %ux%ux%u levels %u samples %u flags %x size %llx block height %u "
+            "swizzle %u%u%u%u", (unsigned long long)guest, (unsigned long long)t.memory, t.target, t.format, t.width, t.height, t.depth, t.levels,
             t.samples, t.flags, (unsigned long long)t.storage_size, t.block_height_gobs, t.swizzle[0], t.swizzle[1],
             t.swizzle[2], t.swizzle[3]);
     c.x[0] = 1;
@@ -291,56 +313,73 @@ constexpr uint64_t kKeptTexture = 0xF000000000000000ull;  // host keys of finali
 // through the pool (Wonder does it for most course objects: Goombas, trees, bushes drew black with the dummy, and
 // every such draw ended the render pass; docs/nvn/DEBUG.md #38). The object moves to a host key the pool slots are
 // pointed at, and is destroyed once no slot names it.
+// Moves the texture at `guest` to a host key when a pool slot still names it, and points those slots there (under
+// objects_lock). Returns the key, or 0 when no slot names it.
+uint64_t keep_for_slots(uint64_t guest) {
+    // Off unless NX_KEEP_TEXTURES=1: kept textures fed stale data to the course's sky (white, blocky) and did not fix
+    // what they were for (docs/nvn/DEBUG.md #38); missing pool textures sample the dummy without a pass break (#34).
+    static const bool on = std::getenv("NX_KEEP_TEXTURES") != nullptr;
+    if (!on) return 0;
+    auto reg = g_registered.find(guest);
+    uint64_t kept = 0;
+    if (reg == g_registered.end()) return 0;
+    for (auto [pool, id] : reg->second) {
+        auto po = objects().find(pool);
+        auto* d = po == objects().end() ? nullptr : dynamic_cast<DescriptorPool*>(po->second.get());
+        auto slot = d ? d->textures.find(id) : decltype(d->textures.end()){};
+        if (!d || slot == d->textures.end() || slot->second != guest) continue;
+        if (!kept) {
+            auto o = objects().find(guest);
+            if (o == objects().end() || !dynamic_cast<Texture*>(o->second.get())) break;
+            kept = kKeptTexture | ++g_next_kept;
+            if (g_next_kept % 2000 == 0)
+                log("nvn: %llu textures kept for their pool slots, %llu released", (unsigned long long)g_next_kept,
+                    (unsigned long long)g_released_kept);
+            std::unique_ptr<Object> moved = std::move(o->second);
+            objects().erase(o);  // before inserting: an insertion may rehash and invalidate `o`
+            objects()[kept] = std::move(moved);
+            g_registered[kept];
+        }
+        slot->second = kept;
+        g_registered[kept].push_back({pool, id});
+        if (g_registered[kept].size() == 1) g_kept_order.push_back({kept, plat::monotonic_ns()});
+    }
+    g_registered.erase(guest);
+    for (auto& [pool, set] : pool_textures())
+        if (set.erase(guest) && kept) set.insert(kept);
+    return kept;
+}
+
+// The game rarely re-registers those slots: a kept texture nothing sampled for 2 s goes (its slots then sample the
+// dummy, as before). Without this they piled up at ~450 per second (6 GB in two minutes). Under objects_lock.
+void expire_kept() {
+    uint64_t now = plat::monotonic_ns();
+    for (int n = 0; n < 8 && !g_kept_order.empty(); n++) {
+        auto [key, since] = g_kept_order.front();
+        auto o = objects().find(key);
+        auto* t = o == objects().end() ? nullptr : dynamic_cast<Texture*>(o->second.get());
+        // Never sampled: 250 ms (a course load finalizes thousands); sampled: 2 s after the last use.
+        uint64_t sampled = t ? t->last_sampled.load() : 0;
+        if (t && (sampled ? std::max(since, sampled) + 2'000'000'000ull : since + 250'000'000ull) > now) break;
+        g_kept_order.pop_front();
+        if (!t) continue;
+        g_registered.erase(key);
+        for (auto& [pool, set] : pool_textures()) set.erase(key);
+        defer_object(std::move(o->second));
+        objects().erase(o);
+        g_released_kept++;
+    }
+}
+
 void TextureFinalize(CPU& c) {
     uint64_t guest = c.x[0];
+    if (trace_textures()) log("nvn: texture %llx finalized", (unsigned long long)guest);
     {
         std::lock_guard lk(objects_lock());
-        auto reg = g_registered.find(guest);
-        uint64_t kept = 0;
-        if (reg != g_registered.end()) {
-            for (auto [pool, id] : reg->second) {
-                auto po = objects().find(pool);
-                auto* d = po == objects().end() ? nullptr : dynamic_cast<DescriptorPool*>(po->second.get());
-                auto slot = d ? d->textures.find(id) : decltype(d->textures.end()){};
-                if (!d || slot == d->textures.end() || slot->second != guest) continue;
-                if (!kept) {
-                    kept = kKeptTexture | ++g_next_kept;
-                    static uint64_t released_seen = 0;
-                    if (g_next_kept % 2000 == 0)
-                        log("nvn: %llu finalized textures kept for their pool slots, %llu released",
-                            (unsigned long long)g_next_kept, (unsigned long long)(released_seen = g_released_kept));
-                    objects()[kept] = std::move(objects()[guest]);
-                    g_registered[kept];
-                }
-                slot->second = kept;
-                g_registered[kept].push_back({pool, id});
-                if (g_registered[kept].size() == 1) g_kept_order.push_back({kept, plat::monotonic_ns()});
-            }
-            g_registered.erase(guest);
-        }
-        for (auto& [pool, set] : pool_textures())
-            if (set.erase(guest) && kept) set.insert(kept);
-        // The game rarely re-registers those slots: a kept texture nothing sampled for 2 s goes (its slots then
-        // sample the dummy, as before). Without this they piled up at ~70 per second (6 GB in two minutes).
-        uint64_t now = plat::monotonic_ns();
-        for (int n = 0; n < 8 && !g_kept_order.empty(); n++) {
-            auto [key, since] = g_kept_order.front();
-            auto o = objects().find(key);
-            auto* t = o == objects().end() ? nullptr : dynamic_cast<Texture*>(o->second.get());
-            // Never sampled: 250 ms (a course load finalizes thousands); sampled: 2 s after the last use.
-            uint64_t sampled = t ? t->last_sampled.load() : 0;
-            if (t && (sampled ? std::max(since, sampled) + 2'000'000'000ull : since + 250'000'000ull) > now) break;
-            g_kept_order.pop_front();
-            if (!t) continue;
-            g_registered.erase(key);
-            for (auto& [pool, set] : pool_textures()) set.erase(key);
-            objects().erase(key);
-            g_released_kept++;
-        }
-        if (kept) {
-            objects().erase(guest);
-            return;
-        }
+        uint64_t kept = keep_for_slots(guest);
+        for (auto& [pool, set] : pool_textures()) set.erase(guest);
+        expire_kept();
+        if (kept) return;
     }
     destroy(guest);
 }
@@ -357,7 +396,7 @@ void release_kept(uint64_t key) {
         }
     g_registered.erase(key);
     for (auto& [pool, set] : pool_textures()) set.erase(key);
-    objects().erase(key);
+    if (auto o = objects().find(key); o != objects().end()) defer_object(std::move(o->second)), objects().erase(o);
     g_released_kept++;
 }
 
@@ -435,10 +474,13 @@ void TexturePoolRegister(CPU& c) {
     // The view may pick levels or layers (a bloom chain samples one mip of its target) and override the swizzle
     // (a font atlas in R8 is registered with alpha = R).
     ViewInfo v = read_view(c, c.x[3]);
-    if (std::getenv("NX_TRACE_TEXTURES"))
-        log("nvn: pool %llx id %#x = texture %llx view %llx: levels %u+%u layers %u+%u swizzle %08x",
-            (unsigned long long)c.x[0], uint32_t(c.x[1]), (unsigned long long)c.x[2], (unsigned long long)c.x[3],
-            v.base_level, v.levels, v.min_layer, v.layers, v.swizzle);
+    if (trace_textures()) {
+        auto* tt = get<Texture>(c.x[2]);
+        log("nvn: pool %llx id %#x = texture %llx (memory %llx %ux%u) view %llx: levels %u+%u layers %u+%u swizzle %08x "
+            "format %#x", (unsigned long long)c.x[0], uint32_t(c.x[1]), (unsigned long long)c.x[2],
+            (unsigned long long)(tt ? tt->memory : 0), tt ? tt->width : 0, tt ? tt->height : 0, (unsigned long long)c.x[3],
+            v.base_level, v.levels, v.min_layer, v.layers, v.swizzle, v.format);
+    }
     if (v.swizzle)
         if (auto* t = get<Texture>(c.x[2])) t->pool_swizzle = v.swizzle;
     if (auto* d = get<DescriptorPool>(c.x[0])) {

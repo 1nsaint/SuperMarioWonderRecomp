@@ -76,6 +76,7 @@ set(NX_RUNTIME_SOURCES
     runtime/src/nvn/nvn_sampler.cpp
     runtime/src/nvn/nvn_draw_state.cpp
     runtime/src/nvn/nvn_raster.cpp
+    runtime/src/nvn/nvn_worker.cpp
     runtime/src/nvn/nvn_shaders.cpp
     runtime/src/nvn/nvn_tiling.cpp
     runtime/src/nvn/nvn_vk.cpp

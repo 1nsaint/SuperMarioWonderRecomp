@@ -329,3 +329,36 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
       never sampled. Without the expiry they piled up at ~450 per second (6 GB in two minutes).
     - Stencil reference, compare and write masks, polygon offset (depth bias) and depth clamp are now recorded and
       applied (nvn_raster.cpp). Depth bounds are recorded only, since MoltenVK has no depthBounds.
+
+    **Update:** keeping finalized pool textures is now off by default (`NX_KEEP_TEXTURES=1` turns it on).
+    - Bisect runs showed that it fed stale data to the course's sky: white and blocky in the second part of
+      1-1. With it off, the sky is blue with clouds, as in the real game.
+    - The actors stayed dark either way.
+    - Its other gain, fewer pass breaks, comes from #34 alone: a missing pool texture samples the dummy without a break.
+39. **Course actors (Goombas, the player, trees, bushes) render dark. Not solved yet.** What is known:
+    - Their fragment shaders multiply by an AO term, `textureLod(R8 half-res target, uv, 1.0)`, and an ambient term
+      from a 192x108 RGBA16F target. Neither is the dummy: a run with the dummy cleared to magenta showed none.
+    - The texture handles those draws bind name textures of an older frame, two frames earlier. The dynamic
+      resolution changes every frame, so the sizes differ. The draw's own frame renders AO and ambient into other
+      texture objects.
+    - Tried without effect:
+      - keeping re-initialized textures for their pool slots (`keep_for_slots` in `TextureInitialize`, off with
+        `NX_KEEP_TEXTURES`);
+      - reading the arrays of the `*Deferred` bind calls when the work is submitted or replayed instead of when it is
+        recorded (#41).
+    - Next: find where the handle arrays get their values (the texture pool registration order against the
+      recording), with `NX_TRACE_TEXTURES=<frame>` (logs from that presented frame on) and a draw trace.
+40. **Replay thread** (`NX_REPLAY_THREAD=1`, off by default).
+    - What it does: nvnQueueSubmitCommands and nvnQueuePresentTexture queue their work for one host thread, the way a
+      GPU runs behind the CPU. The game waits only at nvnSyncWait, nvnQueueFinish, memory pool invalidate/finalize,
+      and at most two queued presents.
+    - Objects the game destroys are freed between jobs (`defer_object` / `drain_objects`), so a replay never holds a
+      freed pointer.
+    - Why it stays off: with the replay a frame behind, the course's render passes ended by target changes went from
+      125 k to 1.3 M per run, and the course ran slower (15-20 fps against 30). The course still sits near 30 fps
+      without it: the game switches its window present interval between 1 and 2 (now logged).
+41. **`*Deferred` bind calls** (`NX_DEFERRED_BINDS=1`, off by default).
+    - The SDK's BindTexturesDeferred stores the array's address instead of the values: a record of opcode 23, stage,
+      first, count and pointer (sdk+469680, against BindTextures at sdk+469430, which copies each handle).
+    - The runtime can record the pointer and read the array at submit (`NX_DEFERRED_SNAPSHOT=1`) or at replay.
+    - Neither fixed #39, and both multiplied the pass breaks, so the arrays are read at recording, as before.

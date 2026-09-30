@@ -180,6 +180,21 @@ std::shared_mutex& objects_lock() {
     return m;
 }
 
+std::vector<std::unique_ptr<Object>>& deferred_objects() {
+    static std::vector<std::unique_ptr<Object>> v;
+    return v;
+}
+
+void defer_object(std::unique_ptr<Object> o) { deferred_objects().push_back(std::move(o)); }
+
+void drain_objects() {
+    std::vector<std::unique_ptr<Object>> dead;
+    {
+        std::lock_guard lk(objects_lock());
+        dead.swap(deferred_objects());
+    }
+}  // destructors run here, outside the lock (a Texture's takes the graveyard lock)
+
 std::unordered_map<uint64_t, std::unique_ptr<Object>>& objects() {
     static std::unordered_map<uint64_t, std::unique_ptr<Object>> m;
     return m;
