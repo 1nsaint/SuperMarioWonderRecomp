@@ -248,3 +248,12 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
     - `tools/detect_explode.py` flags frames with large brown areas in the sky. It has known false positives (title,
       character select, the tree), so look at what it flags.
     - The exploded meshes of the user's recording (#43) predate the cache, and that issue stays open.
+
+77. **Windowed 35-40 fps stretches (#51) no longer reproduce.**
+    - Windowed course 1-1 runs on the scripted input, current build:
+      - muted: 283 intervals, 2 under 50 fps;
+      - with sound: 285 intervals, a 59.4 fps mean, 3 under 50 (scene changes).
+    - The user's second play session (play5) was also at 60 nearly throughout.
+    - The first session's stretches had a 13-15 ms fence wait, the GPU past its frame. Likely causes, not isolated:
+      other load on the Mac then, and the pipelines compiled on the fly (the cache, #73, came later).
+    - Closed; reopen with a log if it shows again.
