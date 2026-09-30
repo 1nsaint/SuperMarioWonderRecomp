@@ -408,6 +408,7 @@ void dispatch(VkCommandBuffer cb, const Cmd& c) {
     if (args && !gpu_args) std::memcpy(&x, args, 4), std::memcpy(&y, args + 4, 4), std::memcpy(&z, args + 8, 4);
     if (!gpu_args && (!x || !y || !z)) return;
     trace_compute_once(cs, x, y, z);  // 0, 0, 0 for GPU arguments
+    trace_nan_dispatch(cs);
     std::vector<const ShaderInfo*> stages{cs};
     const ProgramLayout& layout = program_layout(stages);
     VkPipeline pipeline = compute_pipeline(cs, layout);
@@ -613,7 +614,10 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
 
 void draw_end_submit() {  // after the submit's fence: compute results to guest memory, debug snapshots
     debug_snapshots_write();
-    for (const WriteBack& w : draw_take_write_backs()) std::memcpy(w.to, w.from, w.size);
+    for (const WriteBack& w : draw_take_write_backs()) {
+        trace_nan_write_back(w.from, w.to, w.size);
+        std::memcpy(w.to, w.from, w.size);
+    }
 }
 
 std::vector<WriteBack> draw_take_write_backs() {  // an asynchronous submit copies them when it is retired

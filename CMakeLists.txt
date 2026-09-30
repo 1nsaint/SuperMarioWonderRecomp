@@ -66,6 +66,7 @@ set(NX_RUNTIME_SOURCES
     runtime/src/nvn/nvn_trace.cpp
     runtime/src/nvn/nvn_device.cpp
     runtime/src/nvn/nvn_objects.cpp
+    runtime/src/nvn/nvn_incarnation.cpp
     runtime/src/nvn/nvn_texture_layout.cpp
     runtime/src/nvn/nvn_program.cpp
     runtime/src/nvn/nvn_queue.cpp

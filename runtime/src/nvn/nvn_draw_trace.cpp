@@ -76,6 +76,42 @@ void trace_cube_draw(const Targets& t, const ShaderInfo* vs, const ShaderInfo* f
 
 }  // namespace
 
+namespace {
+std::map<uint64_t, std::string> g_nan_writers;  // storage address -> the last compute shader bound to it
+bool trace_nan_on() {
+    static const bool on = std::getenv("NX_TRACE_NAN") != nullptr;
+    return on;
+}
+}  // namespace
+
+void trace_nan_dispatch(const ShaderInfo* cs) {
+    if (!trace_nan_on()) return;
+    for (const Range& r : g_state.storage[5])
+        if (r.address) g_nan_writers[reinterpret_cast<uintptr_t>(guest_bytes(r.address))] = cs->hash;
+}
+
+void trace_nan_write_back(const uint8_t* from, const uint8_t* to, uint64_t size) {
+    static int logged = 0;
+    if (!trace_nan_on() || logged >= 200) return;
+    uint64_t bad = 0, first = 0;
+    auto* f = reinterpret_cast<const uint32_t*>(from);
+    for (uint64_t k = 0; k < size / 4; k++) {
+        uint32_t e = f[k] >> 23 & 0xFF;
+        if (e == 0xFF || (e >= 127 + 40 && e != 0xFF)) {  // Inf/NaN, or |x| >= 2^40 (also integers that look so)
+            if (!bad) first = k;
+            bad++;
+        }
+    }
+    if (!bad) return;
+    std::string who;
+    auto it = g_nan_writers.upper_bound(reinterpret_cast<uintptr_t>(to) + size - 1);
+    if (it != g_nan_writers.begin() && (--it)->first + 0 >= reinterpret_cast<uintptr_t>(to)) who = it->second;
+    logged++;
+    log("nan: frame %llu write-back %p (%llu bytes): %llu suspicious floats, first at word %llu = %08x, cs %s",
+        (unsigned long long)g_frame.load(), (void*)to, (unsigned long long)size, (unsigned long long)bad,
+        (unsigned long long)first, f[first], who.c_str());
+}
+
 // NX_SNAP_FOLLOW=<fs hash>@<first draw>: from the first draw with that fragment shader, the next 48 draws into its
 // colour target 0 are logged (shaders, textures) and snapshotted after (frames/00000_<draw>.ppm): which draw of a
 // pass paints what.
@@ -89,7 +125,8 @@ bool snap_follow(const Targets& t, const ShaderInfo* vs, const ShaderInfo* fs, c
     static const bool by_frame = env.find("@f") != std::string::npos;  // <hash>@f<presented frame>
     static const uint64_t frame_from = by_frame ? std::strtoull(env.c_str() + env.find("@f") + 2, nullptr, 10) : 0;
     bool started = by_frame ? g_frame >= frame_from : g_stats.done >= from;
-    if (!target && fs && started && env.compare(0, 16, fs->hash) == 0) target = t.colors[0], left = count;
+    if (!target && started && ((fs && env.compare(0, 16, fs->hash) == 0) || env.compare(0, 16, vs->hash) == 0))
+        target = t.colors[0], left = count;  // the vertex shader's hash matches too
     if (!target || t.colors[0] != target || left <= 0) return false;
     left--;
     std::string tex;

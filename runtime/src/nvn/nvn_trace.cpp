@@ -192,6 +192,7 @@ void drain_objects() {
     {
         std::lock_guard lk(objects_lock());
         dead.swap(deferred_objects());
+        purge_incarnations();  // the records point at objects freed here (nvn_incarnation.cpp)
     }
 }  // destructors run here, outside the lock (a Texture's takes the graveyard lock)
 

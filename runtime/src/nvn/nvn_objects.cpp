@@ -258,12 +258,17 @@ void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBu
     // dynamic-resolution targets every frame) keeps the old one for those slots, as the pool's descriptor copy
     // would: replayed later, a frame's draws sampled another frame's AO and ambient-light buffers (dark course
     // actors, docs/nvn/DEBUG.md #39).
-    {
+    // The new incarnation is built aside and published whole, in the section that retires the old one (#55): a replay
+    // on another thread could see a texture half built (a size, memory 0) or a gap with none. NX_TEXTURE_RACE_OLD=1:
+    // the old one goes first and the new one is filled in place.
+    static const bool old = texture_race_old();
+    std::unique_ptr<Texture> fresh = old ? nullptr : std::make_unique<Texture>();
+    if (old) {
         std::lock_guard lk(objects_lock());
         keep_for_slots(guest);
         hand_image_to_snapshots(guest);
     }
-    auto& t = make<Texture>(guest);
+    auto& t = old ? make<Texture>(guest) : *fresh;
     t.target = uint32_t(driver(c, "nvnTextureBuilderGetTarget", {builder}));
     t.format = uint32_t(driver(c, "nvnTextureBuilderGetFormat", {builder}));
     t.flags = uint32_t(driver(c, "nvnTextureBuilderGetFlags", {builder}));
@@ -277,7 +282,7 @@ void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBu
     t.pool = driver(c, "nvnTextureBuilderGetMemoryPool", {builder});
     t.offset = driver(c, "nvnTextureBuilderGetMemoryOffset", {builder});
     t.storage_size = texture_storage_size(c, builder);
-    {
+    if (old) {
         std::lock_guard lk(objects_lock());
         pool_textures()[t.pool].insert(guest);
     }
@@ -312,6 +317,14 @@ void TextureInitialize(CPU& c) {  // NVNboolean (NVNtexture*, const NVNtextureBu
             "swizzle %u%u%u%u", (unsigned long long)guest, (unsigned long long)t.memory, t.target, t.format, t.width, t.height, t.depth, t.levels,
             t.samples, t.flags, (unsigned long long)t.storage_size, t.block_height_gobs, t.swizzle[0], t.swizzle[1],
             t.swizzle[2], t.swizzle[3]);
+    if (!old) {
+        std::lock_guard lk(objects_lock());
+        note_replaced(guest);
+        keep_for_slots(guest);
+        hand_image_to_snapshots(guest);
+        pool_textures()[t.pool].insert(guest);
+        publish_locked(guest, std::move(fresh));
+    }
     c.x[0] = 1;
 }
 
@@ -387,13 +400,19 @@ void TextureFinalize(CPU& c) {
     auto guard = reinit_guard();
     uint64_t guest = c.x[0];
     if (trace_textures()) log("nvn: texture %llx finalized", (unsigned long long)guest);
+    static const bool old = texture_race_old();
     {
         std::lock_guard lk(objects_lock());
+        note_replaced(guest);  // a replay in flight keeps resolving it (#55)
         hand_image_to_snapshots(guest);
         uint64_t kept = keep_for_slots(guest);
         for (auto& [pool, set] : pool_textures()) set.erase(guest);
         expire_kept();
         if (kept) return;
+        if (!old) {  // in the same section (#55)
+            if (auto o = objects().find(guest); o != objects().end()) defer_object(std::move(o->second)), objects().erase(o);
+            return;
+        }
     }
     destroy(guest);
 }

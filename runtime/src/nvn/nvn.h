@@ -63,28 +63,45 @@ struct ObjectsLock {
 ObjectsLock& objects_lock();
 std::unordered_map<uint64_t, std::unique_ptr<Object>>& objects();
 
+// Texture incarnations (nvn_incarnation.cpp, docs/nvn/DEBUG.md #55). Game threads re-initialize and finalize texture
+// structs while another thread replays a submit (Wonder's dynamic-resolution targets, every frame). A replay resolves
+// every texture as it was when the submit began: each re-initialization or finalization records the incarnation it
+// retires, with an epoch, and a replay's lookups (t_replay_mark != 0) return the one current at its mark. Retired
+// objects live on as deferred objects until drain_objects, which also forgets the records. Game threads (mark 0)
+// always see the current one. NX_TEXTURE_RACE_OLD=1: no records, no marks (the old behaviour).
+inline thread_local uint64_t t_replay_mark = 0;  // the replaying thread's mark; 0 outside a replay
+bool texture_race_old();
+Object* find_object(uint64_t guest, uint64_t mark);  // under objects_lock (shared)
+void note_replaced(uint64_t guest);                  // under objects_lock (alone): guest's object is about to change
+void purge_incarnations();                           // under objects_lock (alone), from drain_objects
+// A submit's replay (gpu_submit, under the GPU lock): drains the deferred objects, then takes the mark.
+struct ReplayScope {
+    ReplayScope();
+    ~ReplayScope();
+};
+
 // A per-thread cache of the last lookups of each type, valid until anything takes the lock alone: a recorded command
 // looks up its command buffer, a replayed draw the same texture 5-10 times, and libc++'s shared lock is a mutex and a
 // condition variable that the game threads and the replay contend on (~20% of the main thread's own CPU in the
-// course, docs/nvn/DEBUG.md #44). The generation is read before the lookup: a concurrent change invalidates it.
+// course, docs/nvn/DEBUG.md #44). The generation is read before the lookup: a concurrent change invalidates it. The
+// replay mark is part of the key: a thread that replays (the render thread) also calls the game-side procs.
 template <typename T>
 T* get(uint64_t guest) {
     struct Entry {
-        uint64_t guest = 0, generation = 0;
+        uint64_t guest = 0, generation = 0, mark = 0;
         T* object = nullptr;
     };
     thread_local Entry cache[8];
     ObjectsLock& ol = objects_lock();
-    uint64_t gen = ol.generation.load(std::memory_order_acquire);
+    uint64_t gen = ol.generation.load(std::memory_order_acquire), mark = t_replay_mark;
     Entry& e = cache[((guest >> 3) ^ (guest >> 11)) & 7];
-    if (e.generation == gen && e.guest == guest) return e.object;
+    if (e.generation == gen && e.guest == guest && e.mark == mark) return e.object;
     T* p;
     {
         std::shared_lock lk(ol);
-        auto it = objects().find(guest);
-        p = it == objects().end() ? nullptr : dynamic_cast<T*>(it->second.get());
+        p = dynamic_cast<T*>(find_object(guest, mark));
     }
-    e = {guest, gen, p};
+    e = {guest, gen, mark, p};
     return p;
 }
 
@@ -100,6 +117,13 @@ T& make(uint64_t guest) {
     if (slot) defer_object(std::move(slot));
     slot = std::make_unique<T>();
     return static_cast<T&>(*slot);
+}
+
+// Installs a fully built object at `guest` (the one there goes to defer_object). Under objects_lock (alone).
+inline void publish_locked(uint64_t guest, std::unique_ptr<Object> o) {
+    auto& slot = objects()[guest];
+    if (slot) defer_object(std::move(slot));
+    slot = std::move(o);
 }
 
 inline void destroy(uint64_t guest) {

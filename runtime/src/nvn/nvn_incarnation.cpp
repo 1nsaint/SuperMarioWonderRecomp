@@ -1,0 +1,77 @@
+// Texture incarnations (nvn.h, docs/nvn/DEBUG.md #55). A submit is replayed on the thread that submits it (or the
+// replay thread) while the game's other threads keep calling nvnTextureInitialize / nvnTextureFinalize: Wonder
+// re-initializes the structs of its dynamic-resolution targets every frame with new sizes and memory. Looked up by
+// guest address, one texture could then change in the middle of a replay: a pass rendered into the old image and a
+// later draw sampled the new one (fresh, stale), or sizes no longer matched (the intermittent horizon band).
+//
+// Every change of a texture's registry entry records the object it retires, with an epoch, under objects_lock. A
+// replay takes a mark (the epoch) when it begins, and its lookups return the object that was current at the mark: the
+// one retired by the first change after it, else the current one. Retired objects are deferred objects, freed by
+// drain_objects under the GPU lock (no replay then), which forgets the records at the same time.
+//
+// Thread roles: game threads (HLE procs: Initialize/Finalize, getters, pool registration, recording) never set a mark
+// and see the current object; only gpu_submit sets one, for its own thread. Lock order is unchanged: the GPU lock,
+// then objects_lock; nothing here waits for the GPU lock.
+#include <cstdlib>
+#include <utility>
+#include <vector>
+
+#include "nvn.h"
+
+namespace nx::nvn {
+
+namespace {
+
+std::atomic<uint64_t> g_epoch{1};  // bumped under objects_lock (alone) by each recorded change
+// guest -> (epoch of the change, object it retired; null: there was none), in epoch order. Under objects_lock.
+std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, Object*>>> g_retired;
+std::atomic<uint64_t> g_resolved_old{0};  // replay lookups answered with a retired incarnation
+
+}  // namespace
+
+bool texture_race_old() {
+    static const bool old = [] {
+        const char* e = std::getenv("NX_TEXTURE_RACE_OLD");
+        return e && e[0] == '1';
+    }();
+    return old;
+}
+
+void note_replaced(uint64_t guest) {
+    if (texture_race_old()) return;
+    auto it = objects().find(guest);
+    Object* current = it == objects().end() ? nullptr : it->second.get();
+    g_retired[guest].push_back({g_epoch.fetch_add(1, std::memory_order_acq_rel) + 1, current});
+}
+
+Object* find_object(uint64_t guest, uint64_t mark) {
+    auto it = objects().find(guest);
+    Object* current = it == objects().end() ? nullptr : it->second.get();
+    if (!mark || g_retired.empty()) return current;
+    auto h = g_retired.find(guest);
+    if (h == g_retired.end()) return current;
+    for (auto& [epoch, object] : h->second)
+        if (epoch > mark) {  // the first change after the mark retired what the replay must see
+            if (object != current) {
+                uint64_t n = g_resolved_old.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n == 1 || n == 100 || n % 10000 == 0)
+                    log("nvn: %llu replay lookups resolved a texture re-initialized or finalized mid-replay (%llx)",
+                        (unsigned long long)n, (unsigned long long)guest);
+            }
+            return object;
+        }
+    return current;
+}
+
+void purge_incarnations() { g_retired.clear(); }
+
+ReplayScope::ReplayScope() {
+    drain_objects();
+    if (texture_race_old()) return;
+    std::shared_lock lk(objects_lock());  // orders the mark against the recorded changes (made under the lock alone)
+    t_replay_mark = g_epoch.load(std::memory_order_acquire);
+}
+
+ReplayScope::~ReplayScope() { t_replay_mark = 0; }
+
+}  // namespace nx::nvn

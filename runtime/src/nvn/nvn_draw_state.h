@@ -57,6 +57,9 @@ void texture_for(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, ViewI
 
 // NX_SNAP_FOLLOW (nvn_draw_trace.cpp): log and snapshot this draw.
 bool snap_follow(const Targets& t, const ShaderInfo* vs, const ShaderInfo* fs, const std::vector<uint64_t>& handles);
+// NX_TRACE_NAN=1 (nvn_draw_trace.cpp): non-finite or huge floats in what compute shaders wrote, with the shader.
+void trace_nan_dispatch(const ShaderInfo* cs);
+void trace_nan_write_back(const uint8_t* from, const uint8_t* to, uint64_t size);
 using TexBindings = std::vector<std::pair<const ShaderInfo*, const DescriptorBinding*>>;
 // NX_TRACE_DRAWS & co (docs/nvn/DEBUG.md): logs a replayed draw with its state, when the switches select it.
 void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, const ShaderInfo* vs,

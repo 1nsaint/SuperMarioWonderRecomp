@@ -618,3 +618,20 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
       - The race it points at: other game threads re-initialize dynamic-resolution texture structs while a submit
         is replayed, so `get<Texture>` returns the new incarnation mid-replay. It needs a proper design (per-submit
         incarnations): in progress.
+55. **Texture incarnations: a submit sees each texture as it was when the submit started (`nvn_incarnation.cpp`).**
+    - Two races between the replay and the game's other threads:
+      - `nvnTextureInitialize` put an empty Texture in the registry and filled it over ~15 guest calls with no lock.
+        A replay could look it up half-built (new size, memory 0) and give it an image no target shares.
+      - A struct re-initialized or finalized mid-replay made `get<Texture>` switch to the new incarnation between
+        two draws of one submit.
+    - Now:
+      - a texture is built locally and published in one locked step; Finalize is one step too;
+      - each replaced object is recorded with an epoch;
+      - `gpu_submit` marks the epoch (`ReplayScope`), and replay-side `get<>` resolves to the object that was
+        current at that mark;
+      - retired objects are freed by `drain_objects`, under the GPU lock, with their records.
+    - Measured: 640-750 thousand replay lookups per course run hit a texture changed mid-replay.
+    - `NX_TEXTURE_RACE_OLD=1` restores the old behaviour.
+    - The horizon band is not this: it still appeared in 1 of 3 runs. Up close it is stretched geometry with
+      sparkles around it, and it lasts the whole run once it appears: a GPU-simulated effect whose state went bad.
+      `NX_TRACE_NAN=1` logs non-finite or huge floats in compute write-backs, with the shader.
