@@ -42,6 +42,7 @@
 
 #include "kernel.h"
 #include "platform.h"
+#include "platform_android.h"
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -272,6 +273,8 @@ void release_window(void* w) { ANativeWindow_release(static_cast<ANativeWindow*>
 
 uint64_t window_generation() { return g_window_gen; }
 
+ANativeWindow* android_window() { return g_window.load(); }  // platform_android.h
+
 bool window_minimized() { return !g_visible || !g_window; }
 
 void screen_size(uint32_t& w, uint32_t& h) {
@@ -341,222 +344,6 @@ float default_render_scale() {
         return s;
     }();
     return scale;
-}
-
-// ---- input: game controllers + touch --------------------------------------------------------------------------
-// Touch: left half = virtual stick (relative to where the finger went down); right half = four buttons in a
-// diamond around the thumb (Y attack up-left, X special up-right, B dash down-left, A interact down-right), top
-// corners L / R, top centre +.
-
-namespace {
-std::mutex g_in;
-PadState g_pad_buttons;  // controller state
-struct Touch {
-    int32_t id;
-    float x0, y0, x, y;
-    bool left;
-    uint64_t button;
-};
-std::vector<Touch> g_touches;
-float g_w = 1, g_h = 1;
-
-uint64_t key_to_button(int32_t k) {
-    switch (k) {
-        case AKEYCODE_BUTTON_A: return kB;  // bottom face button = Nintendo B
-        case AKEYCODE_BUTTON_B: return kA;  // right face button = Nintendo A
-        case AKEYCODE_BUTTON_X: return kY;
-        case AKEYCODE_BUTTON_Y: return kX;
-        case AKEYCODE_BUTTON_L1: return kL;
-        case AKEYCODE_BUTTON_R1: return kR;
-        case AKEYCODE_BUTTON_L2: return kZL;
-        case AKEYCODE_BUTTON_R2: return kZR;
-        case AKEYCODE_BUTTON_START: return kPlus;
-        case AKEYCODE_BUTTON_SELECT: return kMinus;
-        case AKEYCODE_BUTTON_THUMBL: return kStickL;
-        case AKEYCODE_BUTTON_THUMBR: return kStickR;
-        case AKEYCODE_DPAD_LEFT: return kLeft;
-        case AKEYCODE_DPAD_UP: return kUp;
-        case AKEYCODE_DPAD_RIGHT: return kRight;
-        case AKEYCODE_DPAD_DOWN: return kDown;
-        case AKEYCODE_BACK: return kMinus;
-        default: return 0;
-    }
-}
-
-uint64_t touch_button(float x, float y) {
-    float nx_ = x / g_w, ny = y / g_h;
-    if (ny < 0.2f) return nx_ < 0.6f ? (nx_ < 0.45f ? kL : kPlus) : (nx_ > 0.85f ? kR : kZR);
-    bool up = ny < 0.6f, right = nx_ > 0.8f;
-    if (up) return right ? kX : kY;
-    return right ? kA : kB;
-}
-
-int32_t on_input(android_app*, AInputEvent* e) {
-    std::lock_guard lk(g_in);
-    int32_t type = AInputEvent_getType(e);
-    int32_t src = AInputEvent_getSource(e);
-    if (type == AINPUT_EVENT_TYPE_KEY) {
-        uint64_t b = key_to_button(AKeyEvent_getKeyCode(e));
-        if (!b) return 0;
-        if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_DOWN)
-            g_pad_buttons.buttons |= b;
-        else if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_UP)
-            g_pad_buttons.buttons &= ~b;
-        return 1;
-    }
-    if (type != AINPUT_EVENT_TYPE_MOTION) return 0;
-    if ((src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK) {
-        auto axis = [&](int32_t a) {
-            float v = AMotionEvent_getAxisValue(e, a, 0);
-            return std::fabs(v) < 0.15f ? 0 : int32_t(std::clamp(v, -1.f, 1.f) * kStickMax);
-        };
-        g_pad_buttons.lx = axis(AMOTION_EVENT_AXIS_X);
-        g_pad_buttons.ly = -axis(AMOTION_EVENT_AXIS_Y);
-        g_pad_buttons.rx = axis(AMOTION_EVENT_AXIS_Z);
-        g_pad_buttons.ry = -axis(AMOTION_EVENT_AXIS_RZ);
-        float hx = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_X, 0);
-        float hy = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_Y, 0);
-        g_pad_buttons.buttons &= ~(kLeft | kRight | kUp | kDown | kZL | kZR);
-        if (hx < -0.5f) g_pad_buttons.buttons |= kLeft;
-        if (hx > 0.5f) g_pad_buttons.buttons |= kRight;
-        if (hy < -0.5f) g_pad_buttons.buttons |= kUp;
-        if (hy > 0.5f) g_pad_buttons.buttons |= kDown;
-        if (AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_LTRIGGER, 0) > 0.4f ||
-            AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_BRAKE, 0) > 0.4f)
-            g_pad_buttons.buttons |= kZL;
-        if (AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_RTRIGGER, 0) > 0.4f ||
-            AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_GAS, 0) > 0.4f)
-            g_pad_buttons.buttons |= kZR;
-        return 1;
-    }
-    if ((src & AINPUT_SOURCE_TOUCHSCREEN) != AINPUT_SOURCE_TOUCHSCREEN) return 0;
-    int32_t action = AMotionEvent_getAction(e);
-    int32_t kind = action & AMOTION_EVENT_ACTION_MASK;
-    size_t index = size_t((action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
-    if (g_window) {
-        g_w = float(ANativeWindow_getWidth(g_window));
-        g_h = float(ANativeWindow_getHeight(g_window));
-    }
-    if (kind == AMOTION_EVENT_ACTION_DOWN || kind == AMOTION_EVENT_ACTION_POINTER_DOWN) {
-        float x = AMotionEvent_getX(e, index), y = AMotionEvent_getY(e, index);
-        bool left = x < g_w * 0.5f;
-        g_touches.push_back({AMotionEvent_getPointerId(e, index), x, y, x, y, left, left ? 0 : touch_button(x, y)});
-    } else if (kind == AMOTION_EVENT_ACTION_UP || kind == AMOTION_EVENT_ACTION_POINTER_UP ||
-               kind == AMOTION_EVENT_ACTION_CANCEL) {
-        int32_t id = AMotionEvent_getPointerId(e, index);
-        if (kind == AMOTION_EVENT_ACTION_UP || kind == AMOTION_EVENT_ACTION_CANCEL) g_touches.clear();
-        g_touches.erase(std::remove_if(g_touches.begin(), g_touches.end(), [&](const Touch& t) { return t.id == id; }),
-                        g_touches.end());
-    } else if (kind == AMOTION_EVENT_ACTION_MOVE) {
-        for (size_t k = 0; k < AMotionEvent_getPointerCount(e); k++) {
-            int32_t id = AMotionEvent_getPointerId(e, k);
-            for (auto& t : g_touches)
-                if (t.id == id) {
-                    t.x = AMotionEvent_getX(e, k);
-                    t.y = AMotionEvent_getY(e, k);
-                }
-        }
-    }
-    return 1;
-}
-}  // namespace
-
-bool headless() {  // NX_HEADLESS (platform.h)
-    static const bool on = std::getenv("NX_HEADLESS") != nullptr;
-    return on;
-}
-
-void read_pad(PadState& p) {
-    std::lock_guard lk(g_in);
-    p.buttons |= g_pad_buttons.buttons;
-    if (g_pad_buttons.lx || g_pad_buttons.ly) {
-        p.lx = g_pad_buttons.lx;
-        p.ly = g_pad_buttons.ly;
-    }
-    p.rx = g_pad_buttons.rx;
-    p.ry = g_pad_buttons.ry;
-    float radius = std::max(1.f, g_h * 0.12f);
-    for (const auto& t : g_touches) {
-        if (t.left) {
-            float dx = (t.x - t.x0) / radius, dy = (t.y - t.y0) / radius;
-            p.lx = int32_t(std::clamp(dx, -1.f, 1.f) * kStickMax);
-            p.ly = int32_t(std::clamp(-dy, -1.f, 1.f) * kStickMax);
-        } else {
-            p.buttons |= t.button;
-        }
-    }
-}
-
-// ---- audio: AAudio (callback pulls from a queue of submitted buffers) ------------------------------------------
-
-namespace {
-struct Pending {
-    const uint8_t* data;
-    size_t size, pos;
-    void* ctx;
-};
-std::mutex g_audio;
-std::deque<Pending> g_pending;
-AudioDone g_done = nullptr;
-AAudioStream* g_stream = nullptr;
-
-aaudio_data_callback_result_t audio_cb(AAudioStream*, void*, void* out, int32_t frames) {
-    auto* dst = static_cast<uint8_t*>(out);
-    size_t want = size_t(frames) * 4;
-    std::vector<void*> finished;
-    {
-        std::lock_guard lk(g_audio);
-        while (want && !g_pending.empty()) {
-            Pending& p = g_pending.front();
-            size_t n = std::min(want, p.size - p.pos);
-            std::memcpy(dst, p.data + p.pos, n);
-            dst += n;
-            want -= n;
-            p.pos += n;
-            if (p.pos == p.size) {
-                finished.push_back(p.ctx);
-                g_pending.pop_front();
-            }
-        }
-    }
-    if (want) std::memset(dst, 0, want);  // underrun: silence
-    for (void* c : finished) g_done(c);
-    return AAUDIO_CALLBACK_RESULT_CONTINUE;
-}
-}  // namespace
-
-bool audio_open(AudioDone done) {
-    g_done = done;
-    AAudioStreamBuilder* b = nullptr;
-    if (AAudio_createStreamBuilder(&b) != AAUDIO_OK) return false;
-    AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
-    AAudioStreamBuilder_setChannelCount(b, 2);
-    AAudioStreamBuilder_setSampleRate(b, 48000);
-    AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-    AAudioStreamBuilder_setDataCallback(b, audio_cb, nullptr);
-    bool ok = AAudioStreamBuilder_openStream(b, &g_stream) == AAUDIO_OK && AAudioStream_requestStart(g_stream) == AAUDIO_OK;
-    AAudioStreamBuilder_delete(b);
-    return ok;
-}
-
-void audio_pause(bool paused) {
-    if (!g_stream) return;
-    if (paused)
-        AAudioStream_requestPause(g_stream);
-    else
-        AAudioStream_requestStart(g_stream);
-}
-
-bool audio_submit(const void* data, size_t bytes, void* ctx) {
-    if (!g_stream) return false;
-    std::lock_guard lk(g_audio);
-    g_pending.push_back({static_cast<const uint8_t*>(data), bytes, 0, ctx});
-    return true;
-}
-
-uint32_t audio_queued() {
-    std::lock_guard lk(g_audio);
-    return uint32_t(g_pending.size());
 }
 
 // ---- Vulkan ---------------------------------------------------------------------------------------------------
