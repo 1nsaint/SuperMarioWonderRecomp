@@ -63,7 +63,7 @@ GpuImage* image_of(uint64_t guest) {
             }
     if ((t->image = reuse_image(*t))) return t->image.get();
     auto img = std::make_shared<GpuImage>();
-    img->format = vk_format(t->format);
+    img->format = bc_host_decode(t->format) ? bc_decoded_format(t->format) : vk_format(t->format);  // nvn_bc.cpp
     img->nvn_format = t->format;
     if (t->format == 0x1 && t->pool_swizzle == 0x02010101u) {
         img->format = VK_FORMAT_R8G8B8A8_UNORM;

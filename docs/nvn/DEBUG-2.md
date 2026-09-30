@@ -221,3 +221,16 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
     - Loaded with `dlsym` (Android 13+; older versions go without). `NX_ADPF=0`: off. It does nothing on the Mac and
       Windows.
     - The Mac regression is unchanged (course 1-1 at 60 fps). The effect on the S23 waits for the phone.
+
+75. **BC decoded on the CPU for GPUs without BC (Mali; D1's fallback).**
+    - `nvn_bc.cpp` decodes BC1-BC5 and BC7 at upload, after untiling. The image is created as RGBA8, R8 (BC4) or RG8
+      (BC5), in UNORM, SNORM or sRGB as the BC format was. Views follow (`bc_view_format`). BC6H is not decoded.
+    - It is on when the device has no `textureCompressionBC`. `NX_FORCE_BC_DECODE=1` forces it, to check it on the
+      Mac.
+    - The BC7 partition and anchor tables (2 and 3 subsets, 64 shapes each) were derived from Pillow's decoder,
+      with blocks whose subsets decode to distinct colours (`tools/bc/derive.py`).
+    - Against Pillow (`tools/bc/compare.py`), on 5,120 random blocks per format with all BC7 modes: a maximum
+      difference of 0 on every format.
+    - Course 1-1 with `NX_FORCE_BC_DECODE=1`: the same screens as native BC, 60 fps, a 3.95 GB peak.
+    - The same comparison caught the exploded-mesh glitch (issue #43) in the *native* reference run. Huge brown
+      triangles appeared near the pipe near the end of the course, so #43 is still open (DEBUG-2 #76).

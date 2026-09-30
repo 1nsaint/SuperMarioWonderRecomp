@@ -19,6 +19,7 @@ using namespace nx::vk;
 // blends in linear) and samples them the same way. Ignoring it lost one conversion per draw: far too much contrast
 // and saturation (docs/nvn/DEBUG.md #29).
 VkFormat view_format(const GpuImage& img, uint32_t nvn) {
+    if (VkFormat f; bc_view_format(img, nvn, f)) return f;  // decoded BC (nvn_bc.cpp)
     if (!nvn || nvn == img.nvn_format || img.alpha_from_r || img.aspect != VK_IMAGE_ASPECT_COLOR_BIT) return img.format;
     VkFormat f = vk_format(nvn);
     uint32_t bw = 1, bh = 1, bytes = 0, iw = 1, ih = 1, ibytes = 0;

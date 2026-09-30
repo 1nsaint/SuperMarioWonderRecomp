@@ -116,6 +116,12 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
         p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
         return;
     }
+    bool decode = bc_host_decode(t.format);  // nvn_bc.cpp: no BC on this GPU
+    if (decode && t.stride) {
+        static bool logged = false;
+        if (!logged) log("nvn/vk: pitch-linear BC texture (format %#x): not decoded, cleared", t.format), logged = true;
+        return clear_image(cb, img);
+    }
     if (t.stride) {  // pitch-linear: rows as they are
         uint64_t rows = (img.height + bh - 1) / bh;
         VkBufferImageCopy r{};
@@ -147,6 +153,26 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
     if (levels.empty()) {
         log("nvn/vk: texture %ux%u format %#x: could not untile (%llu bytes)", img.width, img.height, t.format,
             (unsigned long long)t.storage_size);
+        return;
+    }
+    if (decode) {  // every level's blocks -> texels, tightly packed, then copied as an uncompressed image
+        uint32_t tb = bc_decoded_bytes(t.format), slices = img.view_type == VK_IMAGE_VIEW_TYPE_3D ? layers : img.layers;
+        uint64_t total = 0;
+        for (const auto& l : levels) total += uint64_t(l.width) * l.height * slices * tb;
+        Upload u = upload_alloc(total, 16);
+        uint64_t at = 0;
+        for (uint32_t k = 0; k < levels.size(); k++) {
+            bc_decode(t.format, linear.data() + levels[k].offset, levels[k].width, levels[k].height, slices, u.ptr + at);
+            VkBufferImageCopy r{};
+            r.bufferOffset = u.offset + at;
+            r.imageSubresource = {img.aspect, k, 0, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? 1u : img.layers};
+            r.imageExtent = {levels[k].width, levels[k].height, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? layers : 1u};
+            copies.push_back(r);
+            at += uint64_t(levels[k].width) * levels[k].height * slices * tb;
+        }
+        transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(copies.size()),
+                                 copies.data());
         return;
     }
     // Widened, every offset in the linear buffer doubles (level offsets are multiples of the 4-byte texel).

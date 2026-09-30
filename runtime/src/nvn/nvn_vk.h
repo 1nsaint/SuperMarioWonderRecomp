@@ -51,6 +51,13 @@ bool present_pass_targets(VkFormat format, const std::vector<VkImage>& images, V
                           VkSurfaceTransformFlagBitsKHR transform);
 bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop, uint32_t index);
 GpuImage* present_pass_test_target();
+// nvn_bc.cpp: BC textures decoded on the CPU where the GPU has no textureCompressionBC (NX_FORCE_BC_DECODE=1 anyway).
+bool bc_host_decode(uint32_t nvn_format);         // a BC format this device cannot sample (BC6H excepted)
+VkFormat bc_decoded_format(uint32_t nvn_format);  // what it is stored as instead
+uint32_t bc_decoded_bytes(uint32_t nvn_format);   // bytes per texel of that
+void bc_decode(uint32_t nvn_format, const uint8_t* blocks, uint32_t width, uint32_t height, uint32_t slices,
+               uint8_t* out);  // tightly packed blocks -> tightly packed texels
+bool bc_view_format(const GpuImage& img, uint32_t nvn, VkFormat& out);  // a view of a decoded image
 // nvn_pipeline_cache.cpp: the pipeline cache kept in <data root>/cache (NX_PIPELINE_CACHE=0: none). Called once per
 // pipeline made: every 32 calls it is saved.
 VkPipelineCache pipeline_cache();  // NX_PRESENT_TEST: an offscreen "display" for the pass (headless dumps)
