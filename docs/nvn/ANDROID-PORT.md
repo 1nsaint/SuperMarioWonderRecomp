@@ -321,6 +321,30 @@ A0, 2026-09-30:
   (libwonder.so 187 MB stripped), package `io.github.belmantegu.wonderrecomp`, min SDK 29, signature verified. A clean
   NDK build at `-j4` took about 2 hours on the M1 (1,332 objects, with `-g`). Installing it waits for a phone (A1).
 
+A1, 2026-09-30, Galaxy S23 (DEBUG-2.md #68):
+- First fixes: the alias region moved below the modules (Android's zygote sits in the old one at random), and the
+  data went to Internal storage with all-files access by `appops`.
+- **Exit met:** the game runs on the phone at 40-60 fps at the title, with no failed draw and no crash, and memory
+  under the guard (5 GB set in `config.txt`).
+- Tools: `private/wonder/push_emu.sh` (install and push, any serial) and `private/wonder/run_emu.sh` (run, log,
+  pull the frame dumps).
+
+A2, in progress (DEBUG-2.md #69, #70, #72):
+- The present pass (`nvn_present.cpp`): rotation, fit, alpha 1, surface format and composite alpha from the surface,
+  and a new window after home or the lock screen. Checked on the Mac with `NX_PRESENT_TEST`; the on-device check
+  waits for the phone.
+- BC is native on Adreno: D1 is for Mali.
+- The emulator cannot render on the M1 (SwiftShader only).
+
+A4, started (DEBUG-2.md #71):
+- Drawn touch controls for Wonder, with dash at full tilt.
+- Short taps work in the menus.
+
+**To test when the phone is back:**
+1. `bash private/wonder/push_emu.sh <serial> --no-data` installs the new APK and keeps the data.
+2. `bash private/wonder/run_emu.sh <serial> 90 s23b`.
+3. Look at the screen: the title, upright, with bars and the touch controls drawn.
+
 Total: about 12-16 weeks. A0-A2 can start while the Mac track finishes W7. They share no files with the glitch work
 except `nvn_vk.cpp` (present and swapchain) and `nvn_format.cpp`, where the Android changes are per-device branches
 chosen from capabilities, not platform `#ifdef`s.

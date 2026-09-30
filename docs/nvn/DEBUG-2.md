@@ -144,3 +144,61 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
     - In the draw trace, the indented state lines come *before* the `draw N:` line they belong to.
     - Check: the map shows the chosen character. The course is still 60 fps, and menus and "Here we go!" are
       unchanged.
+
+## Android bring-up (2026-09-30, evening; branch `feat/android-wonder`)
+
+68. **First run on a phone: the alias region collided with Android's zygote.**
+    - Device: Galaxy S23 (SM-S911B, Snapdragon 8 Gen 2, Adreno 740, 8 GB, Android 16).
+    - The app died at start with `FATAL: cannot reserve alias at 5800000000 (+1000000000): the range is in use`.
+    - `/proc/<pid>/maps` showed `app_process64` (the zygote's executable, position independent) at
+      0x5f_0972_b000. Android places it at random, from about 0x55_5555_0000 to 0x65_5555_0000, at every boot. So
+      the old layout worked for Hades only by luck of the boot.
+    - Fix: on Android the alias region (64 GiB) sits at 0x20_0000_0000, below the modules. Android keeps to the low
+      4 GiB there (ART heap). The guest learns the region from svcGetInfo; `memory.cpp` marks the gap between the
+      alias and the stack region inaccessible.
+    - The second failure was the data folder. Files pushed by `adb` into `Android/data/<pkg>` belong to the shell
+      user, and the app cannot read them. The data now goes to `Internal storage/Super Mario Bros. Wonder`, with
+      all-files access granted by `appops set --uid <pkg> MANAGE_EXTERNAL_STORAGE allow`
+      (`private/wonder/push_emu.sh`).
+    - Result: the game runs on the S23. Adreno 740, Vulkan 1.3, MAILBOX, 2340x1080 swapchain, 40-60 fps at the
+      title, tens of thousands of draws with none failed, and still running after a minute. The screen stays black
+      (#69).
+
+69. **Black screen on the phone: the NVN present path was Mac-only.** The picture renders (no failed draw), and
+    `gpu_present` blitted it to the swapchain. Three things are wrong there on Android:
+    - The swapchain format was hard-coded to `B8G8R8A8_UNORM`. Android surfaces offer RGBA, not BGRA; the format
+      now comes from `vkGetPhysicalDeviceSurfaceFormatsKHR`.
+    - `compositeAlpha` was hard-coded to OPAQUE, which an Android surface may not offer (INHERIT then takes the
+      image's alpha as transparency). It is now chosen from the capabilities, and the picture's alpha is forced to 1.
+    - The blit does not rotate. With the surface's `currentTransform` at 90° the compositor has to turn the image.
+    - Fix: `nvn_present.cpp`, a render pass that samples the window texture. It rotates by `preTransform` (the
+      swapchain made in the panel's own orientation), fits the picture with bars (16:9 on 19.5:9) and writes alpha
+      1. It is on by default on Android; `NX_PRESENT_PASS=1` enables it elsewhere, `=0` restores the blit.
+    - A new Android window (home, lock screen) now re-makes the surface and the swapchain (`window_generation`).
+    - Check without a phone: `NX_PRESENT_TEST=1080x2340:90` renders the pass into an offscreen "display" in headless
+      runs and dumps it. The title comes out turned 90° with bars, the same mapping as the Hades pass that is proven
+      on the S23.
+    - The on-device check is pending (the phone was disconnected).
+
+70. **Adreno reads BC natively.** On the S23 no texture image failed to be made, and the game uploads BC1/BC4/BC5/
+    BC7 from its first frames. Decision D1 (BC → ASTC on the Mac, ANDROID-PORT.md) is therefore for Mali phones
+    only, not a blocker for Adreno.
+
+71. **Touch controls for Wonder, drawn (A4).**
+    - `touch_layout.cpp` holds a fixed layout: round buttons with A big at the bottom right, B, Y, X around it, and
+      ZR, R, L, +, - along the top. It is hit-tested by `platform_android_input.cpp`.
+    - The left half is a stick that appears where the thumb lands. Pushed past 85% it also holds Y (dash), so
+      running and jumping need one thumb each.
+    - The present pass draws the circles over the picture: translucent, brighter while held, with the stick under
+      the thumb. They hide while a controller is in use.
+    - Hades keeps its own zones.
+    - `NX_OVERLAY_DEMO=1` draws the layout on the Mac for the self-test
+      (`docs/media/wonder/41-android-touch-overlay-selftest.png`).
+    - Also checked on the Mac: menus take short taps. Seven 0.15 s A presses go from the title to course 1-1. The
+      "A held ~1 s" of 2026-09-29 is gone.
+
+72. **The Android emulator is no use for rendering on the M1.** The emulator 34.2.16 selects SwiftShader (a CPU
+    Vulkan) whatever the settings: `-no-window` forces it, and with a window, `ANDROID_EMU_VK_ICD` and the bundled
+    MoltenVK ICD were ignored. Wonder boots on it, but no frame came in 11 minutes: every pipeline compiles on the
+    CPU. It is kept for install and boot checks only (AVD `WonderTest`: 5 GB RAM, 16 GB disk). Rendering checks use
+    `NX_PRESENT_TEST` on the Mac and the phone.
