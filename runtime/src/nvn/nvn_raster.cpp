@@ -96,9 +96,11 @@ void raster_dynamic(VkCommandBuffer cb) {
             fn(cb, VK_STENCIL_FACE_BACK_BIT, v[1]);
         }
     };
-    set(p_vkCmdSetStencilReference, s.stencil_ref);
-    set(p_vkCmdSetStencilCompareMask, s.stencil_compare_mask);
-    set(p_vkCmdSetStencilWriteMask, s.stencil_write_mask);
+    static const bool old = std::getenv("NX_OLD_STENCIL") != nullptr;  // bisecting: reference 0, masks 0xFF
+    static const uint8_t zero[2] = {0, 0}, all[2] = {0xFF, 0xFF};
+    set(p_vkCmdSetStencilReference, old ? zero : s.stencil_ref);
+    set(p_vkCmdSetStencilCompareMask, old ? all : s.stencil_compare_mask);
+    set(p_vkCmdSetStencilWriteMask, old ? all : s.stencil_write_mask);
     // Depth bias. NVN's call has glPolygonOffsetClamp's meaning, which is Vulkan's: units in minimum resolvable
     // depth differences (r), factor per unit of slope. Ryujinx and yuzu halve the units, but that is of the Maxwell
     // register the driver writes (units * 2); the API value needs no scaling. What does differ: D24 targets are

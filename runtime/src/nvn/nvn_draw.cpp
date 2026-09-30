@@ -637,7 +637,9 @@ void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
     if (!g_rendering) begin_rendering(cb, t);
     uint32_t level = color ? t.views.level[c.n] : t.views.level[8];
     VkExtent2D full{std::max(1u, img->width >> level), std::max(1u, img->height >> level)};
-    if (full.width > g_pass_extent.width || full.height > g_pass_extent.height) {
+    static const bool transfer = std::getenv("NX_TRANSFER_CLEARS") != nullptr;  // bisecting: whole-image clears
+    if (transfer && !color) a.aspectMask = img->aspect;  // the old clears ignored the masks
+    if (transfer || full.width > g_pass_extent.width || full.height > g_pass_extent.height) {
         // The pass is smaller than this target (a larger shared depth buffer): clear all of it, outside the pass.
         draw_end_rendering(cb, 4);
         transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);
