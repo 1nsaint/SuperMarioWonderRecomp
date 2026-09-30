@@ -398,7 +398,7 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     ci.pDynamicState = &dy;
     ci.layout = layout.layout;
     VkPipeline p = VK_NULL_HANDLE;
-    if (p_vkCreateGraphicsPipelines(vk_device(), VK_NULL_HANDLE, 1, &ci, nullptr, &p) != VK_SUCCESS)
+    if (p_vkCreateGraphicsPipelines(vk_device(), pipeline_cache(), 1, &ci, nullptr, &p) != VK_SUCCESS)
         log("nvn/vk: pipeline for %s + %s failed", key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
     else if (g_trace)
         log("nvn/vk: pipeline %zu: %s + %s", cache.size() + 1, key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
@@ -629,7 +629,7 @@ VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgramLayout& layout) {
         ci.stage.module = module_of(cs);
         ci.stage.pName = "main";
         ci.layout = layout.layout;
-        if (p_vkCreateComputePipelines(vk_device(), VK_NULL_HANDLE, 1, &ci, nullptr, &p) != VK_SUCCESS) {
+        if (p_vkCreateComputePipelines(vk_device(), pipeline_cache(), 1, &ci, nullptr, &p) != VK_SUCCESS) {
             log("nvn/vk: compute pipeline for %s failed", cs->hash.c_str());
             p = VK_NULL_HANDLE;
         }

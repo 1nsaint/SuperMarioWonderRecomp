@@ -202,3 +202,13 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
     MoltenVK ICD were ignored. Wonder boots on it, but no frame came in 11 minutes: every pipeline compiles on the
     CPU. It is kept for install and boot checks only (AVD `WonderTest`: 5 GB RAM, 16 GB disk). Rendering checks use
     `NX_PRESENT_TEST` on the Mac and the phone.
+
+73. **Pipeline cache on disk (A3, also for the Mac).**
+    - Every session compiled every pipeline again: 672 over the scripted course on the Mac. That is a hitch at each
+      new scene, and slower on Adreno.
+    - `nvn_pipeline_cache.cpp` keeps a `VkPipelineCache` in `<data root>/cache/pipelines_<vendor>_<device>.bin`
+      (10.5 MB on the M1). The header must match the device, or the cache starts over.
+    - It is saved on a thread of its own every 32 new pipelines, and retried when the driver answers INCOMPLETE
+      (MoltenVK did, twice, as the cache grew between the two calls).
+    - Course 1-1 headless, two identical runs: 11 intervals under 55 fps without the cache, 5 with it.
+    - `NX_PIPELINE_CACHE=0`: no cache.

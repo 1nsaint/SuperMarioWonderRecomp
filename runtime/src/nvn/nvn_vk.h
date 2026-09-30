@@ -50,7 +50,10 @@ bool present_pass_wanted();
 bool present_pass_targets(VkFormat format, const std::vector<VkImage>& images, VkExtent2D extent,
                           VkSurfaceTransformFlagBitsKHR transform);
 bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop, uint32_t index);
-GpuImage* present_pass_test_target();  // NX_PRESENT_TEST: an offscreen "display" for the pass (headless dumps)
+GpuImage* present_pass_test_target();
+// nvn_pipeline_cache.cpp: the pipeline cache kept in <data root>/cache (NX_PIPELINE_CACHE=0: none). Called once per
+// pipeline made: every 32 calls it is saved.
+VkPipelineCache pipeline_cache();  // NX_PRESENT_TEST: an offscreen "display" for the pass (headless dumps)
 
 // Per-submit upload memory (host visible, coherent), reset at every submit: data the replayed commands read from
 // guest memory is copied here at replay time (vertex, index, uniform, storage data, texture staging).
