@@ -31,6 +31,9 @@ Windows merge (DEBUG-2.md #89). The studies that build on these numbers are in t
 | `dyn1` (+ dynamic uniform offsets, Android default) | pipelined | 46.8 mean | 30 (interval 2) | 17.5-19.8 ms | 2-3 ms | sets reused 82%; images correct |
 | `rt1` (+ `NX_REPLAY_THREAD=1`) | pipelined | 47.3 mean, 12 < 30 | 30 (interval 2) | 18.7-20.9 ms | 0.5-1.6 ms | no clear gain |
 | `max1` (dyn1 + `NX_MAX_INTERVAL=1`) | pipelined | 53.1 mean, 1 < 30 | **48-50** | **16-17 ms** | 0.2-1.1 ms | the 30-fps lock off: CPU clocks stay up; 77% of present intervals 14-19 ms; the game runs ~17% slow when a frame is late |
+| `watch1` (+ write watches; lock off) | pipelined | 54.4 mean | 45-49 | 16-17.6 ms | 0.5 ms | no hash spike every 4th frame |
+| `heap1` (+ heap zero-fill off, delayed page release; lock off) | pipelined | 53.2 mean | 42-47 | 15.8-18.8 ms | 0.2-1.1 ms | **518/600 present intervals 14-19 ms** (best so far); 41 over 50 ms |
+| `gpu2` (heap1 + `NX_GPU_PROFILE=1`) | pipelined | - | - | - | - | **GPU 18.7 ms/frame at the higher load**: two 960x540 passes 2.8 + 2.4 ms |
 | `aff1` (R1 + `NX_AFFINITY=1`) | pipelined | 47.1 mean | 30 (interval 2) | 20 ms | 2.5 ms | replay thread 600/600 on the prime core: only ~1 ms less, so the replay is work, not clocks |
 
 Conclusions so far:
@@ -89,3 +92,15 @@ The sampled frames of `pipe1` look clean: the flicker is temporal and needs fram
   elsewhere.
 - **At 30 fps the replay looks ~2-3 ms slower than it is.** The replay thread is idle half the time, and the clocks
   drop. `max1`, with the lock off, gives the cost at full clocks: ~16-17 ms.
+
+## State after phase 2 work (2026-10-01, `heap1`/`gpu2`)
+
+- **CPU** (submit thread, full clocks): replay ~16-17 ms + other ~1.2 + encode 0.6 + present 0.4 → ~18.5 ms, about
+  54 fps.
+- **GPU:** 18.7 ms/frame. It is a blocker as much as the CPU; Phase 3 (G1-G4) is needed.
+- **Profiler caveat:** when the sampled PC is a leaf in libc or the Adreno driver, the frame-pointer walk skips its
+  caller. "First libwonder frame" then names the caller's caller. ~26% of the replay thread's samples sat under
+  `begin_rendering` this way: the driver's per-pass allocation and memset in `vkCmdBeginRendering`.
+- **Memory** (heap1, course): app total PSS 3.29 GB, Graphics 0.97 GB, swap PSS 1.9 GB, MemAvailable ~1.0-1.1 GB.
+- **Temperature** after the 5-minute run: AP (SoC) 52.6 °C, skin and battery 39.9 °C, thermal status LIGHT,
+  headroom 0.87 (throttling from 1.0).

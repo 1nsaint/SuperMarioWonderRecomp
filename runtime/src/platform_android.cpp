@@ -19,6 +19,7 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <malloc.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -554,6 +555,13 @@ extern "C" void android_main(android_app* app) {
                 setenv(line.substr(0, eq).c_str(), line.substr(eq + 1).c_str(), 0);
         }
         setenv("NX_HANDHELD", "1", 0);
+    }
+    // The heap (scudo) zero-fills every allocation and gives freed pages back at once by default: in the replay, a
+    // memset under each allocation and madvise churn (docs/nvn/android-perf/PLAN.md, phase 2). NX_MALLOC_TUNE=0: as
+    // the system set it.
+    if (const char* e = getenv("NX_MALLOC_TUNE"); !(e && e[0] == '0')) {
+        int zero = mallopt(M_BIONIC_ZERO_INIT, 0), decay = mallopt(M_DECAY_TIME, 1);
+        nx::log("heap: zero-fill off (%d), page release delayed (%d)", zero, decay);
     }
     start_memory_guard();
     app->onAppCmd = on_cmd;
