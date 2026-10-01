@@ -100,7 +100,10 @@ bool astc_decoded(uint32_t f) {
     return g_astc_decode >> (f >= 0x87 ? 1 : 0) & 1;
 }
 
+bool native_r11g11b10();  // nvn_caps.cpp
+
 VkFormat vk_format(uint32_t f) {
+    if (f == 0x3f && native_r11g11b10()) return VK_FORMAT_B10G11R11_UFLOAT_PACK32;  // nvn_caps.cpp
     if (f < sizeof kFormats / sizeof kFormats[0]) return kFormats[f].vk;
     if (f >= 0x79 && f <= 0x86) return astc_decoded(f) ? VK_FORMAT_R8G8B8A8_UNORM : kAstc[f - 0x79];
     if (f >= 0x87 && f <= 0x94) return astc_decoded(f) ? VK_FORMAT_R8G8B8A8_SRGB : kAstcSrgb[f - 0x87];
@@ -138,7 +141,7 @@ uint32_t vk_block_bytes(VkFormat f) {
         case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_R8G8B8A8_SRGB:
         case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2B10G10R10_UINT_PACK32:
         case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
-        case VK_FORMAT_D32_SFLOAT: return 4;
+        case VK_FORMAT_D32_SFLOAT: case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return 4;
         case VK_FORMAT_R16G16B16_SFLOAT: case VK_FORMAT_R16G16B16_UNORM: case VK_FORMAT_R16G16B16_SNORM:
         case VK_FORMAT_R16G16B16_UINT: case VK_FORMAT_R16G16B16_SINT: return 6;
         case VK_FORMAT_R32G32_SFLOAT: case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT:

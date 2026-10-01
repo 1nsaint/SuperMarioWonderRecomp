@@ -439,6 +439,7 @@ std::vector<WriteBack> draw_take_write_backs() {  // an asynchronous submit copi
 void draw_begin_submit() {
     g_rendering = false;
     g_bound = Bound{};  // a new command buffer
+    submit_lists_reset();
     sets_begin_submit();
     clears_begin_submit();
     g_submit_ns = plat::monotonic_ns();

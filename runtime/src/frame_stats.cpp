@@ -142,6 +142,11 @@ Role g_roles[2] = {{"replay+present"}, {"game main"}};
 
 }  // namespace
 
+void thread_counters(uint64_t& cpu_ns, long faults[2], long switches[2]) {
+    cpu_ns = thread_cpu_ns();
+    thread_usage(faults, switches);
+}
+
 void frame_thread_tick(int role) {
     Role& r = g_roles[role & 1];
 #if defined(__ANDROID__)

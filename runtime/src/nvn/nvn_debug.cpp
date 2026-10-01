@@ -332,7 +332,7 @@ double g_period_ns = 1.0;
 }  // namespace
 
 bool gpu_profile_on() {
-    static const bool on = std::getenv("NX_GPU_PROFILE") != nullptr;
+    static const bool on = std::getenv("NX_GPU_PROFILE") && std::atoi(std::getenv("NX_GPU_PROFILE")) == 1;
     return on;
 }
 

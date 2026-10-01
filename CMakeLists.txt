@@ -107,6 +107,8 @@ set(NX_RUNTIME_SOURCES
     runtime/src/write_watch.cpp
     runtime/src/nvn/nvn_caps.cpp
     runtime/src/nvn/nvn_renderpass.cpp
+    runtime/src/nvn/nvn_gpu_busy.cpp
+    runtime/src/nvn/nvn_janitor.cpp
     runtime/src/nvn/nvn_trace.cpp
     runtime/src/nvn/nvn_device.cpp
     runtime/src/nvn/nvn_objects.cpp

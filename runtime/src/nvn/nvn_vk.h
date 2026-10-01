@@ -115,7 +115,8 @@ bool async_gpu();  // the slots are in use (either mode)
 bool pipelined();  // NX_PIPELINED: fences not waited for, write-backs copied before gpu_submit returns
 // The extensions and memory types that the Android performance plan depends on, logged once (nvn_caps.cpp).
 void log_device_caps(VkPhysicalDevice physical, const std::vector<VkExtensionProperties>& extensions);
-uint32_t upload_memory_type(uint32_t bits);  // the upload ring's memory type (nvn_caps.cpp)
+uint32_t upload_memory_type(uint32_t bits);
+bool native_r11g11b10();  // NVN 0x3f as B10G11R11_UFLOAT (nvn_caps.cpp; Android)  // the upload ring's memory type (nvn_caps.cpp)
 void frame_init(VkCommandPool pool, uint32_t family, VkBuffer ring, uint8_t* ring_ptr, uint64_t ring_size);
 VkCommandBuffer frame_begin(bool replay);  // NX_ASYNC_GPU, replay: submits with write-backs retired first
 VkSemaphore frame_acquire_semaphore();
@@ -123,6 +124,7 @@ VkSemaphore frame_rendered_semaphore(uint32_t image);
 void frame_submit(VkSemaphore wait, VkSemaphore signal, std::vector<WriteBack> write_backs, bool wait_done);
 void frame_wait_all();
 uint64_t frame_upload_used();
+uint64_t frame_ring_size();  // the slots' upload ring (0: synchronous submits, no ring)
 uint64_t frame_completed();  // the serial of the last retired submit (for free_retired_images)
 Upload frame_upload_alloc(uint64_t size, uint64_t align);
 VkDescriptorSet frame_descriptor_set(VkDescriptorSetLayout layout);
@@ -214,6 +216,8 @@ bool mask_clear(VkCommandBuffer cb, const Targets& t, uint32_t slot, uint32_t ma
                 const VkRect2D& rect);
 // nvn_replay.cpp: a command list into `cb` (`depth`: CallList nesting).
 void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth);
+std::shared_ptr<CmdList> submit_command_list(uint64_t handle);  // command_list(), once per handle per submit
+void submit_lists_reset();  // at each submit's start (draw_begin_submit)
 
 void replay_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list);  // nvn_copy.cpp: texture copies
 void forget_image_views(const GpuImage& img);
@@ -230,7 +234,17 @@ void debug_snapshot(VkCommandBuffer cb, GpuImage& img, uint64_t draw);
 void debug_snapshots_write();  // nvn_pipeline.cpp: before an image is freed
 
 // nvn_debug.cpp: GPU time per render pass (NX_GPU_PROFILE=1).
-bool gpu_profile_on();
+bool gpu_profile_on();  // NX_GPU_PROFILE=1: per-pass labels, every submit waited for (nvn_debug.cpp)
+// NX_GPU_PROFILE=3: the GPU's busy time per frame without waits, from per-part timestamps (nvn_gpu_busy.cpp).
+// The janitor thread (nvn_janitor.cpp, NX_JANITOR): pool resets of retired slots, off the replay thread.
+bool janitor_on();
+void janitor_run(std::function<void()> job);
+void janitor_wait(const std::atomic<bool>& done);
+bool gpu_busy_on();
+void gpu_busy_part_begin(uint32_t slot, uint32_t part, VkCommandBuffer cb);
+void gpu_busy_part_end(uint32_t slot, uint32_t part, VkCommandBuffer cb);
+void gpu_busy_retired(uint32_t slot, uint32_t queued);
+void gpu_busy_log(uint64_t frames);
 void gpu_profile_begin(VkCommandBuffer cb);
 void gpu_profile_mark(VkCommandBuffer cb, const std::string& label);
 void gpu_profile_collect();

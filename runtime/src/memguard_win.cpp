@@ -65,4 +65,6 @@ void start_memory_guard() {
 
 #endif
 
+uint64_t memguard_overlap_ns(uint64_t, uint64_t) { return 0; }
+
 }  // namespace nx::plat

@@ -68,6 +68,7 @@ struct Slot {
     VkSemaphore acquired = VK_NULL_HANDLE;          // a present's swapchain image
     VkDescriptorPool descriptors = VK_NULL_HANDLE;  // made on first use (presents need none)
     bool descriptors_used = false;
+    std::atomic<bool> reset_done{true};  // the janitor reset its pools (nvn_janitor.cpp); frame_begin waits for it
     uint64_t serial = 0;    // in flight until retired; 0: free
     uint64_t ring_end = 0;  // the ring position after this submit's data
     std::vector<WriteBack> write_backs;
@@ -97,7 +98,8 @@ bool g_slot_pools = false;
 uint64_t g_chunk_draws = 0;           // NX_SUBMIT_CHUNK_DRAWS (frame_init); 0: no chunks
 bool g_chunking = false;              // this submit is chunked (frame_plan_split)
 uint64_t g_chunk_from = UINT64_MAX;   // the draw count at the last part's start (UINT64_MAX: the next call's)
-std::atomic<uint64_t> g_game_waits{0}, g_game_wait_ns{0};  // the game's waits that blocked (NX_ASYNC_GPU only)
+std::atomic<uint64_t> g_game_waits{0}, g_game_wait_ns{0};
+uint64_t g_staging_count = 0, g_staging_bytes = 0;  // staging_alloc's buffers, per log period (PHASE4.md U1)  // the game's waits that blocked (NX_ASYNC_GPU only)
 
 // The upload ring (the synchronous path's upload buffer). Positions only grow; position p is byte p % size. What
 // lies before g_tail belongs to retired submits; g_begin is where the submit being recorded started.
@@ -169,9 +171,21 @@ bool retire_oldest() {
     if (!s) return false;
     VkFence fences[kMaxParts];
     wait_fences(fences, queued_fences(*s, kMaxParts, fences));
+    gpu_busy_retired(uint32_t(s - g_slots), s->queued);  // NX_GPU_PROFILE=3
     apply_write_backs(*s);
-    if (s->descriptors_used) p_vkResetDescriptorPool(vk_device(), s->descriptors, 0);
-    s->descriptors_used = false;
+    // Its command and descriptor pools: reset on the janitor thread (PHASE4.md C2b), or here (NX_JANITOR=0).
+    if (janitor_on()) {
+        s->reset_done.store(false, std::memory_order_relaxed);
+        janitor_run([s] {
+            if (g_slot_pools && s->pool_used) p_vkResetCommandPool(vk_device(), s->pool, 0);
+            if (s->descriptors_used) p_vkResetDescriptorPool(vk_device(), s->descriptors, 0);
+            s->pool_used = s->descriptors_used = false;
+            s->reset_done.store(true, std::memory_order_release);
+        });
+    } else {
+        if (s->descriptors_used) p_vkResetDescriptorPool(vk_device(), s->descriptors, 0);
+        s->descriptors_used = false;
+    }
     g_tail = std::max(g_tail, s->ring_end);
     g_completed = s->serial;
     s->serial = 0;
@@ -257,7 +271,7 @@ uint32_t count_dispatches(const CmdList& list, int depth) {
     uint32_t n = l.own_dispatches;
     if (depth < 8)
         for (uint64_t h : l.calls)
-            if (auto called = command_list(h)) n += count_dispatches(*called, depth + 1);
+            if (auto called = submit_command_list(h)) n += count_dispatches(*called, depth + 1);
     return n;
 }
 
@@ -270,9 +284,11 @@ int env_int(const char* name) {
 // buffer: the next pass on their targets takes them as load operations), queues it, and begins the next one.
 VkCommandBuffer next_part(Slot& s) {
     pass_end_only(s.cbs[s.part], 0);
+    gpu_busy_part_end(uint32_t(&s - g_slots), s.part, s.cbs[s.part]);
     if (s.ok && submit_part(s.cbs[s.part], s.fences[s.part], VK_NULL_HANDLE, VK_NULL_HANDLE)) s.queued |= 1u << s.part;
     s.part++;
     s.ok = begin_part(s.cbs[s.part]);
+    if (s.ok) gpu_busy_part_begin(uint32_t(&s - g_slots), s.part, s.cbs[s.part]);
     if (!s.ok) log("nvn/vk: a part of a submit could not begin: it is lost");
     g_chunk_from = UINT64_MAX;
     return s.cbs[s.part];
@@ -349,6 +365,7 @@ VkCommandBuffer frame_begin(bool replay) {
     if (!pipelined() && replay && g_barrier > g_completed) retire_through(g_barrier);
     Slot& s = g_slots[g_next];
     if (s.serial) retire_through(s.serial);
+    janitor_wait(s.reset_done);
     if (g_slot_pools && s.pool_used) p_vkResetCommandPool(vk_device(), s.pool, 0);  // none of its parts is in flight
     s.pool_used = true;
     g_next = (g_next + 1) % g_slot_count;
@@ -362,6 +379,7 @@ VkCommandBuffer frame_begin(bool replay) {
         return VK_NULL_HANDLE;
     }
     g_current = &s;
+    gpu_busy_part_begin(uint32_t(&s - g_slots), 0, s.cbs[0]);  // NX_GPU_PROFILE=3
     return s.cbs[0];
 }
 
@@ -433,6 +451,7 @@ void frame_submit(VkSemaphore wait, VkSemaphore signal, std::vector<WriteBack> w
         g_stats.submits++;
         if (s.split_part >= 0) g_stats.replay_ns += plat::monotonic_ns() - s.begin_ns;
     }
+    if (s.ok) gpu_busy_part_end(uint32_t(&s - g_slots), s.part, s.cbs[s.part]);
     const bool has_last = s.ok && submit_part(s.cbs[s.part], s.fences[s.part], wait, signal);
     if (has_last) s.queued |= 1u << s.part;
     if (!s.queued) return;  // nothing ran: no results to copy back, the slot stays free
@@ -479,14 +498,23 @@ void frame_submit(VkSemaphore wait, VkSemaphore signal, std::vector<WriteBack> w
     if (wait_done || (compute_wait && !s.write_backs.empty())) retire_through(s.serial);
 }
 
-void frame_wait_all() { retire_through(g_submitted); }
+void frame_wait_all() {
+    retire_through(g_submitted);
+    for (uint32_t k = 0; k < g_slot_count; k++) janitor_wait(g_slots[k].reset_done);
+}
 
 uint64_t frame_upload_used() { return g_head - g_begin; }
+uint64_t frame_ring_size() { return async_gpu() ? g_ring_size : 0; }
 
 void frame_log(uint64_t frames) {
+    gpu_busy_log(frames);
     if (uint64_t waits = g_game_waits.exchange(0))
         log("nvn/vk: the game's waits (syncs, finish, pool invalidate/finalize): %llu blocked, %.2f ms per frame",
             (unsigned long long)waits, double(g_game_wait_ns.exchange(0)) / 1e6 / double(frames));
+    if (g_staging_count)
+        log("nvn/vk: staging: %llu buffers, %.1f MB over %llu frames", (unsigned long long)g_staging_count,
+            double(g_staging_bytes) / 1e6, (unsigned long long)frames);
+    g_staging_count = g_staging_bytes = 0;
     if (!pipelined() || !g_stats.submits) return;
     const Stats& t = g_stats;
     log("nvn/vk: pipelined: %llu submits, %llu split (first part: %.0f%% of the replay), write-backs after the first "
@@ -607,6 +635,7 @@ Texture::~Texture() {
 // to RGBA8 staged 312 MB in one submit, wrapping over its own data before the GPU had copied it (DEBUG-2 #72). Freed
 // once the submit being recorded is retired (as images in the grave). Falls back to the ring if allocation fails.
 Upload staging_alloc(uint64_t size) {
+    g_staging_count++, g_staging_bytes += size;
     VkDevice d = vk_device();
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;

@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 
 #include "nvn_draw_state.h"
 #include "nvn_vk.h"
@@ -10,6 +11,29 @@
 namespace nx::nvn {
 
 using namespace nx::vk;
+
+namespace {
+// The lists called during one submit, by handle (PHASE4.md C5): command_list() takes a mutex and walks a map, and a
+// course frame calls hundreds of lists, each looked up twice (the dispatch count, then the replay). The first lookup
+// of a handle in a submit is kept for the rest of it: a list re-recorded meanwhile on the game's recording thread
+// is not mixed into a submit already being replayed. NX_CALL_TABLE=0: every call looks up.
+std::unordered_map<uint64_t, std::shared_ptr<CmdList>> g_called;
+}  // namespace
+
+void submit_lists_reset() { g_called.clear(); }
+
+std::shared_ptr<CmdList> submit_command_list(uint64_t handle) {
+    static const bool off = [] {
+        const char* e = std::getenv("NX_CALL_TABLE");
+        return e && e[0] == '0';
+    }();
+    if (off) return command_list(handle);
+    auto it = g_called.find(handle);
+    if (it != g_called.end()) return it->second;
+    auto l = command_list(handle);
+    if (l) g_called.emplace(handle, l);
+    return l;
+}
 
 void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth) {
     if (skin_lists_on()) skin_list_replayed(list, depth);
@@ -39,7 +63,7 @@ void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth
             case Cmd::ClearDepthStencil: draw_clear(cb, st, c); break;
             case Cmd::CallList:
                 if (depth < 8) {
-                    if (auto l = command_list(c.a[0])) {
+                    if (auto l = submit_command_list(c.a[0])) {
                         replay_list(cb, st, *l, depth + 1);
                         cb = frame_cb(cb);  // NX_PIPELINED: the called list may have split the submit
                     } else {

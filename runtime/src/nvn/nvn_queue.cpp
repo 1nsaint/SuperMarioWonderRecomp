@@ -247,15 +247,28 @@ void frame_time_probe(CPU& c) {
     }
     static uint64_t bins[5] = {}, frames = 0;
     double ms = double(ld<uint64_t>(c.x[19] + 0x118)) / 19200.0;
-    // A main-thread frame over 33 ms: what it waited on (PHASE3.md I1), 300 lines at most.
+    // A main-thread frame over 33 ms: what it waited on (PHASE3.md I1), its CPU time, faults and switches since the
+    // last call, and how much of it a memory-guard read covered (PHASE4.md H0). NX_HITCH_LINES lines at most (300).
     static int hitches = 0;
-    if (ms >= 33 && hitches < 300) {
+    static const int max_hitches = std::getenv("NX_HITCH_LINES") ? std::atoi(std::getenv("NX_HITCH_LINES")) : 300;
+    static uint64_t cpu_prev = 0;
+    static long faults_prev[2] = {}, switches_prev[2] = {};
+    uint64_t cpu = 0, now = plat::monotonic_ns();
+    long faults[2], switches[2];
+    plat::thread_counters(cpu, faults, switches);
+    if (ms >= 33 && hitches < max_hitches && cpu_prev) {
         hitches++;
-        log("hitch: frame %llu, main thread %.1f ms, blocked: sync %.1f, finish %.1f, invalidate %.1f, finalize %.1f ms",
-            (unsigned long long)g_frame.load(), ms, double(g_wait_sites[0].frame_ns) / 1e6,
-            double(g_wait_sites[1].frame_ns) / 1e6, double(g_wait_sites[2].frame_ns) / 1e6,
-            double(g_wait_sites[3].frame_ns) / 1e6);
+        uint64_t span = uint64_t(ms * 1e6);
+        log("hitch: frame %llu, main thread %.1f ms (cpu %.1f), blocked: sync %.1f, finish %.1f, invalidate %.1f, "
+            "finalize %.1f ms; faults %ld/%ld, switches %ld/%ld; guard read %.1f ms",
+            (unsigned long long)g_frame.load(), ms, double(cpu - cpu_prev) / 1e6,
+            double(g_wait_sites[0].frame_ns) / 1e6, double(g_wait_sites[1].frame_ns) / 1e6,
+            double(g_wait_sites[2].frame_ns) / 1e6, double(g_wait_sites[3].frame_ns) / 1e6, faults[0] - faults_prev[0],
+            faults[1] - faults_prev[1], switches[0] - switches_prev[0], switches[1] - switches_prev[1],
+            double(plat::memguard_overlap_ns(now > span ? now - span : 0, now)) / 1e6);
     }
+    cpu_prev = cpu;
+    for (int k = 0; k < 2; k++) faults_prev[k] = faults[k], switches_prev[k] = switches[k];
     for (WaitSite& w : g_wait_sites) w.frame_ns = 0;
     bins[ms < 12 ? 0 : ms < 15.83 ? 1 : ms < 20 ? 2 : ms < 33 ? 3 : 4]++;
     if (++frames % 600 == 0) {

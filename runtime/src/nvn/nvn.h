@@ -70,6 +70,8 @@ std::unordered_map<uint64_t, std::unique_ptr<Object>>& objects();
 // objects live on as deferred objects until drain_objects, which also forgets the records. Game threads (mark 0)
 // always see the current one. NX_TEXTURE_RACE_OLD=1: no records, no marks (the old behaviour).
 inline thread_local uint64_t t_replay_mark = 0;  // the replaying thread's mark; 0 outside a replay
+inline thread_local uint64_t t_replay_serial = 0;  // which replay (ReplayScope counts them): keys get<T>'s replay cache
+bool resolve_cache_on();  // NX_RESOLVE_CACHE (nvn_incarnation.cpp)
 bool texture_race_old();
 Object* find_object(uint64_t guest, uint64_t mark);  // under objects_lock (shared)
 void note_replaced(uint64_t guest);                  // under objects_lock (alone): guest's object is about to change
@@ -90,6 +92,27 @@ struct ReplayScope {
 // replay mark is part of the key: a thread that replays (the render thread) also calls the game-side procs.
 template <typename T>
 T* get(uint64_t guest) {
+    // During a replay every lookup answers as of its mark, and nothing a lookup returns is freed before the replay
+    // ends (drain_objects runs between replays): an answer holds for the whole replay, so it is kept per replay
+    // (docs/nvn/android-perf/PHASE4.md C4). The game threads bump the lock's generation ~180 times a frame, which
+    // emptied the cache below during a replay (get<Texture> was 8.5% of the replay thread). Not for nulls: an object
+    // created after the mark resolves to the current one (DEBUG.md #64). NX_RESOLVE_CACHE=0: off.
+    if (uint64_t serial = t_replay_serial; serial && t_replay_mark && resolve_cache_on()) {
+        struct Slot {
+            uint64_t guest = 0, serial = 0;
+            T* object = nullptr;
+        };
+        thread_local Slot table[1024];
+        Slot& s = table[((guest >> 4) ^ (guest >> 14)) & 1023];
+        if (s.serial == serial && s.guest == guest) return s.object;
+        T* p;
+        {
+            std::shared_lock lk(objects_lock());
+            p = dynamic_cast<T*>(find_object(guest, t_replay_mark));
+        }
+        if (p) s = {guest, serial, p};
+        return p;
+    }
     struct Entry {
         uint64_t guest = 0, generation = 0, mark = 0;
         T* object = nullptr;

@@ -88,6 +88,20 @@ void decode_astc(uint32_t format, std::vector<uint8_t>& linear, std::vector<Line
             (unsigned long long)textures, double(bytes) / 1e6, double(ns) / 1e6, (unsigned long long)invalid);
 }
 
+// Whether a 1 MB+ upload gets a staging buffer of its own (PHASE4.md U1). In steady state (a course frame stages ~30
+// such textures, ~40 MB per second) the ring takes them: a fresh buffer each was an allocation (a kgsl ioctl that
+// zero-fills), a page fault per 4 KB of the copy and a free at retire, on the replay thread. A scene load, which
+// stages hundreds of MB in one submit, still gets its own buffers: past a quarter of the ring in this submit, or one
+// upload over an eighth of it. NX_STAGING_MIN=0: a staging buffer for every 1 MB+ upload, as before.
+bool staging_wanted(uint64_t size) {
+    static const bool always = [] {
+        const char* e = std::getenv("NX_STAGING_MIN");
+        return e && e[0] == '0';
+    }();
+    uint64_t ring = frame_ring_size();
+    return always || !ring || frame_upload_used() + size > ring / 4 || size > ring / 8;
+}
+
 }  // namespace
 
 // NX_1D_IMAGES=1: NVN 1D textures as Vulkan 1D images again (they are 2D of height 1: Ryujinx samples 1D as 2D, G8).
@@ -222,7 +236,7 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
     if (widen) {
         u = upload_alloc(linear.size() * 2, 16);
         widen_r11g11b10(linear.data(), u.ptr, linear.size() / 4);
-    } else if (linear.size() >= (1u << 20) && !std::getenv("NX_STAGING_RING")) {
+    } else if (linear.size() >= (1u << 20) && !std::getenv("NX_STAGING_RING") && staging_wanted(linear.size())) {
         // 1 MB and up: a staging buffer of its own, so a scene load cannot wrap the ring over itself (DEBUG-2 #72).
         // NX_STAGING_RING=1: through the ring, as before (bisecting).
         u = staging_alloc(linear.size());

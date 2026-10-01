@@ -92,6 +92,11 @@ bool write_watch_fault(void* at);
 bool headless();
 // Ends the process when its memory footprint passes NX_MEM_LIMIT_GB (default 8); logs it every 30 s (macOS).
 void start_memory_guard();
+// How much of [from, to) (monotonic ns) the memory guard spent reading (memguard_android.cpp; 0 elsewhere).
+uint64_t memguard_overlap_ns(uint64_t from, uint64_t to);
+// The calling thread's CPU time, page faults (major, minor) and context switches (voluntary, involuntary)
+// (frame_stats.cpp; Linux and Android, zeros elsewhere).
+void thread_counters(uint64_t& cpu_ns, long faults[2], long switches[2]);
 void input_script(PadState& p);  // NX_INPUT_SCRIPT presses (input_script.cpp), for unattended runs
 
 // Audio: s16 stereo 48 kHz. `done` is called (on any thread) when a submitted buffer has been played.

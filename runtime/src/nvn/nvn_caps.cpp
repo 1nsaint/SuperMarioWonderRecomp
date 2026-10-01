@@ -1,6 +1,7 @@
 // What the device offers that the Android performance plan (docs/nvn/android-perf/PLAN.md, phase 0) decides on:
 // descriptor and pipeline extensions (R3, P1), dynamic state, present timing (P2), and the memory types (R5: is there
 // a host-cached one for reading compute results back). Logged once, when the device is made.
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -43,6 +44,33 @@ void log_device_caps(VkPhysicalDevice physical, const std::vector<VkExtensionPro
         types += "/h" + std::to_string(mp.memoryTypes[k].heapIndex);
     }
     log("nvn/vk: memory types (D device-local, V host-visible, C coherent, $ cached, L lazy):%s", types.c_str());
+}
+
+// NVN's R11G11B10F (0x3f) as B10G11R11_UFLOAT_PACK32 (docs/nvn/android-perf/PHASE4.md G2): the same bits (R in 0-10,
+// G 11-21, B 22-31), half the bytes of the RGBA16F it is stored as elsewhere, for every load, store and sample of the
+// HDR chain. Vulkan converts negative results to 0 as Maxwell does; Metal wrote Inf/NaN into it (the green screens of
+// nvn_format.cpp), so MoltenVK keeps RGBA16F. Android, when the format can be rendered to, blended, sampled with a
+// linear filter and copied; NX_R11G11B10_EMULATE=1: RGBA16F there too.
+bool native_r11g11b10() {
+    static std::atomic<int> state{-1};
+    int s = state.load(std::memory_order_acquire);
+    if (s >= 0) return s == 1;
+#if defined(__ANDROID__)
+    if (!vk_physical()) return false;  // asked before the device exists: not decided yet
+    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+                                      VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                      VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    VkFormatProperties fp{};
+    p_vkGetPhysicalDeviceFormatProperties(vk_physical(), VK_FORMAT_B10G11R11_UFLOAT_PACK32, &fp);
+    bool on = (fp.optimalTilingFeatures & need) == need && !std::getenv("NX_R11G11B10_EMULATE");
+    log("nvn/vk: R11G11B10F %s (format features %#x)", on ? "native (B10G11R11_UFLOAT)" : "as RGBA16F",
+        unsigned(fp.optimalTilingFeatures));
+#else
+    bool on = false;
+#endif
+    state.store(on ? 1 : 0, std::memory_order_release);
+    return on;
 }
 
 // The upload ring takes ~11 MB of CPU writes per course frame (copies and zero padding). Host-visible coherent memory
