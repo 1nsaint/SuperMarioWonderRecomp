@@ -112,7 +112,8 @@ T* get(uint64_t guest) {
 // while a replay may still hold a pointer from get<T>() (nvn_trace.cpp). Under objects_lock.
 void defer_object(std::unique_ptr<Object> o);
 void drain_objects();
-void wait_submits_so_far();  // nvn_queue.cpp: until the submits made so far were replayed (DEBUG.md #59)
+enum { kWaitSync, kWaitFinish, kWaitInvalidate, kWaitFinalize, kWaitSites };  // nvn_queue.cpp's wait sites
+void wait_submits_so_far(int site);  // nvn_queue.cpp: until the submits made so far were replayed (DEBUG.md #59)
 
 template <typename T>
 T& make(uint64_t guest) {

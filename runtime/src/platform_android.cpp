@@ -118,7 +118,20 @@ void sleep_ns(int64_t ns) {
     nanosleep(&ts, nullptr);
 }
 
-void yield() { sched_yield(); }
+// Wonder's job system yields after every job item and in its barriers (svc YieldThread; DEBUG.md #44). NX_YIELD=spin:
+// a short pause on the core instead of the scheduler (the main thread made ~52 voluntary context switches per frame
+// in course, PHASE3.md B5); unset or sched: sched_yield, as before.
+void yield() {
+    static const bool spin = [] {
+        const char* e = std::getenv("NX_YIELD");
+        return e && std::strcmp(e, "spin") == 0;
+    }();
+    if (!spin) {
+        sched_yield();
+        return;
+    }
+    for (int k = 0; k < 64; k++) asm volatile("yield" ::: "memory");
+}
 void set_thread_name(const char* name) { pthread_setname_np(pthread_self(), name); }
 int64_t current_thread_id() { return gettid(); }
 

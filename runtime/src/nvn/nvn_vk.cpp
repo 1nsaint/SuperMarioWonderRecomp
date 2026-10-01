@@ -243,7 +243,7 @@ bool init() {
     make_upload_buffer(256ull << 20);
 #endif
     if (async_gpu())
-        frame_init(g_pool, g_upload, g_upload_ptr, g_upload_size);  // the upload buffer becomes the slots' ring
+        frame_init(g_pool, g_family, g_upload, g_upload_ptr, g_upload_size);  // the upload buffer: the slots' ring
     else
         g_descriptors = make_descriptor_pool();
     log("nvn/vk: %s, Vulkan %u.%u, queue family %u", props.deviceName, VK_API_VERSION_MAJOR(props.apiVersion),

@@ -11,7 +11,9 @@
 #include <chrono>
 #include <array>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <atomic>
 #include <vector>
 
@@ -44,16 +46,40 @@ void submit_done() {
     g_sub_cv.notify_all();
 }
 
+// Where the game waits for the replay (docs/nvn/android-perf/PHASE3.md I1): calls, the ones that blocked and for how
+// long, per 600 presents; frame_ns is this main-thread frame's blocked time, for the hitch lines (frame_time_probe).
+struct WaitSite {
+    const char* name;
+    std::atomic<uint64_t> calls{0}, blocked{0}, ns{0}, frame_ns{0};
+};
+WaitSite g_wait_sites[kWaitSites] = {{"sync wait"}, {"queue finish"}, {"pool invalidate"}, {"pool finalize"}};
+
 // Waits until the submits up to `seq` were replayed (2 s at most: a hung replay is logged, not waited forever).
-void wait_submits(uint64_t seq) {
+void wait_submits(uint64_t seq, int site) {
     if (sync_loose() || !seq) return;
+    WaitSite& w = g_wait_sites[site];
+    w.calls++;
     std::unique_lock lk(g_sub_lock);
     if (g_sub_done >= seq) return;
     uint64_t n = ++g_sub_blocked;
     if (n == 1 || n % 1000 == 0) log("nvn: %llu CPU waits blocked on a submit still being replayed", (unsigned long long)n);
+    uint64_t t0 = plat::monotonic_ns();
     if (!g_sub_cv.wait_for(lk, std::chrono::seconds(2), [seq] { return g_sub_done >= seq; }))
         log("nvn: a CPU wait gave up after 2 s on submit %llu (%llu done)", (unsigned long long)seq,
             (unsigned long long)g_sub_done);
+    uint64_t dt = plat::monotonic_ns() - t0;
+    w.blocked++, w.ns += dt, w.frame_ns += dt;
+}
+
+void log_wait_sites() {
+    std::string line;
+    for (WaitSite& w : g_wait_sites) {
+        char b[128];
+        std::snprintf(b, sizeof b, "; %s %llu calls, %llu blocked %.1f ms", w.name, (unsigned long long)w.calls.exchange(0),
+                      (unsigned long long)w.blocked.exchange(0), double(w.ns.exchange(0)) / 1e6);
+        line += b;
+    }
+    log("nvn: game waits on the replay over 600 presents%s", line.c_str());
 }
 
 uint64_t submits_called() {
@@ -63,7 +89,7 @@ uint64_t submits_called() {
 }  // namespace
 
 // MemoryPoolInvalidateMappedRange / Finalize (nvn_objects.cpp): the CPU reads or frees what submits made so far use.
-void wait_submits_so_far() { wait_submits(submits_called()); }
+void wait_submits_so_far(int site) { wait_submits(submits_called(), site); }
 
 namespace {
 
@@ -91,7 +117,7 @@ void signal_sync(uint64_t guest) {
 // for whatever the timeout, 2 s at most (then the GPU hung and the process ends). Correct results before latency.
 void SyncWait(CPU& c) {
     auto* s = get<Sync>(c.x[0]);
-    if (s) wait_submits(s->seq.load());
+    if (s) wait_submits(s->seq.load(), kWaitSync);
     if (s) worker_wait(s->job);
     if (uint64_t serial = s ? s->serial.load() : 0) gpu_wait(serial);
     c.x[0] = 0;
@@ -136,7 +162,7 @@ void QueueSubmitCommands(CPU& c) {  // (NVNqueue*, int count, const NVNcommandHa
 }
 void QueueFlush(CPU&) {}
 void QueueFinish(CPU&) {
-    wait_submits(submits_called());
+    wait_submits(submits_called(), kWaitFinish);
     worker_finish();
     gpu_wait(gpu_serial());
 }
@@ -221,6 +247,16 @@ void frame_time_probe(CPU& c) {
     }
     static uint64_t bins[5] = {}, frames = 0;
     double ms = double(ld<uint64_t>(c.x[19] + 0x118)) / 19200.0;
+    // A main-thread frame over 33 ms: what it waited on (PHASE3.md I1), 300 lines at most.
+    static int hitches = 0;
+    if (ms >= 33 && hitches < 300) {
+        hitches++;
+        log("hitch: frame %llu, main thread %.1f ms, blocked: sync %.1f, finish %.1f, invalidate %.1f, finalize %.1f ms",
+            (unsigned long long)g_frame.load(), ms, double(g_wait_sites[0].frame_ns) / 1e6,
+            double(g_wait_sites[1].frame_ns) / 1e6, double(g_wait_sites[2].frame_ns) / 1e6,
+            double(g_wait_sites[3].frame_ns) / 1e6);
+    }
+    for (WaitSite& w : g_wait_sites) w.frame_ns = 0;
     bins[ms < 12 ? 0 : ms < 15.83 ? 1 : ms < 20 ? 2 : ms < 33 ? 3 : 4]++;
     if (++frames % 600 == 0) {
         log("nvn: main-thread frame time over 600 frames: <12 ms %llu, <15.8 %llu, <20 %llu, <33 %llu, more %llu",
@@ -253,7 +289,8 @@ void pace_present(int interval) {
     if (next > now) plat::sleep_ns(next - now), now = plat::monotonic_ns();
     static uint64_t presents = 0, at2 = 0;  // how often the game asks for 30 fps (interval 2), per 600 presents
     at2 += interval >= 2;
-    if (++presents % 600 == 0) log("nvn: %llu of the last 600 presents at interval >= 2", (unsigned long long)at2), at2 = 0;
+    if (++presents % 600 == 0)
+        log("nvn: %llu of the last 600 presents at interval >= 2", (unsigned long long)at2), at2 = 0, log_wait_sites();
     uint64_t period = uint64_t(interval) * 16'666'667ull;
     next = (next > now || now - next < period ? next : now) + period;
 }

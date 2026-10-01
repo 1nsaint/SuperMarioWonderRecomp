@@ -411,6 +411,8 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
 
     VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     ci.pNext = &ri;
+    if (render_pass_objects())  // nvn_renderpass.cpp: compatible with every pass of these formats
+        ci.pNext = nullptr, ci.renderPass = compatible_render_pass(key.color_count, key.color_formats, key.depth_format);
     ci.stageCount = nstages;
     ci.pStages = stages;
     ci.pVertexInputState = &vi;
@@ -656,10 +658,12 @@ void forget_image_views(const GpuImage& img) {
     // a scan of every cached view per destroyed texture, a visible share of the replay time).
     auto drop = [&](auto& cache, auto lowest) {
         for (auto it = cache.lower_bound(lowest); it != cache.end() && std::get<0>(it->first) == img.image;) {
+            forget_framebuffers(it->second);
             if (it->second && it->second != img.view) p_vkDestroyImageView(vk_device(), it->second, nullptr);
             it = cache.erase(it);
         }
     };
+    forget_framebuffers(img.view);  // nvn_renderpass.cpp (attachments may use the whole-image view)
     drop(g_sampled_views, std::make_tuple(img.image, VkImageViewType(0), 0u, uint64_t(0), uint64_t(0)));
     for (ViewHit& h : g_view_hits)
         if (std::get<0>(h.key) == img.image) h = {};

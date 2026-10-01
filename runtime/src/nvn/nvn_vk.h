@@ -116,7 +116,7 @@ bool pipelined();  // NX_PIPELINED: fences not waited for, write-backs copied be
 // The extensions and memory types that the Android performance plan depends on, logged once (nvn_caps.cpp).
 void log_device_caps(VkPhysicalDevice physical, const std::vector<VkExtensionProperties>& extensions);
 uint32_t upload_memory_type(uint32_t bits);  // the upload ring's memory type (nvn_caps.cpp)
-void frame_init(VkCommandPool pool, VkBuffer ring, uint8_t* ring_ptr, uint64_t ring_size);
+void frame_init(VkCommandPool pool, uint32_t family, VkBuffer ring, uint8_t* ring_ptr, uint64_t ring_size);
 VkCommandBuffer frame_begin(bool replay);  // NX_ASYNC_GPU, replay: submits with write-backs retired first
 VkSemaphore frame_acquire_semaphore();
 VkSemaphore frame_rendered_semaphore(uint32_t image);
@@ -193,6 +193,16 @@ void clears_flush(VkCommandBuffer cb);  // outside a pass: the pending clears in
 void clears_begin_submit();
 void clears_log();
 bool pass_open();  // a render pass is being recorded
+// Render pass and framebuffer objects instead of dynamic rendering (nvn_renderpass.cpp, NX_RENDER_PASS_OBJECTS).
+bool render_pass_objects();
+VkFormat unused_slot_format();  // a pipeline's format for a colour slot with no image
+VkRenderPass compatible_render_pass(uint32_t count, const VkFormat* colors, VkFormat depth);
+void begin_render_pass(VkCommandBuffer cb, uint32_t count, const VkFormat* formats,
+                       const VkRenderingAttachmentInfo* colors, VkFormat depth_format,
+                       const VkRenderingAttachmentInfo& depth, const VkRenderingAttachmentInfo& stencil,
+                       VkExtent2D extent);
+void forget_framebuffers(VkImageView view);
+void render_pass_log();
 void pass_end_only(VkCommandBuffer cb, int reason);  // draw_end_rendering without the pending clears
 bool pass_open_on(const Targets& t);
 VkExtent2D pass_extent();

@@ -11,6 +11,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#if !defined(_WIN32)
+#include <sys/resource.h>
+#endif
 #include <string>
 #include <vector>
 
@@ -123,7 +126,18 @@ struct Role {
     const char* name;
     uint64_t ticks = 0, cpu_from = 0, wall_from = 0;
     uint64_t on[4] = {};  // ticks found on each cluster (Android)
+    long faults_from[2] = {}, switches_from[2] = {};  // major/minor page faults, voluntary/involuntary switches
 };
+
+// This thread's page faults and context switches (Linux and Android: RUSAGE_THREAD; elsewhere none).
+void thread_usage(long faults[2], long switches[2]) {
+    faults[0] = faults[1] = switches[0] = switches[1] = 0;
+#if defined(RUSAGE_THREAD)
+    rusage u{};
+    if (getrusage(RUSAGE_THREAD, &u) == 0)
+        faults[0] = u.ru_majflt, faults[1] = u.ru_minflt, switches[0] = u.ru_nvcsw, switches[1] = u.ru_nivcsw;
+#endif
+}
 Role g_roles[2] = {{"replay+present"}, {"game main"}};
 
 }  // namespace
@@ -137,9 +151,15 @@ void frame_thread_tick(int role) {
     if (cpu >= 0 && size_t(cpu) < c.cluster.size()) r.on[std::min(c.cluster[size_t(cpu)], 3)]++;
 #endif
     uint64_t now = monotonic_ns();
-    if (!r.wall_from) r.wall_from = now, r.cpu_from = thread_cpu_ns();
+    if (!r.wall_from) r.wall_from = now, r.cpu_from = thread_cpu_ns(), thread_usage(r.faults_from, r.switches_from);
     if (++r.ticks % 600) return;
     uint64_t cpu_ns = thread_cpu_ns();
+    long faults[2], switches[2];
+    thread_usage(faults, switches);
+    log("threads: %s: %ld major and %ld minor page faults, %ld voluntary and %ld involuntary switches over 600", r.name,
+        faults[0] - r.faults_from[0], faults[1] - r.faults_from[1], switches[0] - r.switches_from[0],
+        switches[1] - r.switches_from[1]);
+    for (int k = 0; k < 2; k++) r.faults_from[k] = faults[k], r.switches_from[k] = switches[k];
     double busy = now > r.wall_from ? 100.0 * double(cpu_ns - r.cpu_from) / double(now - r.wall_from) : 0.0;
 #if defined(__ANDROID__)
     log("threads: %s (tid %lld) on clusters 0/1/2/3: %llu/%llu/%llu/%llu of 600, on a CPU %.0f%% of the time, "

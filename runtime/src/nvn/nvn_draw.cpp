@@ -38,6 +38,7 @@ using namespace replay;
 namespace {
 
 bool g_rendering = false;
+bool g_render_pass = false;  // the open pass is a render pass object (nvn_renderpass.cpp), not dynamic rendering
 Targets g_pass;           // what the open pass renders to
 GpuImage* g_pass_images[9];  // their images (8: depth), resolved once per pass for gather_textures
 uint32_t g_pass_written = 0;  // targets the open pass's draws wrote: bit c colour c, bit 8 depth
@@ -109,6 +110,7 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     VkRenderingAttachmentInfo colors[8]{};
     VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     VkExtent2D extent{UINT32_MAX, UINT32_MAX};
+    VkFormat formats[8]{};  // the views' (render pass objects)
     for (uint32_t k = 0; k < t.color_count; k++) {
         colors[k].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
@@ -118,7 +120,8 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
         transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);  // rendered images stay GENERAL (sampled while rendered)
         img->rendered = true;
         uint32_t level = std::min<uint32_t>(t.views.level[k], img->levels - 1);
-        colors[k].imageView = attachment_view(*img, level, t.views.layer[k], view_format(*img, t.views.format[k]));
+        formats[k] = view_format(*img, t.views.format[k]);
+        colors[k].imageView = attachment_view(*img, level, t.views.layer[k], formats[k]);
         // NX_TRACE_CUBES=<first frame>: writes into cube images from that frame on. With 400 from the start, the log
         // ran out at the first 3D scene (frame ~171) and never reached a course load.
         static const char* trace_cubes = std::getenv("NX_TRACE_CUBES");
@@ -164,7 +167,12 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
         if (dimg->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ri.pDepthAttachment = &depth;
         if (dimg->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ri.pStencilAttachment = &stencil;
     }
-    p_vkCmdBeginRendering(cb, &ri);
+    g_render_pass = render_pass_objects();
+    if (g_render_pass)
+        begin_render_pass(cb, t.color_count, formats, colors, dimg ? dimg->format : VK_FORMAT_UNDEFINED, depth, stencil,
+                          extent);
+    else
+        p_vkCmdBeginRendering(cb, &ri);
     g_rendering = true;
     g_pass_written = cleared | fresh;  // as a clear inside the pass: sampling it needs it stored first
     trace_pass("begin: cleared, fresh", t, cleared, fresh);
@@ -318,7 +326,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     key.alpha_to_coverage = g_state.alpha_to_coverage;
     for (uint32_t k = 0; k < t.color_count; k++) {
         GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
-        key.color_formats[k] = img ? view_format(*img, t.views.format[k]) : VK_FORMAT_R8G8B8A8_UNORM;
+        key.color_formats[k] = img ? view_format(*img, t.views.format[k]) : unused_slot_format();
         if (img && (img->nvn_format == 0x3f || t.views.format[k] == 0x3f)) key.ufloat_colors |= 1u << k;  // G4
     }
     GpuImage* dimg = tt.depth ? image_of(tt.depth) : nullptr;
@@ -443,6 +451,7 @@ uint64_t recorded_draws();
 
 void draw_log_stats() {
     dedup_log();
+    render_pass_log();
     written_log();
     sampled_ready_log();
     sets_log();
@@ -468,7 +477,10 @@ void draw_log_stats() {
 void pass_end_only(VkCommandBuffer cb, int reason) {
     if (!g_rendering) return;
     g_pass_ends[reason & 7]++, trace_pass("end: reason", g_pass, uint32_t(reason), 0);
-    p_vkCmdEndRendering(cb);
+    if (g_render_pass)
+        p_vkCmdEndRenderPass(cb);
+    else
+        p_vkCmdEndRendering(cb);
     g_rendering = false;
     // What the pass wrote is read by what follows (sampled, copied, loaded by the next pass), and what it sampled may
     // be rendered over next. The images stay GENERAL, so transition() records no barrier. Metal (MoltenVK) and the

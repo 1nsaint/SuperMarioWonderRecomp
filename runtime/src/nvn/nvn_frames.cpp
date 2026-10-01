@@ -56,6 +56,8 @@ constexpr uint32_t kMaxParts = 8;  // command buffers per submit: chunks, the sp
 constexpr uint64_t kFenceTimeout = 2'000'000'000ull;  // a frame's work takes milliseconds; longer is a hung shader
 
 struct Slot {
+    VkCommandPool pool = VK_NULL_HANDLE;  // its own (the parts reset together), unless NX_CB_RESET=1
+    bool pool_used = false;               // parts were begun since the pool's last reset
     VkCommandBuffer cbs[kMaxParts] = {};  // the parts, queued in order
     VkFence fences[kMaxParts] = {};
     uint32_t part = 0;                    // the part being recorded
@@ -89,6 +91,9 @@ struct Stats {
     uint64_t submits = 0, splits = 0, waited_first = 0, waited_whole = 0, throttled = 0, first_ns = 0, replay_ns = 0;
     uint64_t chunks = 0;
 } g_stats;
+// A command pool per slot, reset whole when the slot is taken again (PHASE3.md C2): resetting each part's command
+// buffer was 6-9% of the replay thread on Adreno (it frees the driver's per-pass objects). NX_CB_RESET=1: as before.
+bool g_slot_pools = false;
 uint64_t g_chunk_draws = 0;           // NX_SUBMIT_CHUNK_DRAWS (frame_init); 0: no chunks
 bool g_chunking = false;              // this submit is chunked (frame_plan_split)
 uint64_t g_chunk_from = UINT64_MAX;   // the draw count at the last part's start (UINT64_MAX: the next call's)
@@ -188,7 +193,7 @@ uint32_t replays_in_flight() {
 }
 
 bool begin_part(VkCommandBuffer cb) {
-    p_vkResetCommandBuffer(cb, 0);
+    if (!g_slot_pools) p_vkResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (p_vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) {
@@ -300,16 +305,22 @@ bool async_gpu() {
 FrameTimes& frame_times() { return g_times; }
 uint64_t frame_completed() { return g_completed; }
 
-void frame_init(VkCommandPool pool, VkBuffer ring, uint8_t* ring_ptr, uint64_t ring_size) {
+void frame_init(VkCommandPool pool, uint32_t family, VkBuffer ring, uint8_t* ring_ptr, uint64_t ring_size) {
     // NX_ASYNC_GPU=1 (or 2): two frames in flight; 3 or 4: that many. A frame is a submit and a present, a slot each.
     // NX_PIPELINED likewise (at most that many submits in flight, whatever the slots).
     uint32_t frames = uint32_t(std::clamp(env_int(pipelined() ? "NX_PIPELINED" : "NX_ASYNC_GPU"), 2, 4));
     g_max_replays = frames;
     g_slot_count = std::min(kMaxSlots, frames * 2);
     VkDevice d = vk_device();
+    g_slot_pools = std::getenv("NX_CB_RESET") == nullptr;
     for (uint32_t k = 0; k < g_slot_count; k++) {
+        if (g_slot_pools) {
+            VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+            pci.queueFamilyIndex = family;
+            g_slot_pools = p_vkCreateCommandPool(d, &pci, nullptr, &g_slots[k].pool) == VK_SUCCESS;
+        }
         VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cai.commandPool = pool;
+        cai.commandPool = g_slot_pools ? g_slots[k].pool : pool;
         cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         cai.commandBufferCount = kMaxParts;
         p_vkAllocateCommandBuffers(d, &cai, g_slots[k].cbs);
@@ -338,6 +349,8 @@ VkCommandBuffer frame_begin(bool replay) {
     if (!pipelined() && replay && g_barrier > g_completed) retire_through(g_barrier);
     Slot& s = g_slots[g_next];
     if (s.serial) retire_through(s.serial);
+    if (g_slot_pools && s.pool_used) p_vkResetCommandPool(vk_device(), s.pool, 0);  // none of its parts is in flight
+    s.pool_used = true;
     g_next = (g_next + 1) % g_slot_count;
     g_begin = g_head;
     s.replay = replay, s.part = s.queued = s.waited = 0, s.split_part = -1, s.ok = true;

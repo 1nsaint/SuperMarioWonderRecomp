@@ -34,6 +34,9 @@ Windows merge (DEBUG-2.md #89). The studies that build on these numbers are in t
 | `watch1` (+ write watches; lock off) | pipelined | 54.4 mean | 45-49 | 16-17.6 ms | 0.5 ms | no hash spike every 4th frame |
 | `heap1` (+ heap zero-fill off, delayed page release; lock off) | pipelined | 53.2 mean | 42-47 | 15.8-18.8 ms | 0.2-1.1 ms | **518/600 present intervals 14-19 ms** (best so far); 41 over 50 ms |
 | `gpu2` (heap1 + `NX_GPU_PROFILE=1`) | pipelined | - | - | - | - | **GPU 18.7 ms/frame at the higher load**: two 960x540 passes 2.8 + 2.4 ms |
+| `c2` (+ PHASE3 C2: a command pool per slot; lock off) | pipelined | 54.0 mean | 47.6-50.4 | **12.5-14.5 ms** | 1.3-2.4 ms | other 1.2 → 2.3 ms (the pool reset): net ~-2 ms. Default on |
+| `c1` (c2 + C1 `NX_RENDER_PASS_OBJECTS=1`) | pipelined | 53.8 mean | 42-50 | 13.6-15.3 ms | 2-4.5 ms | no gain on Adreno, the GPU waits rose; thermal headroom falling over runs. Off by default |
+| `spin1` (c2 + `NX_YIELD=spin`) | pipelined | 52.6 mean | 39-45 | 14.6-16.2 ms | 2-3.4 ms | worse: the game's yields keep sched_yield |
 | `aff1` (R1 + `NX_AFFINITY=1`) | pipelined | 47.1 mean | 30 (interval 2) | 20 ms | 2.5 ms | replay thread 600/600 on the prime core: only ~1 ms less, so the replay is work, not clocks |
 
 Conclusions so far:
@@ -104,3 +107,16 @@ The sampled frames of `pipe1` look clean: the flicker is temporal and needs fram
 - **Memory** (heap1, course): app total PSS 3.29 GB, Graphics 0.97 GB, swap PSS 1.9 GB, MemAvailable ~1.0-1.1 GB.
 - **Temperature** after the 5-minute run: AP (SoC) 52.6 °C, skin and battery 39.9 °C, thermal status LIGHT,
   headroom 0.87 (throttling from 1.0).
+
+## Hitches (PHASE3 I1, `c2`)
+
+- **The study's hypothesis is out.** No `hitch:` line (main-thread frames over 33 ms) waited on the replay: SyncWait,
+  QueueFinish, pool invalidate and finalize all show 0.0 ms blocked.
+- **The hitches are periodic:** every 14-16 frames in course, 45-60 ms on the game's main thread.
+- **Per 600 frames:**
+  - main thread: ~31,000 voluntary context switches (~52 per frame), 35-46 major page faults;
+  - replay thread: ~41,000 voluntary context switches and ~48,000 minor faults (~80 per frame).
+- **Still open:** what the main thread waits on every ~15 frames. The next step is to instrument the kernel's waits
+  (svc WaitSynchronization / ArbitrateLock) per frame.
+- **Measurement hygiene:** thermal headroom drops from 0.87 to 0.83 over back-to-back runs. A/B runs need a pause
+  between them, and the headroom must be logged with each result.

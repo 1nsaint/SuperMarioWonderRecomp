@@ -106,6 +106,7 @@ set(NX_RUNTIME_SOURCES
     runtime/src/frame_stats.cpp
     runtime/src/write_watch.cpp
     runtime/src/nvn/nvn_caps.cpp
+    runtime/src/nvn/nvn_renderpass.cpp
     runtime/src/nvn/nvn_trace.cpp
     runtime/src/nvn/nvn_device.cpp
     runtime/src/nvn/nvn_objects.cpp
