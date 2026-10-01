@@ -26,6 +26,7 @@ adb -s "$S" shell am force-stop "$PKG"
     echo "NX_HANDHELD=1"
     echo "NX_MEM_LIMIT_GB=5"
     echo "NX_DUMP_FRAMES=600"
+    echo "NX_SHOW_WHEN_LOCKED=1"
     echo "NX_INPUT_SCRIPT=$SC"
     for x in "$@"; do echo "$x"; done
 } > "$OUT/config.txt"
@@ -43,6 +44,7 @@ adb -s "$S" push "$OUT/config.txt" "$D/config.txt" > /dev/null
 adb -s "$S" shell rm -rf "'$D/frames'" "'$D/profile.txt'"
 adb -s "$S" shell mkdir -p "'$D/frames'"
 adb -s "$S" logcat -c
+adb -s "$S" shell input keyevent KEYCODE_WAKEUP
 adb -s "$S" shell am start -n "$PKG/android.app.NativeActivity" > /dev/null
 memsample() {
     M=$(adb -s "$S" shell dumpsys meminfo "$PKG" 2>/dev/null)

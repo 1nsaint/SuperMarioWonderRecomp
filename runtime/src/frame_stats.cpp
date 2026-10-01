@@ -98,10 +98,17 @@ void place(int role) {
         bool in = mode == 2 ? cl > 0 : role == 0 ? cl == top : (c.clusters > 2 ? cl > 0 && cl < top : cl == top);
         if (in) CPU_SET(int(k), &set);
     }
-    if (sched_setaffinity(0, sizeof set, &set) != 0) {
-        static bool warned = false;
-        if (!warned) warned = true, log("threads: sched_setaffinity failed");
-    }
+    if (sched_setaffinity(0, sizeof set, &set) == 0) return;
+    // The prime core paused (Android takes it offline when the phone is hot): every big core instead, not wherever
+    // the scheduler left the thread (the little ones included).
+    CPU_ZERO(&set);
+    for (size_t k = 0; k < c.cluster.size(); k++)
+        if (c.cluster[k] > 0) CPU_SET(int(k), &set);
+    static uint64_t failed = 0;
+    if (failed++ % 100 == 0)
+        log("threads: sched_setaffinity to role %d's cores failed %llu times: all big cores instead", role,
+            (unsigned long long)failed);
+    sched_setaffinity(0, sizeof set, &set);
 }
 
 float thermal_headroom() {

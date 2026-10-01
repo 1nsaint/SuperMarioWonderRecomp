@@ -227,6 +227,50 @@ void WindowGetPresentInterval(CPU& c) {
     c.x[0] = w ? uint64_t(w->interval) : 1;
 }
 
+// Our governor over the game's (NX_GOVERNOR; on by default on Android unless NX_MAX_INTERVAL is set). The game's own
+// rule (below) locks 30 fps after 3 frames over 15.83 ms; at 30 fps a phone lowers its clocks, every frame then takes
+// longer, and it never leaves 30 (a Galaxy S23 sat at 30 fps in course with frames that run at 60 when allowed).
+// This one holds 60 (the game's maximum clamped to 1) while it is kept: it watches the main thread's loop period over
+// 120-frame windows, and when two windows in a row had over 20% of their frames past 20 ms (the game would run
+// visibly slow; one window is a scene load), it hands the choice back to the game (30 fps at the right speed) for a
+// while, then tries 60 again, skipping the first 90 frames of a try (the clocks ramp up from the 30-fps level). The
+// wait doubles after each failed try (10 s, 20 s, ... 80 s) and resets once a try holds. Returns 1 (clamp) or 0.
+uint32_t governor_max(uint64_t now) {
+    static const bool on = [] {
+        const char* e = std::getenv("NX_GOVERNOR");
+#if defined(__ANDROID__)
+        return !(e && e[0] == '0');
+#else
+        return e && e[0] == '1';
+#endif
+    }();
+    if (!on) return 0;
+    static uint64_t last = 0, frames = 0, slow = 0, game_until = 0, warm_until = 0, backoff = 600, n = 0;
+    static int bad_windows = 0, held_windows = 0;
+    uint64_t period = last ? now - last : 0;
+    last = now;
+    n++;
+    if (n < game_until) return 0;
+    if (n == game_until) frames = slow = 0, bad_windows = 0, warm_until = n + 90;
+    if (n < warm_until) return 1;
+    frames++, slow += period > 20'000'000ull;
+    if (frames < 120) return 1;
+    bool held = slow * 5 <= frames;
+    if (!held || held_windows++ % 30 == 0)
+        log("nvn: governor: %llu of %llu frames over 20 ms%s", (unsigned long long)slow, (unsigned long long)frames,
+            held ? ": 60 fps holds" : bad_windows ? ": back to the game's choice" : " (once: still 60)");
+    frames = slow = 0;
+    if (held) {
+        bad_windows = 0, backoff = 600;
+        return 1;
+    }
+    held_windows = 0;
+    if (++bad_windows < 2) return 1;
+    game_until = n + backoff;
+    backoff = std::min<uint64_t>(backoff * 2, 4800);
+    return 0;
+}
+
 // Wonder's sead::GameFramework::procFrame_ override (main+e15ec) picks the interval every frame from the main
 // thread's last frame time, fw[0x118] (GetSystemTick ticks from the end of the previous present wait to the end of
 // this frame's calc and draw recording): 2 when it reaches 15.83 ms, locked after 3 slow frames, back to 1 after 15
@@ -238,8 +282,11 @@ void frame_time_probe(CPU& c) {
     plat::perf_hint_thread();  // the game's main thread makes the frame too (ADPF, PLAN.md R2)
     plat::frame_thread_tick(1);
     static const char* max_env = std::getenv("NX_MAX_INTERVAL");
-    if (max_env && std::atoi(max_env) >= 1) {
-        uint32_t max = uint32_t(std::atoi(max_env));
+    static uint32_t game_max = 0;  // the game's own maximum (fw[0x24c]), restored when the governor lets go
+    if (!game_max) game_max = ld<uint32_t>(c.x[19] + 0x24c);
+    uint32_t max = max_env && std::atoi(max_env) >= 1 ? uint32_t(std::atoi(max_env)) : governor_max(plat::monotonic_ns());
+    if (!max && !max_env && game_max) st<uint32_t>(c.x[19] + 0x24c, game_max);
+    if (max >= 1) {
         st<uint32_t>(c.x[19] + 0x24c, max);
         if (ld<uint32_t>(c.x[19] + 0x268) > max) st<uint32_t>(c.x[19] + 0x268, max);
         if (ld<uint32_t>(c.x[19] + 0x264) > max) st<uint32_t>(c.x[19] + 0x264, max);

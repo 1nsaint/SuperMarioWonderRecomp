@@ -120,3 +120,60 @@ The sampled frames of `pipe1` look clean: the flicker is temporal and needs fram
   (svc WaitSynchronization / ArbitrateLock) per frame.
 - **Measurement hygiene:** thermal headroom drops from 0.87 to 0.83 over back-to-back runs. A/B runs need a pause
   between them, and the headroom must be logged with each result.
+
+## Phase 4 (2026-10-01; PHASE4.md)
+
+From here every run uses the new protocol:
+- `tools/phone_thermal_wait.py` gates the start: battery ≤ 33 °C, skin ≤ 34 °C, thermal status 0.
+- `MEMWATCH=0`: no dumpsys stalls.
+- `NX_GPU_PROFILE=3`: GPU busy time from per-part timestamps, no waits.
+- `NX_SHOW_WHEN_LOCKED=1`: the app shows over the lock screen, so unattended runs survive a locked phone.
+- `tools/wonder_run_summary.py`: medians and IQRs over course windows (replay ≥ 8 ms).
+
+### Course results, game lock off (`NX_MAX_INTERVAL=1`)
+
+| Run | Change | fps median (IQR) | replay ms | GPU busy ms | hitches / 600 | > 50 ms / 600 |
+|---|---|---|---|---|---|---|
+| `c2` | before phase 4 (smaps guard) | 52.4 (48.6-57.7) | 12.2 | - | 11.9 (capped) | 11.4 |
+| `h0` | `NX_MEMGUARD=ab` | 48.1 | 12.1 | - | **smaps 16.5, statm 1.5** | 5.8 |
+| `h1b` | H1: statm guard (default) | **57.1** (49.4-59.4) | 11.4 | - | 1.4 | 1.7 |
+| `n1` | + C2b janitor, U1 ring uploads, C4 resolve cache, C5 CallList table, G2 native R11G11B10F, G5A transfer clears | **59.7** (49.9-60.0) | **10.2** | 13.9 | 0.7 | 1.4 |
+
+**H0, the hitch cause, confirmed.** In the smaps windows the guard's read took 38-63 ms (avg 47). Each slow
+main-thread frame overlapped one read almost entirely, e.g. 43.4 ms of a 44.8 ms frame. statm reads take 0.12 ms.
+
+**n1, by section:**
+- World map and first course section: 60 fps, replay ~10 ms, GPU ~13 ms.
+- A later section: 50 fps, replay 13 ms, GPU 14-15 ms. There the replay thread was on the 2.8 GHz cores:
+  `sched_setaffinity` to the prime core failed, presumably because Android pauses the prime core when the phone is
+  hot. A fallback to all big cores is now in `frame_stats.cpp`.
+
+### Default config (the game's lock on): the governor
+
+- **`n1def`, without a governor:** 30 fps in course. At 30 fps the clocks drop, so replay takes 15.9 ms and the
+  game's main-thread frame stays past 15.83 ms: the game never leaves 30.
+- **New `NX_GOVERNOR`** (nvn_queue.cpp; default on Android):
+  - it clamps the game to 60;
+  - it hands back to the game's choice only after two 120-frame windows in a row with > 20% of frames over 20 ms;
+  - each try skips its first 90 frames while the clocks ramp up;
+  - the wait between tries doubles from 10 s up to 80 s.
+- **`n3def`, first version** (one window decided, no warm-up): 60 fps in the first course section, then a scene load
+  sent it to 30 and the next tries failed at the low clocks.
+- **`n4def`, tolerant version:** course median **58.5 fps** (IQR 50.2-60).
+  - The first section holds 60 throughout.
+  - The heavier later section runs 50-54 at 60-fps settings (replay 12, GPU busy 14-15 ms). The governor sends it
+    back to 30 at the right speed instead of a visibly slow 50, and its tries every 10-20 s fail there.
+  - **To hold 60 there, ~2 ms more must come off both the GPU and the replay.**
+
+### Not taken
+
+- **`NX_GPU_TURBO`** (KGSL power control off, the libadrenotools idea): the session's permission policy refused it as a
+  security weakening. Left for the user to decide.
+- **"Nyushu"** (the emulator the user suggested): an APK repackage of a yuzu-family emulator, never published with
+  source, and taken down by DMCA on 2026-03-31. Nothing to reuse.
+
+### Seen, not yet explained
+
+- **Black silhouettes in `h1b`:** in that run the player and the nearby enemies of the first course section rendered
+  black. The pipe section was normal, and h0, n1 and the earlier runs were clean. Intermittent, the dark-Mario class
+  (DEBUG.md #39: ambient/occlusion targets of a re-created texture). To watch in every run's frames.

@@ -579,7 +579,12 @@ extern "C" void android_main(android_app* app) {
     start_memory_guard();
     app->onAppCmd = on_cmd;
     app->onInputEvent = on_input;
-    ANativeActivity_setWindowFlags(app->activity, AWINDOW_FLAG_KEEP_SCREEN_ON | AWINDOW_FLAG_FULLSCREEN, 0);
+    // NX_SHOW_WHEN_LOCKED=1 (unattended test runs, tools/wonder_phone_course.sh): shown over the lock screen and turning
+    // the screen on, as an alarm app; the phone itself stays locked.
+    uint32_t flags = AWINDOW_FLAG_KEEP_SCREEN_ON | AWINDOW_FLAG_FULLSCREEN;
+    if (const char* e = getenv("NX_SHOW_WHEN_LOCKED"); e && e[0] == '1')
+        flags |= AWINDOW_FLAG_SHOW_WHEN_LOCKED | AWINDOW_FLAG_TURN_SCREEN_ON;
+    ANativeActivity_setWindowFlags(app->activity, flags, 0);
 
     struct sigaction sa{};
     sa.sa_sigaction = crash;
