@@ -296,6 +296,11 @@ struct CmdList {
     uint64_t handle = 0;     // its NVNcommandHandle
     uint64_t epoch = 0;      // the texture epoch when its recording ended (nvn_incarnation.cpp): what its draws name
     uint32_t skinned = 0;    // NX_TRACE_SKINLISTS: binds of skinned programs (a vertex input at location 6) in it
+    // count_dispatches' scan of cmds (nvn_frames.cpp, replay thread only): its own DispatchCompute commands and the
+    // handles it calls, valid while cmds has scanned_size entries.
+    size_t scanned_size = SIZE_MAX;
+    uint32_t own_dispatches = 0;
+    std::vector<uint64_t> calls;
 };
 // NX_TRACE_SKINLISTS (nvn_cmd.cpp): follows the lists that bind skinned programs, from recording to replay.
 bool skin_lists_on();

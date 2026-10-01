@@ -237,15 +237,22 @@ bool submit_part(VkCommandBuffer cb, VkFence fence, VkSemaphore wait, VkSemaphor
     return r == VK_SUCCESS;
 }
 
-uint32_t count_dispatches(const CmdList& list, int depth) {  // as replay_list walks it
-    uint32_t n = 0;
-    for (const Cmd& c : list.cmds) {
-        if (c.op == Cmd::DispatchCompute) {
-            n++;
-        } else if (c.op == Cmd::CallList && depth < 8) {
-            if (auto l = command_list(c.a[0])) n += count_dispatches(*l, depth + 1);
+// As replay_list walks it. A list's own commands are scanned once (a recorded list does not change): the walk over
+// every command of the frame took ~4% of the replay thread on the S23.
+uint32_t count_dispatches(const CmdList& list, int depth) {
+    auto& l = const_cast<CmdList&>(list);
+    if (l.scanned_size != l.cmds.size()) {
+        l.own_dispatches = 0, l.calls.clear();
+        for (const Cmd& c : l.cmds) {
+            if (c.op == Cmd::DispatchCompute) l.own_dispatches++;
+            if (c.op == Cmd::CallList) l.calls.push_back(c.a[0]);
         }
+        l.scanned_size = l.cmds.size();
     }
+    uint32_t n = l.own_dispatches;
+    if (depth < 8)
+        for (uint64_t h : l.calls)
+            if (auto called = command_list(h)) n += count_dispatches(*called, depth + 1);
     return n;
 }
 

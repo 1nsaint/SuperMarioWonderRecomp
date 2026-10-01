@@ -203,6 +203,9 @@ static_assert(uint32_t(DescriptorType::Sampler) == VK_DESCRIPTOR_TYPE_SAMPLER &&
                   uint32_t(DescriptorType::StorageBuffer) == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
               "DescriptorType mirrors VkDescriptorType");
 
+uint64_t dynamic_uniform_bindings(const ShaderInfo* s);  // nvn_spirv_patch.cpp
+uint64_t written_storage_bindings(const ShaderInfo* s);
+
 namespace {
 
 bool read_whole(const std::string& path, std::string& out) {
@@ -294,6 +297,9 @@ const ShaderInfo* shader_for(uint64_t code_host, uint64_t control) {
         log("nvn: shader %s %s: %zu bindings, %zu inputs, %zu outputs, c[1] %u bytes", hash.c_str(),
             stage_name(info->stage), info->refl.bindings.size(), info->refl.inputs.size(), info->refl.outputs.size(),
             uint32_t(info->constants.size()));
+    info->dynamic_uniforms = dynamic_uniform_bindings(info.get());
+    info->written_storage = written_storage_bindings(info.get());
+    info->masks_known = true;
     slot = std::move(info);
     return slot.get();
 }

@@ -215,6 +215,11 @@ struct ShaderInfo {
     // vec4[4096]; bind at least const_size rounded up to 16.
     std::vector<uint8_t> constants;
     uint32_t local_size[3] = {1, 1, 1};  // compute: from control +0x748 (equals the SPIR-V's LocalSize)
+    // dynamic_uniform_bindings and written_storage_bindings (nvn_spirv_patch.cpp), computed when the runtime cache
+    // loads the shader so the replay has no lookup per draw (docs/nvn/android-perf/PLAN.md R4). Unknown: computed
+    // on use, as before.
+    bool masks_known = false;
+    uint64_t dynamic_uniforms = 0, written_storage = 0;
 };
 
 // Builds a ShaderInfo from a code block, its control section and the SPIR-V words (no I/O). `resources` = the
