@@ -205,3 +205,23 @@ item has its switch for a leave-one-out run: `NX_JANITOR=0`, `NX_STAGING_MIN=0`,
 1. One default-config run with G1a + G4: the heavier course section needs GPU ≤ ~13 ms to hold 60.
 2. C1r, cooled.
 3. Leave-one-out runs for G1a and G4.
+
+### GPU turbo (`NX_GPU_TURBO=1`, user-approved test, 2026-10-01)
+
+- **What it does:** turns off the Adreno kernel driver's power control (KGSL_PROP_PWRCTRL), so the GPU sits at its top
+  clock, 719 MHz on the S23. Without it the GPU was sampled at 220-295 MHz in course.
+- **Persistence:** the setting outlived the process (719 MHz with the game closed). The app now sets it at every
+  start: off only with `NX_GPU_TURBO=1`, back to normal otherwise.
+
+| Run (default config: governor on) | fps median (IQR) | replay | fence wait | governor fallbacks | AP at the end |
+|---|---|---|---|---|---|
+| `n6def` (G1a + G4, no turbo) | 58.45 (51.5-60) | 9.6 | 1.50 | 2 | 45.7 °C, status 0 |
+| `n7turbo` (G1a, turbo) | **59.9 (58.5-60)** | 9.2 | **0.06** | 1 | 55.1 °C, status 1 (light) |
+| `n5def` (G1a + G4, turbo left on by accident) | 59.9 (56.8-60) | 9.4 | 0.06 | - | 55.2 °C, status 1 |
+
+**Result:** the GPU stops being the limit; the heavier course section holds 60. It costs ~10 °C more on the SoC and
+more battery. It stays opt-in: `NX_GPU_TURBO=1` in config.txt.
+
+**G4 (narrow pass-end barrier):** off by default again. `n6def` (G4 on, turbo off) showed a black band over the
+course background in 2 of 28 frames (15000 and 16200); none of the other 8 runs did. `NX_PASS_BARRIER_NARROW=1` turns
+it back on for study.

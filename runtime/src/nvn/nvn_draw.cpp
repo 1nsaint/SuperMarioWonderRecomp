@@ -43,14 +43,10 @@ bool g_vertex_pending = false;  // a narrow pass-end barrier since the last one 
 uint64_t g_pass_serial = 0, g_vertex_visible_at = 0;  // pass ends so far; the serial a full barrier covered
 uint64_t g_vertex_barriers = 0;
 
+// Off by default (NX_PASS_BARRIER_NARROW=1 turns it on): the first S23 run with it showed a black band over the course
+// background in 2 of 28 frames (phone_n6def, 15000 and 16200), a timing-dependent hazard of the DEBUG-2 #71 class.
 bool narrow_pass_barrier() {
-    static const bool on = [] {
-#if defined(__ANDROID__)
-        return std::getenv("NX_PASS_BARRIER_FULL") == nullptr;
-#else
-        return std::getenv("NX_PASS_BARRIER_NARROW") != nullptr;
-#endif
-    }();
+    static const bool on = std::getenv("NX_PASS_BARRIER_NARROW") != nullptr;
     return on;
 }
 
@@ -526,9 +522,9 @@ void pass_end_only(VkCommandBuffer cb, int reason) {
     // be rendered over next. The images stay GENERAL, so transition() records no barrier. Metal (MoltenVK) and the
     // Intel driver ordered passes anyway; NVIDIA overlaps them, and later passes read half-written tiles: the course
     // HUD in blocks (DEBUG-2 #71). NX_NO_PASS_BARRIER=1: none, as before (bisecting).
-    // Narrow (PHASE4.md G4; Android): the later stages only, so the next pass's vertex work and binning may start
-    // while this one finishes. A draw whose vertex shader samples a rendered image gets a barrier of its own first
-    // (vertex_read_barrier). NX_PASS_BARRIER_FULL=1: ALL_COMMANDS, as before.
+    // Narrow (PHASE4.md G4; NX_PASS_BARRIER_NARROW=1): the later stages only, so the next pass's vertex work and
+    // binning may start while this one finishes. A draw whose vertex shader samples a rendered image gets a barrier
+    // of its own first (vertex_read_barrier). By default ALL_COMMANDS, as before.
     static const bool no_barrier = std::getenv("NX_NO_PASS_BARRIER") != nullptr;
     if (!no_barrier) {
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
