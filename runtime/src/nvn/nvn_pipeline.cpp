@@ -32,6 +32,13 @@ VkFormat view_format(const GpuImage& img, uint32_t nvn) {
     if (!nvn_sizes && vk_block_bytes(f) && vk_block_bytes(img.format))
         bytes = vk_block_bytes(f), ibytes = vk_block_bytes(img.format);
     bool ok = f != VK_FORMAT_UNDEFINED && format_aspect(nvn) == 0 && bw == iw && bh == ih && bytes == ibytes;
+    if (ok && f != img.format && !img.mutable_format) {  // ubwc_flags: an image made without MUTABLE_FORMAT
+        static std::set<std::pair<uint32_t, uint32_t>> not_mutable;
+        if (not_mutable.insert({img.nvn_format, nvn}).second)
+            log("nvn/vk: texture format %#x viewed as %#x, but the image is not mutable: its own format", img.nvn_format,
+                nvn);
+        return img.format;
+    }
     static std::set<std::pair<uint32_t, uint32_t>> logged;
     if (logged.insert({img.nvn_format, nvn}).second && logged.size() <= 40)
         log("nvn/vk: texture format %#x viewed as %#x%s", img.nvn_format, nvn, ok ? "" : " (not compatible: ignored)");

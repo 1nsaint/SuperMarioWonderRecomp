@@ -26,6 +26,8 @@ struct GpuImage {
     bool texels = false;
     VkComponentMapping swizzle{};  // for sampling (attachment views stay identity)
     bool storage = false;          // created with VK_IMAGE_USAGE_STORAGE_BIT (compute shaders write it)
+    bool mutable_format = true;
+    uint64_t rendered_at = 0;      // the pass-end serial of the last pass that rendered into it (nvn_draw.cpp, G4)    // views may use another format (MUTABLE_FORMAT; nvn_image.cpp, ubwc_flags)
     // An R8 texture always read as (1, 1, 1, R) (a glyph cache): stored as RGBA8 (255, 255, 255, R) and sampled
     // without swizzle. MoltenVK returned alpha 0 for that view swizzle on a 2D-array view, so all text was invisible.
     bool alpha_from_r = false;
@@ -116,7 +118,8 @@ bool pipelined();  // NX_PIPELINED: fences not waited for, write-backs copied be
 // The extensions and memory types that the Android performance plan depends on, logged once (nvn_caps.cpp).
 void log_device_caps(VkPhysicalDevice physical, const std::vector<VkExtensionProperties>& extensions);
 uint32_t upload_memory_type(uint32_t bits);
-bool native_r11g11b10();  // NVN 0x3f as B10G11R11_UFLOAT (nvn_caps.cpp; Android)  // the upload ring's memory type (nvn_caps.cpp)
+bool native_r11g11b10();
+bool ubwc_flags();  // MUTABLE_FORMAT only with a format list (nvn_caps.cpp; Android)  // NVN 0x3f as B10G11R11_UFLOAT (nvn_caps.cpp; Android)  // the upload ring's memory type (nvn_caps.cpp)
 void frame_init(VkCommandPool pool, uint32_t family, VkBuffer ring, uint8_t* ring_ptr, uint64_t ring_size);
 VkCommandBuffer frame_begin(bool replay);  // NX_ASYNC_GPU, replay: submits with write-backs retired first
 VkSemaphore frame_acquire_semaphore();

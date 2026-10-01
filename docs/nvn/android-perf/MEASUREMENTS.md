@@ -177,3 +177,31 @@ main-thread frame overlapped one read almost entirely, e.g. 43.4 ms of a 44.8 ms
 - **Black silhouettes in `h1b`:** in that run the player and the nearby enemies of the first course section rendered
   black. The pipe section was normal, and h0, n1 and the earlier runs were clean. Intermittent, the dark-Mario class
   (DEBUG.md #39: ambient/occlusion targets of a re-created texture). To watch in every run's frames.
+
+### Phase 4 status (end of 2026-10-01)
+
+| Step | State | Evidence |
+|---|---|---|
+| T0 tooling | done | thermal gate, summary, build id per run, `MEMWATCH`, `PROFILE_AT`, `GPUWATCH`, show-when-locked |
+| H0 / H1 guard | **done, default** | h0 in-run A/B; h1b |
+| G0 GPU busy (`NX_GPU_PROFILE=3`) | done | n1 and later: 13-15 ms busy in course |
+| C2b janitor | default | in n1 (bundle) |
+| U1 ring uploads | default | n1: staging buffers in course 29 → ~15 per 60 frames |
+| C4 resolve cache, C5 CallList table | default | n1 |
+| G2 native R11G11B10F (Android) | default | n1 frames clean |
+| G5A transfer clears (Android) | default | n1: all 181,613 clear-only passes became transfer clears |
+| Governor (`NX_GOVERNOR`, Android) | default | n4def: 58.5 fps median in the default config |
+| C1r render pass objects | not measured | the phone was unplugged during the cooled run |
+| G1a UBWC-friendly flags (Android) | default, **S23 not yet run** | Mac with `NX_UBWC_FLAGS=1`: no "not mutable" view, frames match |
+| G4 narrow pass-end barrier (Android) | default, **S23 not yet run** | Mac with `NX_PASS_BARRIER_NARROW=1`: 0 frames flagged; vertex-read barriers only for images rendered since the last full barrier |
+| D1 simpleperf | not run | needs the phone |
+| `NX_GPU_TURBO` | refused by the session's permission policy | user decision |
+
+**Bundle attribution.** The n1 gain over h1b (57.1 → 59.7 fps median, replay 11.4 → 10.2 ms) is the bundle's. Each
+item has its switch for a leave-one-out run: `NX_JANITOR=0`, `NX_STAGING_MIN=0`, `NX_RESOLVE_CACHE=0`,
+`NX_CALL_TABLE=0`, `NX_R11G11B10_EMULATE=1`, `NX_CLEARS_PASS=1`, `NX_UBWC_FLAGS=0`, `NX_PASS_BARRIER_FULL=1`.
+
+**Next on the phone:**
+1. One default-config run with G1a + G4: the heavier course section needs GPU ≤ ~13 ms to hold 60.
+2. C1r, cooled.
+3. Leave-one-out runs for G1a and G4.

@@ -73,6 +73,20 @@ bool native_r11g11b10() {
     return on;
 }
 
+// Image flags that keep Adreno's framebuffer compression (PHASE4.md G1a): MUTABLE_FORMAT only with a format list.
+// Android by default (NX_UBWC_FLAGS=0: every colour image mutable, as before); elsewhere NX_UBWC_FLAGS=1.
+bool ubwc_flags() {
+    static const bool on = [] {
+        const char* e = std::getenv("NX_UBWC_FLAGS");
+#if defined(__ANDROID__)
+        return !(e && e[0] == '0');
+#else
+        return e && e[0] == '1';
+#endif
+    }();
+    return on;
+}
+
 // The upload ring takes ~11 MB of CPU writes per course frame (copies and zero padding). Host-visible coherent memory
 // is write-combined (uncached) on Adreno; NX_RING_CACHED=1 asks for a host-cached coherent type first, where the GPU
 // snoops the CPU's caches (PLAN.md R5).

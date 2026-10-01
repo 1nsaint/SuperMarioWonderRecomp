@@ -150,7 +150,27 @@ GpuImage* image_of(uint64_t guest) {
     // (Metal otherwise refuses a 2D view of a 3D texture).
     ci.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : is3d ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0;
     // Colour images may be viewed in another format of the same size (an sRGB view of RGBA8, docs/nvn/DEBUG.md #29).
-    if (aspect == 0 && !img->alpha_from_r) ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    // With ubwc_flags (Android): only where a view can differ, and with the list of those formats, as Adreno keeps
+    // its framebuffer compression (UBWC) on an image whose views are listed; MUTABLE_FORMAT alone turns it off
+    // (docs/nvn/android-perf/PHASE4.md G1a). In every run the only reinterpretation was RGBA8 viewed as sRGB.
+    VkFormat listed[2] = {};
+    VkImageFormatListCreateInfo list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+    img->mutable_format = aspect == 0 && !img->alpha_from_r;
+    if (img->mutable_format && ubwc_flags()) {
+        auto pair = [&](VkFormat a, VkFormat b) {
+            if (img->format != a && img->format != b) return false;
+            listed[0] = a, listed[1] = b;
+            return true;
+        };
+        if (pair(VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB) ||
+            pair(VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB)) {
+            list.viewFormatCount = 2, list.pViewFormats = listed;
+            ci.pNext = &list;
+        } else {
+            img->mutable_format = compressed;  // block formats: no UBWC to keep, views of the sRGB variant as before
+        }
+    }
+    if (img->mutable_format) ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     ci.imageType = is3d ? VK_IMAGE_TYPE_3D : one_d ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
     ci.format = img->format;
     ci.extent = {img->width, ci.imageType == VK_IMAGE_TYPE_1D ? 1 : img->height, is3d ? depth : 1};
