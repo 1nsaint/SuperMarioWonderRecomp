@@ -88,9 +88,22 @@ void check_linear_content(Texture& t) {
     }();
     bool small = hash_small && t.storage_size <= hash_small;
     if ((!t.stride && !small) || !t.memory || !t.image || t.image->rendered ||
-        (t.hashed_submit && t.hashed_submit + 4 > frame))
+        (t.hashed_submit && t.hashed_submit + (t.watched ? 1 : 4) > frame))
         return;
     t.hashed_submit = frame;
+    // 1 MB and more (the glyph cache): page protection says whether the CPU wrote it, every frame, at no cost.
+    if (t.stride && t.storage_size >= (1u << 20)) {
+        if (!t.watched && !t.content_hash) t.watched = plat::write_watch_add(t.memory, t.storage_size);
+        if (t.watched) {
+            if (plat::write_watch_take(t.memory) && t.content_hash) {
+                t.dirty = true;
+                static uint64_t n = 0;
+                if (++n == 1 || n % 100 == 0) log("nvn: watched texture written by the CPU (%llu times)", (unsigned long long)n);
+            }
+            t.content_hash = 1;  // the first take only arms the watch (the image was just uploaded)
+            return;
+        }
+    }
     uint64_t h = hash_memory(reinterpret_cast<const uint8_t*>(t.memory), t.storage_size);
     if (t.content_hash && h != t.content_hash) {
         t.dirty = true;

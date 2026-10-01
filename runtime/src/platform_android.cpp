@@ -375,6 +375,7 @@ namespace {
 struct sigaction g_previous[32];  // the handlers before ours (debuggerd's)
 
 void crash(int sig, siginfo_t* info, void* uc) {
+    if ((sig == SIGSEGV || sig == SIGBUS) && nx::plat::write_watch_fault(info->si_addr)) return;  // write_watch.cpp
     nx::log("CRASH: signal %d, fault address %p", sig, info->si_addr);
     if (nx::self_thread()) {
         nx::CPU& c = nx::current_cpu();

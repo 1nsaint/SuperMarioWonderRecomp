@@ -578,6 +578,7 @@ void free_retired_images(uint64_t completed) {
 // on another thread may hold it), hence the serial after the last submitted. Before the graveyard no image was ever
 // freed: the opening creates textures continuously and the process reached 85 GB (the machine froze).
 Texture::~Texture() {
+    if (watched) plat::write_watch_remove(memory);
     if (!image) return;
     std::lock_guard lk(g_grave_lock);
     if (image->rendered && image->image && memory) {

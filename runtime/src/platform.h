@@ -81,6 +81,12 @@ void perf_hint_frame(int64_t ns);
 // role 0: the thread that replays and presents (frame_presented ticks it); 1: the game's main thread.
 void frame_thread_tick(int role);
 void frame_presented();  // after each present to the display
+// Write watches (write_watch.cpp; page protection, POSIX): add fails when unsupported or full; take re-arms and
+// says whether the range was written since the last take; the crash handler calls fault first (true: handled).
+bool write_watch_add(uint64_t addr, uint64_t size);
+void write_watch_remove(uint64_t addr);
+bool write_watch_take(uint64_t addr);
+bool write_watch_fault(void* at);
 // NX_HEADLESS=1: no visible window (it is created hidden) and nothing presented; frames still render and
 // NX_DUMP_FRAMES still writes them. For unattended test runs.
 bool headless();

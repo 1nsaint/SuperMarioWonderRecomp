@@ -188,6 +188,7 @@ struct Texture : Object {
     // Pitch-linear textures the CPU keeps writing without a flush (Wonder's glyph cache: 2048x8192 R8): their memory
     // is hashed at most once per submit that samples them, and a change means an upload.
     uint64_t content_hash = 0, hashed_submit = 0;
+    bool watched = false;  // large ones: a write watch instead of the hash (write_watch.cpp)
     std::shared_ptr<GpuImage> image;  // made on first use by the GPU
     std::atomic<uint64_t> last_sampled{0};  // host ns of the last draw that sampled it (kept textures, nvn_objects.cpp)
     ~Texture();  // nvn_vk.cpp: the image is freed once the GPU is done with it
