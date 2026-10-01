@@ -115,6 +115,7 @@ bool async_gpu();  // the slots are in use (either mode)
 bool pipelined();  // NX_PIPELINED: fences not waited for, write-backs copied before gpu_submit returns
 // The extensions and memory types that the Android performance plan depends on, logged once (nvn_caps.cpp).
 void log_device_caps(VkPhysicalDevice physical, const std::vector<VkExtensionProperties>& extensions);
+uint32_t upload_memory_type(uint32_t bits);  // the upload ring's memory type (nvn_caps.cpp)
 void frame_init(VkCommandPool pool, VkBuffer ring, uint8_t* ring_ptr, uint64_t ring_size);
 VkCommandBuffer frame_begin(bool replay);  // NX_ASYNC_GPU, replay: submits with write-backs retired first
 VkSemaphore frame_acquire_semaphore();

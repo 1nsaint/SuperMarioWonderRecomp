@@ -26,6 +26,11 @@ Windows merge (DEBUG-2.md #89). The studies that build on these numbers are in t
 | `pipe1` (the user's run replayed) | pipelined | 43.8 mean | **32.0** | **19.6 ms** | 5.3 ms | pipeline cache warm (0.5 ms per pipeline) |
 | `gpu1` (same, GPU profile on) | pipelined | 32.4 mean | - | - | - | **GPU 17.0 ms/frame**; one 960x540 pass 5.1 ms |
 | `chunk1` (PLAN.md R1: parts every 150 draws) | pipelined | 45.0 mean | 30 (interval 2) | 21 ms | **1.0 ms** | submit thread ~30 → ~25 ms; 2 early parts + the split per frame |
+| `sets1` (+ R3 set cache, R4 masks/scan) | pipelined | 45.9 mean | 30 (interval 2) | 18-19 ms | 1.5-2.7 ms | sets reused 36% |
+| `ring1` (+ `NX_RING_CACHED=1`) | pipelined | 48.8 mean | 30 (interval 2) | 19 ms | 1-2 ms | no gain: the ring stays write-combined |
+| `dyn1` (+ dynamic uniform offsets, Android default) | pipelined | 46.8 mean | 30 (interval 2) | 17.5-19.8 ms | 2-3 ms | sets reused 82%; images correct |
+| `rt1` (+ `NX_REPLAY_THREAD=1`) | pipelined | 47.3 mean, 12 < 30 | 30 (interval 2) | 18.7-20.9 ms | 0.5-1.6 ms | no clear gain |
+| `max1` (dyn1 + `NX_MAX_INTERVAL=1`) | pipelined | 53.1 mean, 1 < 30 | **48-50** | **16-17 ms** | 0.2-1.1 ms | the 30-fps lock off: CPU clocks stay up; 77% of present intervals 14-19 ms; the game runs ~17% slow when a frame is late |
 | `aff1` (R1 + `NX_AFFINITY=1`) | pipelined | 47.1 mean | 30 (interval 2) | 20 ms | 2.5 ms | replay thread 600/600 on the prime core: only ~1 ms less, so the replay is work, not clocks |
 
 Conclusions so far:
@@ -74,3 +79,13 @@ The sampled frames of `pipe1` look clean: the flicker is temporal and needs fram
 - **ADPF** now has 2 threads (the game's main thread joined).
 - **Conclusion:** the replay is ~20 ms of CPU work per frame whatever the core. Phase 2 (R3/R4, less work per draw) is
   what brings 60 fps; R1 is kept on by default on Android.
+
+## Phase 2 notes (2026-10-01)
+
+- **Dynamic uniform offsets** (`ProgramLayout::dynamic`, nvn_pipeline.cpp) work on Adreno. On the Mac (MoltenVK) every
+  frame came out black and the GPU hung near the world map, even with the set cache off and without compute. The
+  offsets logged were right: `UNIFORM_BUFFER_DYNAMIC`, 256-aligned, binding 0 written by both stages. The suspect is
+  MoltenVK with a dynamic binding shared by two stages. Default on Android only; `NX_DYNAMIC_UBO=1` forces it
+  elsewhere.
+- **At 30 fps the replay looks ~2-3 ms slower than it is.** The replay thread is idle half the time, and the clocks
+  drop. `max1`, with the lock off, gives the cost at full clocks: ~16-17 ms.

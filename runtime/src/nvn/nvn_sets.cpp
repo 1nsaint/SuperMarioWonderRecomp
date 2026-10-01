@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string>
 
 #include "nvn_draw_state.h"
 
@@ -239,6 +240,8 @@ struct Descriptors {
     std::vector<VkDescriptorBufferInfo> buffers;
     std::vector<VkDescriptorImageInfo> images;
     std::vector<SetWrite> key;  // scratch for the set cache
+    uint64_t dynamic = 0;              // set 0 bindings given a dynamic offset (ProgramLayout::dynamic)
+    uint32_t dynamic_offset[64] = {};  // their ring offsets, by binding
 };
 Descriptors g_sets;
 
@@ -346,6 +349,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
         d = Descriptors{};
     else
         d.writes.clear(), d.set_index.clear(), d.buffers.clear(), d.images.clear();
+    d.dynamic = 0;
     const bool every_set = draw_slow(kSlowEmptySets), shared = !draw_slow(kSlowUploads), cached = set_cache_on();
     for (int k = 0; k < 4; k++) d.sets[k] = every_set ? descriptor_set(layout.sets[k]) : VK_NULL_HANDLE;
     auto set_of = [&](uint32_t k) {  // with the set cache, made (or found) in bind_sets
@@ -435,12 +439,17 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
                 }
                 default: info = buffer_of(cb, nullptr, 0x1000, 16, false, false); break;
             }
+            VkDescriptorType type = VkDescriptorType(b.type);
+            if (b.set == 0 && b.binding < 64 && layout.dynamic >> b.binding & 1) {  // the offset goes with the bind
+                d.dynamic |= 1ull << b.binding, d.dynamic_offset[b.binding] = uint32_t(info.offset);
+                info.offset = 0, type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+            }
             buffers.push_back(info);
             VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             w.dstSet = set_of(b.set);
             w.dstBinding = b.binding;
             w.descriptorCount = 1;
-            w.descriptorType = VkDescriptorType(b.type);
+            w.descriptorType = type;
             w.pBufferInfo = &buffers.back();
             writes.push_back(w);
         }
@@ -496,8 +505,15 @@ void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayou
     Descriptors& d = g_sets;
     if (set_cache_on()) resolve_sets(layout);
     if (!d.writes.empty()) p_vkUpdateDescriptorSets(vk_device(), uint32_t(d.writes.size()), d.writes.data(), 0, nullptr);
+    // Set 0's dynamic offsets, in binding order (every dynamic binding of the layout; one no stage wrote: 0).
+    uint32_t offsets[64];
+    uint32_t noff = 0;
+    for (uint64_t m = layout.dynamic; m; m &= m - 1) {
+        uint32_t b = uint32_t(__builtin_ctzll(m));
+        offsets[noff++] = d.dynamic >> b & 1 ? d.dynamic_offset[b] : 0;
+    }
     if (draw_slow(kSlowEmptySets)) {
-        p_vkCmdBindDescriptorSets(cb, point, layout.layout, 0, 4, d.sets, 0, nullptr);
+        p_vkCmdBindDescriptorSets(cb, point, layout.layout, 0, 4, d.sets, noff, offsets);
         return;
     }
     for (uint32_t k = 0; k < 4;) {
@@ -507,7 +523,7 @@ void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayou
         }
         uint32_t n = 1;
         while (k + n < 4 && d.sets[k + n]) n++;
-        p_vkCmdBindDescriptorSets(cb, point, layout.layout, k, n, d.sets + k, 0, nullptr);
+        p_vkCmdBindDescriptorSets(cb, point, layout.layout, k, n, d.sets + k, k == 0 ? noff : 0, offsets);
         k += n;
     }
 }

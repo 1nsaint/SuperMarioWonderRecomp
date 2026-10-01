@@ -206,6 +206,29 @@ const ProgramLayout& program_layout(const std::vector<const ShaderInfo*>& stages
             vb.stageFlags |= stage_bit(s->stage);
         }
     ProgramLayout pl;
+    // On by default on Android only (NX_DYNAMIC_UBO=0/1 overrides): on the Mac (MoltenVK) every frame came out black
+    // and the GPU hung a few thousand frames in (2026-10-01), cause not found yet.
+    static const uint32_t max_dynamic = [] {
+        const char* e = std::getenv("NX_DYNAMIC_UBO");
+#if defined(__ANDROID__)
+        if (e && e[0] == '0') return 0u;
+#else
+        if (!e || e[0] != '1') return 0u;
+#endif
+        VkPhysicalDeviceProperties p{};
+        p_vkGetPhysicalDeviceProperties(vk_physical(), &p);
+        log("nvn/vk: uniform buffers bound with dynamic offsets (up to %u per layout)",
+            p.limits.maxDescriptorSetUniformBuffersDynamic);
+        return p.limits.maxDescriptorSetUniformBuffersDynamic;
+    }();
+    uint64_t dynamic = 0;
+    for (auto& [n, b] : sets[0])
+        if (b.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b.descriptorCount == 1 && n < 64) dynamic |= 1ull << n;
+    if (dynamic && uint32_t(__builtin_popcountll(dynamic)) <= max_dynamic) {
+        for (auto& [n, b] : sets[0])
+            if (n < 64 && dynamic >> n & 1) b.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        pl.dynamic = dynamic;
+    }
     for (int k = 0; k < 4; k++) {
         std::vector<VkDescriptorSetLayoutBinding> v;
         for (auto& [n, b] : sets[k]) v.push_back(b);

@@ -50,6 +50,9 @@ struct ByteKeyHash {
 struct ProgramLayout {
     VkDescriptorSetLayout sets[4] = {};
     VkPipelineLayout layout = VK_NULL_HANDLE;
+    // Set 0 bindings (< 64) that are UNIFORM_BUFFER_DYNAMIC: their ring offset goes with vkCmdBindDescriptorSets, so
+    // the set depends only on which buffers and sizes it names (the set cache, nvn_sets.cpp). NX_DYNAMIC_UBO=0: none.
+    uint64_t dynamic = 0;
 };
 const ProgramLayout& program_layout(const std::vector<const ShaderInfo*>& stages);
 
