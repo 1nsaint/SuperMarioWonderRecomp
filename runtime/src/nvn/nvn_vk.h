@@ -113,6 +113,8 @@ void debug_dump_add(uint64_t texture);  // nvn_debug.cpp: read back at the end o
 // full, or when something waits for them.
 bool async_gpu();  // the slots are in use (either mode)
 bool pipelined();  // NX_PIPELINED: fences not waited for, write-backs copied before gpu_submit returns
+// The extensions and memory types that the Android performance plan depends on, logged once (nvn_caps.cpp).
+void log_device_caps(VkPhysicalDevice physical, const std::vector<VkExtensionProperties>& extensions);
 void frame_init(VkCommandPool pool, VkBuffer ring, uint8_t* ring_ptr, uint64_t ring_size);
 VkCommandBuffer frame_begin(bool replay);  // NX_ASYNC_GPU, replay: submits with write-backs retired first
 VkSemaphore frame_acquire_semaphore();
@@ -132,6 +134,9 @@ size_t frame_plan_split(const std::vector<std::shared_ptr<CmdList>>& lists);
 VkCommandBuffer frame_split(VkCommandBuffer cb);
 VkCommandBuffer frame_after_dispatch(VkCommandBuffer cb);
 VkCommandBuffer frame_cb(VkCommandBuffer cb);
+// Chunks (nvn_frames.cpp, NX_SUBMIT_CHUNK_DRAWS): for replay_list before each command, with the draws done so far;
+// returns the command buffer to go on with (a new part once enough draws were recorded).
+VkCommandBuffer frame_chunk(VkCommandBuffer cb, uint64_t draws, bool pass_open);
 // Host time inside vkQueueSubmit (with vkEndCommandBuffer: Metal encoding) and inside vkWaitForFences, running
 // totals in every mode (the synchronous path adds its own).
 struct FrameTimes {
@@ -186,6 +191,7 @@ uint32_t clears_apply(const Targets& t, VkRenderingAttachmentInfo* colors, VkRen
 void clears_flush(VkCommandBuffer cb);  // outside a pass: the pending clears in a pass of their own
 void clears_begin_submit();
 void clears_log();
+bool pass_open();  // a render pass is being recorded
 void pass_end_only(VkCommandBuffer cb, int reason);  // draw_end_rendering without the pending clears
 bool pass_open_on(const Targets& t);
 VkExtent2D pass_extent();

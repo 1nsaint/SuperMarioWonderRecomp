@@ -489,6 +489,7 @@ void draw_end_rendering(VkCommandBuffer cb, int reason) {  // and the pending cl
     pass_end_only(cb, reason);
     clears_flush(cb);
 }
+bool pass_open() { return g_rendering; }
 bool pass_open_on(const Targets& t) { return g_rendering && targets_same(g_pass, t); }
 VkExtent2D pass_extent() { return g_pass_extent; }
 void pass_begin(VkCommandBuffer cb, const Targets& t) { begin_rendering(cb, t); }

@@ -77,6 +77,10 @@ size_t touch_overlay(OverlayShape* out, size_t max);
 // a frame's work took `ns`.
 void perf_hint_thread();
 void perf_hint_frame(int64_t ns);
+// Frame threads and present intervals (frame_stats.cpp): the cores they run on, their CPU time, NX_AFFINITY.
+// role 0: the thread that replays and presents (frame_presented ticks it); 1: the game's main thread.
+void frame_thread_tick(int role);
+void frame_presented();  // after each present to the display
 // NX_HEADLESS=1: no visible window (it is created hidden) and nothing presented; frames still render and
 // NX_DUMP_FRAMES still writes them. For unattended test runs.
 bool headless();

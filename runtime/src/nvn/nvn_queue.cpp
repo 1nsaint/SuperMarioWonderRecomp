@@ -209,6 +209,8 @@ void WindowGetPresentInterval(CPU& c) {
 void frame_time_probe(CPU& c) {
     const LoadedModule* m = module_at(c.x[30]);
     if (!m || c.x[30] - m->base != 0xe16ac || !c.x[19]) return;
+    plat::perf_hint_thread();  // the game's main thread makes the frame too (ADPF, PLAN.md R2)
+    plat::frame_thread_tick(1);
     static const char* max_env = std::getenv("NX_MAX_INTERVAL");
     if (max_env && std::atoi(max_env) >= 1) {
         uint32_t max = uint32_t(std::atoi(max_env));

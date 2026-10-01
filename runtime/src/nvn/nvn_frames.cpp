@@ -18,6 +18,12 @@
 // g_max_replays submits are in flight (the oldest is waited for before another is queued).
 // NX_PIPELINED_NO_SPLIT=1: no split (a submit with write-backs is waited for whole).
 //
+// Chunks (docs/nvn/android-perf/PLAN.md R1): a submit's replay is also queued in parts while it is recorded, at the
+// first point with no render pass open after NX_SUBMIT_CHUNK_DRAWS draws (at twice that, a pass is ended for it), so
+// the GPU starts on a frame a few milliseconds into its replay instead of at its end (or at the split). At most
+// kMaxParts command buffers per submit; each begins with the barrier that orders it after everything queued before.
+// Default 150 on Android, 0 (off) elsewhere: MoltenVK encodes Metal inside each vkQueueSubmit.
+//
 // NX_ASYNC_GPU=<frames in flight> (the older experiment): a submit that has write-backs is retired before the next
 // replay begins (it may read them) and before a wait on it returns; the game's waits retire slots under the GPU lock.
 //
@@ -46,25 +52,24 @@ std::recursive_mutex& gpu_lock();  // nvn_vk.cpp
 namespace {
 
 constexpr uint32_t kMaxSlots = 8;
+constexpr uint32_t kMaxParts = 8;  // command buffers per submit: chunks, the split, the last part
 constexpr uint64_t kFenceTimeout = 2'000'000'000ull;  // a frame's work takes milliseconds; longer is a hung shader
 
 struct Slot {
-    VkCommandBuffer cb = VK_NULL_HANDLE;
-    VkCommandBuffer cb_rest = VK_NULL_HANDLE;       // pipelined: what follows the last dispatch
-    VkFence fence = VK_NULL_HANDLE;                 // of the last (or only) part
-    VkFence fence_first = VK_NULL_HANDLE;           // pipelined: of the part up to the last dispatch
+    VkCommandBuffer cbs[kMaxParts] = {};  // the parts, queued in order
+    VkFence fences[kMaxParts] = {};
+    uint32_t part = 0;                    // the part being recorded
+    uint32_t queued = 0;                  // bit k: part k was queued (its fence will signal)
+    uint32_t waited = 0;                  // parts below this were waited for (the ring may reuse their data)
+    int split_part = -1;                  // pipelined: the part that ends with the last dispatch
+    bool ok = true;                       // the current part is recording (a failed begin leaves nothing to queue)
     VkSemaphore acquired = VK_NULL_HANDLE;          // a present's swapchain image
     VkDescriptorPool descriptors = VK_NULL_HANDLE;  // made on first use (presents need none)
     bool descriptors_used = false;
     uint64_t serial = 0;    // in flight until retired; 0: free
     uint64_t ring_end = 0;  // the ring position after this submit's data
     std::vector<WriteBack> write_backs;
-    bool replay = false;       // a submit's replay (not a present)
-    bool split = false;        // frame_split ran: the rest is recorded into cb_rest
-    bool has_first = false;    // the first part was queued (fence_first will signal)
-    bool has_last = false;     // the last part was queued (fence will signal)
-    bool rest_ok = true;       // cb_rest is recording (a failed begin leaves nothing to queue)
-    bool first_waited = false;  // fence_first was waited for (the ring may reuse the first part's data)
+    bool replay = false;  // a submit's replay (not a present)
     uint64_t binds_at_split = 0;  // replay::written_bind_count() at the split
     uint64_t begin_ns = 0;
 };
@@ -82,7 +87,11 @@ uint32_t g_plan_dispatches = 0, g_seen_dispatches = 0;  // pipelined: the submit
 // waits for the oldest submit (two in flight), and how far into the replay the split came.
 struct Stats {
     uint64_t submits = 0, splits = 0, waited_first = 0, waited_whole = 0, throttled = 0, first_ns = 0, replay_ns = 0;
+    uint64_t chunks = 0;
 } g_stats;
+uint64_t g_chunk_draws = 0;           // NX_SUBMIT_CHUNK_DRAWS (frame_init); 0: no chunks
+bool g_chunking = false;              // this submit is chunked (frame_plan_split)
+uint64_t g_chunk_from = UINT64_MAX;   // the draw count at the last part's start (UINT64_MAX: the next call's)
 std::atomic<uint64_t> g_game_waits{0}, g_game_wait_ns{0};  // the game's waits that blocked (NX_ASYNC_GPU only)
 
 // The upload ring (the synchronous path's upload buffer). Positions only grow; position p is byte p % size. What
@@ -140,16 +149,21 @@ void apply_write_backs(Slot& s) {
 // Waits for the oldest submit in flight and finishes it: compute results to guest memory (if not there yet), its
 // descriptor pool and ring stretch free again, images destroyed before it freed. False when nothing is in flight.
 // Fences complete in submission order on the one queue, so retiring oldest first keeps write-backs in order.
+// The fences of the queued parts below `upto`.
+uint32_t queued_fences(const Slot& s, uint32_t upto, VkFence* out) {
+    uint32_t n = 0;
+    for (uint32_t k = 0; k < upto && k < kMaxParts; k++)
+        if (s.queued >> k & 1) out[n++] = s.fences[k];
+    return n;
+}
+
 bool retire_oldest() {
     Slot* s = nullptr;
     for (uint32_t k = 0; k < g_slot_count; k++)
         if (g_slots[k].serial && (!s || g_slots[k].serial < s->serial)) s = &g_slots[k];
     if (!s) return false;
-    VkFence fences[2];
-    uint32_t n = 0;
-    if (s->has_first) fences[n++] = s->fence_first;
-    if (s->has_last) fences[n++] = s->fence;
-    wait_fences(fences, n);
+    VkFence fences[kMaxParts];
+    wait_fences(fences, queued_fences(*s, kMaxParts, fences));
     apply_write_backs(*s);
     if (s->descriptors_used) p_vkResetDescriptorPool(vk_device(), s->descriptors, 0);
     s->descriptors_used = false;
@@ -240,6 +254,18 @@ int env_int(const char* name) {
     return e ? std::atoi(e) : 0;
 }
 
+// Ends the part being recorded (and its render pass; pending clears stay pending, as they are not tied to a command
+// buffer: the next pass on their targets takes them as load operations), queues it, and begins the next one.
+VkCommandBuffer next_part(Slot& s) {
+    pass_end_only(s.cbs[s.part], 0);
+    if (s.ok && submit_part(s.cbs[s.part], s.fences[s.part], VK_NULL_HANDLE, VK_NULL_HANDLE)) s.queued |= 1u << s.part;
+    s.part++;
+    s.ok = begin_part(s.cbs[s.part]);
+    if (!s.ok) log("nvn/vk: a part of a submit could not begin: it is lost");
+    g_chunk_from = UINT64_MAX;
+    return s.cbs[s.part];
+}
+
 }  // namespace
 
 // On by default on macOS only (course 1-1 headless: ~50 -> ~59 fps there; DEBUG.md #61): MoltenVK encodes Metal inside
@@ -275,20 +301,24 @@ void frame_init(VkCommandPool pool, VkBuffer ring, uint8_t* ring_ptr, uint64_t r
     g_slot_count = std::min(kMaxSlots, frames * 2);
     VkDevice d = vk_device();
     for (uint32_t k = 0; k < g_slot_count; k++) {
-        VkCommandBuffer cbs[2] = {};
         VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         cai.commandPool = pool;
         cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cai.commandBufferCount = 2;
-        p_vkAllocateCommandBuffers(d, &cai, cbs);
-        g_slots[k].cb = cbs[0], g_slots[k].cb_rest = cbs[1];
+        cai.commandBufferCount = kMaxParts;
+        p_vkAllocateCommandBuffers(d, &cai, g_slots[k].cbs);
         VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        p_vkCreateFence(d, &fci, nullptr, &g_slots[k].fence);
-        p_vkCreateFence(d, &fci, nullptr, &g_slots[k].fence_first);
+        for (VkFence& f : g_slots[k].fences) p_vkCreateFence(d, &fci, nullptr, &f);
         VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         p_vkCreateSemaphore(d, &sci, nullptr, &g_slots[k].acquired);
     }
     g_ring = ring, g_ring_ptr = ring_ptr, g_ring_size = ring_size;
+#if defined(__ANDROID__)
+    g_chunk_draws = std::getenv("NX_SUBMIT_CHUNK_DRAWS") ? uint64_t(env_int("NX_SUBMIT_CHUNK_DRAWS")) : 150;
+#else
+    g_chunk_draws = uint64_t(env_int("NX_SUBMIT_CHUNK_DRAWS"));
+#endif
+    if (g_chunk_draws) log("nvn/vk: submits queued in parts every %llu draws (NX_SUBMIT_CHUNK_DRAWS)",
+                           (unsigned long long)g_chunk_draws);
     if (pipelined())
         log("nvn/vk: pipelined fences (NX_PIPELINED): %u submits in flight, %u slots", frames, g_slot_count);
     else
@@ -303,15 +333,16 @@ VkCommandBuffer frame_begin(bool replay) {
     if (s.serial) retire_through(s.serial);
     g_next = (g_next + 1) % g_slot_count;
     g_begin = g_head;
-    s.replay = replay, s.split = s.has_first = s.has_last = s.first_waited = false, s.rest_ok = true;
+    s.replay = replay, s.part = s.queued = s.waited = 0, s.split_part = -1, s.ok = true;
     s.begin_ns = plat::monotonic_ns();
     g_plan_dispatches = g_seen_dispatches = 0;
-    if (!begin_part(s.cb)) {
+    g_chunking = false;
+    if (!begin_part(s.cbs[0])) {
         g_current = nullptr;
         return VK_NULL_HANDLE;
     }
     g_current = &s;
-    return s.cb;
+    return s.cbs[0];
 }
 
 // ---- pipelined: the split after the last dispatch ----------------------------------------------------------------
@@ -319,6 +350,7 @@ VkCommandBuffer frame_begin(bool replay) {
 size_t frame_plan_split(const std::vector<std::shared_ptr<CmdList>>& lists) {
     static const bool off = std::getenv("NX_PIPELINED_NO_SPLIT") != nullptr;
     g_plan_dispatches = g_seen_dispatches = 0;
+    g_chunking = g_chunk_draws && g_current, g_chunk_from = UINT64_MAX;  // not with the profile (not called then)
     // NX_COMPUTE_SEPARATE's write-backs are not counted by written_bind_count(): such a submit is waited for whole.
     if (!pipelined() || off || !g_current || replay::written_separate()) return SIZE_MAX;
     size_t last = SIZE_MAX;
@@ -327,22 +359,30 @@ size_t frame_plan_split(const std::vector<std::shared_ptr<CmdList>>& lists) {
     return last;
 }
 
-VkCommandBuffer frame_cb(VkCommandBuffer cb) { return g_current && g_current->split ? g_current->cb_rest : cb; }
+VkCommandBuffer frame_cb(VkCommandBuffer cb) { return g_current ? g_current->cbs[g_current->part] : cb; }
 
 VkCommandBuffer frame_split(VkCommandBuffer cb) {
-    if (!pipelined() || !g_current || g_current->split || cb != g_current->cb) return frame_cb(cb);
-    Slot& s = *g_current;
-    // The pass a list left open ends here; clears still pending stay pending (they are not tied to a command buffer:
-    // the next pass on their targets takes them as load operations, as without the split).
-    pass_end_only(cb, 0);
-    s.has_first = submit_part(s.cb, s.fence_first, VK_NULL_HANDLE, VK_NULL_HANDLE);
-    if (!s.has_first) log("nvn/vk: the first part of a split submit was not queued: its compute results are lost");
-    s.split = true;
-    s.binds_at_split = replay::written_bind_count();
-    g_stats.splits++, g_stats.first_ns += plat::monotonic_ns() - s.begin_ns;
-    s.rest_ok = begin_part(s.cb_rest);
-    if (!s.rest_ok) log("nvn/vk: the rest of a split submit could not begin: it is lost");
-    return s.cb_rest;
+    Slot* s = g_current;
+    if (!pipelined() || !s || s->split_part >= 0 || cb != s->cbs[s->part] || s->part + 1 >= kMaxParts)
+        return frame_cb(cb);
+    s->split_part = int(s->part);
+    s->binds_at_split = replay::written_bind_count();
+    g_stats.splits++, g_stats.first_ns += plat::monotonic_ns() - s->begin_ns;
+    VkCommandBuffer next = next_part(*s);
+    if (!(s->queued >> s->split_part & 1))
+        log("nvn/vk: the part with a split submit's dispatches was not queued: its compute results are lost");
+    return next;
+}
+
+VkCommandBuffer frame_chunk(VkCommandBuffer cb, uint64_t draws, bool pass_open) {
+    Slot* s = g_current;
+    // Two parts are kept for the split and the last one.
+    if (!g_chunking || !s || cb != s->cbs[s->part] || s->part + 2 >= kMaxParts) return cb;
+    if (g_chunk_from == UINT64_MAX) g_chunk_from = draws;
+    uint64_t since = draws - g_chunk_from;
+    if (since < g_chunk_draws || (pass_open && since < 2 * g_chunk_draws)) return cb;
+    g_stats.chunks++;
+    return next_part(*s);
 }
 
 VkCommandBuffer frame_after_dispatch(VkCommandBuffer cb) {
@@ -371,16 +411,18 @@ void frame_submit(VkSemaphore wait, VkSemaphore signal, std::vector<WriteBack> w
     g_current = nullptr;
     if (pipelined() && s.replay) {
         g_stats.submits++;
-        if (s.split) g_stats.replay_ns += plat::monotonic_ns() - s.begin_ns;
+        if (s.split_part >= 0) g_stats.replay_ns += plat::monotonic_ns() - s.begin_ns;
     }
-    s.has_last = s.rest_ok && submit_part(s.split ? s.cb_rest : s.cb, s.fence, wait, signal);
-    if (!s.has_last && !s.has_first) return;  // nothing ran: no results to copy back, the slot stays free
+    const bool has_last = s.ok && submit_part(s.cbs[s.part], s.fences[s.part], wait, signal);
+    if (has_last) s.queued |= 1u << s.part;
+    if (!s.queued) return;  // nothing ran: no results to copy back, the slot stays free
     s.serial = ++g_submitted;
     s.ring_end = g_head;
     s.write_backs = std::move(write_backs);
     // The dispatches were in a part that never ran: the buffers hold no results, and copying them back would put the
     // inputs (or older data) over guest memory.
-    if (s.split && !s.has_first) s.write_backs.clear();
+    const bool has_first = s.split_part >= 0 && (s.queued >> s.split_part & 1);
+    if (s.split_part >= 0 && !has_first) s.write_backs.clear();
     if (pipelined()) {
         // At most g_max_replays submits in flight, this one included: the oldest are waited for once this one is
         // queued (before, the rest waited behind them and the GPU idled between the two parts).
@@ -398,8 +440,9 @@ void frame_submit(VkSemaphore wait, VkSemaphore signal, std::vector<WriteBack> w
         if (wait_done) {
             retire_through(s.serial);
         } else if (!s.write_backs.empty()) {
-            if (s.has_first && s.has_last && replay::written_bind_count() == s.binds_at_split) {
-                wait_fences(&s.fence_first, 1);
+            if (has_first && has_last && replay::written_bind_count() == s.binds_at_split) {
+                VkFence fences[kMaxParts];
+                wait_fences(fences, queued_fences(s, uint32_t(s.split_part) + 1, fences));
                 apply_write_backs(s);
                 g_stats.waited_first++;
             } else {
@@ -427,10 +470,10 @@ void frame_log(uint64_t frames) {
     if (!pipelined() || !g_stats.submits) return;
     const Stats& t = g_stats;
     log("nvn/vk: pipelined: %llu submits, %llu split (first part: %.0f%% of the replay), write-backs after the first "
-        "part %llu, after the whole submit %llu, %llu waited for the oldest in flight",
+        "part %llu, after the whole submit %llu, %llu waited for the oldest in flight, %llu chunks queued early",
         (unsigned long long)t.submits, (unsigned long long)t.splits,
         t.replay_ns ? 100.0 * double(t.first_ns) / double(t.replay_ns) : 0.0, (unsigned long long)t.waited_first,
-        (unsigned long long)t.waited_whole, (unsigned long long)t.throttled);
+        (unsigned long long)t.waited_whole, (unsigned long long)t.throttled, (unsigned long long)t.chunks);
     g_stats = {};
 }
 
@@ -439,10 +482,11 @@ Upload frame_upload_alloc(uint64_t size, uint64_t align) {
     if (at % g_ring_size + size > g_ring_size) at += g_ring_size - at % g_ring_size;  // never split: the next lap
     while (at + size > g_tail + g_ring_size)  // the oldest submits' data is still read: wait for them
         if (!retire_oldest()) {
-            // Pipelined: the submit's first part is queued and may still read its data: wait for it first.
-            if (g_current && g_current->has_first && !g_current->first_waited) {
-                wait_fences(&g_current->fence_first, 1);
-                g_current->first_waited = true;
+            // The submit's parts queued so far may still read its data: wait for them first.
+            if (g_current && g_current->waited < g_current->part) {
+                VkFence fences[kMaxParts];
+                wait_fences(fences, queued_fences(*g_current, g_current->part, fences));
+                g_current->waited = g_current->part;
             }
             log("nvn/vk: upload buffer full (%llu bytes in this submit)", (unsigned long long)(at + size - g_begin));
             g_tail = at + size - g_ring_size;  // this submit wraps over its own first data, as the synchronous path

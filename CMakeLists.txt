@@ -103,6 +103,8 @@ set(NX_RUNTIME_SOURCES
     runtime/src/input_script.cpp
     runtime/src/touch_layout.cpp
     runtime/src/perf_hint.cpp
+    runtime/src/frame_stats.cpp
+    runtime/src/nvn/nvn_caps.cpp
     runtime/src/nvn/nvn_trace.cpp
     runtime/src/nvn/nvn_device.cpp
     runtime/src/nvn/nvn_objects.cpp
