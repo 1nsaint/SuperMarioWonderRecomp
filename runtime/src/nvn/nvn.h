@@ -249,6 +249,7 @@ uint32_t format_aspect(uint32_t format);
 void set_astc_native(bool native);
 bool astc_native();
 bool is_astc(uint32_t format);
+bool astc_decoded(uint32_t format);  // an ASTC format this device gets as RGBA8
 // Bytes per texel of a Vulkan format as buffer-image copies count them (nvn_format.cpp); 0 for block-compressed and
 // combined depth/stencil formats, whose NVN size (format_block) is the host's. Differs from the NVN size where a
 // format is stored wider than the game's: 0x3f R11G11B10F is 4 bytes in NVN, RGBA16F (8) here.

@@ -197,8 +197,8 @@ bool init() {
     p_vkGetPhysicalDeviceFeatures2(g_physical, &features);
     g_depth_clip_control = fclip.depthClipControl;
     g_features = features.features;
-    // NX_ASTC_DECODE=1: the CPU decoder even where the GPU has ASTC (to compare the two on the same GPU).
-    set_astc_native(g_features.textureCompressionASTC_LDR && !std::getenv("NX_ASTC_DECODE"));
+    // NX_ASTC_DECODE=1|linear|srgb: the CPU decoder even where the GPU has ASTC (to compare the two on one GPU).
+    set_astc_native(g_features.textureCompressionASTC_LDR);
     log("nvn/vk: ASTC %s", astc_native() ? "native" : "decoded to RGBA8 at upload (no textureCompressionASTC_LDR)");
     log("nvn/vk: depthClamp %u, depthBiasClamp %u, depthBounds %u, depth clip control %u (extension %u)",
         g_features.depthClamp, g_features.depthBiasClamp, g_features.depthBounds, g_depth_clip_control,

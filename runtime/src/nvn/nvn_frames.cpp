@@ -94,6 +94,7 @@ uint64_t g_ring_size = 0, g_head = 0, g_tail = 0, g_begin = 0;
 // Images of destroyed textures, with the serial of the last submit that may still use them.
 std::mutex g_grave_lock;
 std::vector<std::pair<uint64_t, std::shared_ptr<GpuImage>>> g_grave;
+std::vector<std::tuple<uint64_t, VkBuffer, VkDeviceMemory>> g_staging;  // staging_alloc's, freed like the grave's
 
 // GPU-written images of destroyed textures, kept a few submits for a new texture over the same memory with the same
 // shape. Wonder re-creates ~180 NVNtexture objects per frame over the same render-target memory: each got a new
@@ -496,6 +497,15 @@ void free_retired_images(uint64_t completed) {
         for (auto it = done; it != g_grave.end(); ++it) dead.push_back(std::move(it->second));
         g_grave.erase(done, g_grave.end());
     }
+    std::vector<std::pair<VkBuffer, VkDeviceMemory>> staging;
+    {
+        std::lock_guard lk(g_grave_lock);
+        auto done = std::stable_partition(g_staging.begin(), g_staging.end(),
+                                          [&](const auto& e) { return std::get<0>(e) > completed; });
+        for (auto it = done; it != g_staging.end(); ++it) staging.push_back({std::get<1>(*it), std::get<2>(*it)});
+        g_staging.erase(done, g_staging.end());
+    }
+    for (auto& [b, m] : staging) p_vkDestroyBuffer(vk_device(), b, nullptr), p_vkFreeMemory(vk_device(), m, nullptr);
     for (auto& img : dead) {
         if (!img || !img->image) continue;
         if (img.use_count() > 1) continue;  // another live texture shares it (image_of): freed with the last one
@@ -520,6 +530,35 @@ Texture::~Texture() {
         return;
     }
     g_grave.push_back({g_submitted + 1, std::move(image)});
+}
+
+// A host-visible buffer of its own for one big texture upload: the ring is 256 MB, and a scene load with ASTC decoded
+// to RGBA8 staged 312 MB in one submit, wrapping over its own data before the GPU had copied it (DEBUG-2 #72). Freed
+// once the submit being recorded is retired (as images in the grave). Falls back to the ring if allocation fails.
+Upload staging_alloc(uint64_t size) {
+    VkDevice d = vk_device();
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = size;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    if (p_vkCreateBuffer(d, &bi, nullptr, &buffer) != VK_SUCCESS) return upload_alloc(size, 16);
+    VkMemoryRequirements req{};
+    p_vkGetBufferMemoryRequirements(d, buffer, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex =
+        memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* p = nullptr;
+    if (p_vkAllocateMemory(d, &ai, nullptr, &memory) != VK_SUCCESS || p_vkBindBufferMemory(d, buffer, memory, 0) ||
+        p_vkMapMemory(d, memory, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) {
+        p_vkDestroyBuffer(d, buffer, nullptr);
+        if (memory) p_vkFreeMemory(d, memory, nullptr);
+        return upload_alloc(size, 16);
+    }
+    std::lock_guard lk(g_grave_lock);
+    g_staging.push_back({g_submitted + 1, buffer, memory});
+    return {buffer, 0, static_cast<uint8_t*>(p)};
 }
 
 std::shared_ptr<GpuImage> reuse_image(const Texture& t) {

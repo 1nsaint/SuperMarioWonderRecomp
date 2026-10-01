@@ -18,7 +18,8 @@ param(
     [int]$MinPresents = 300,
     [double]$MinFps = 0,
     [double]$MaxMemGB = 5.0,
-    [string]$Exe = "private\wonder\build\wonder.exe"
+    [string]$Exe = "private\wonder\build\wonder.exe",
+    [switch]$KeepSave                    # default: the save is deleted first, so scripted input meets the same screens
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
@@ -30,6 +31,7 @@ if (Test-Path $run) { Remove-Item -Recurse -Force $run }
 New-Item -ItemType Directory -Force "$run\frames" | Out-Null
 $frames = "private\wonder\frames"
 if (Test-Path $frames) { Remove-Item -Recurse -Force $frames }
+if (-not $KeepSave -and (Test-Path "private\wonder\user\save")) { Remove-Item -Recurse -Force "private\wonder\user\save" }
 
 $vars = @{ NX_LOG = "$run\nx.log"; NX_MEM_LIMIT_GB = "8"; NX_GPU = $Gpu }
 if ($Headless) { $vars.NX_HEADLESS = "1"; $vars.NX_MUTE = "1" }

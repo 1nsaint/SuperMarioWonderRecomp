@@ -147,7 +147,7 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
         p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
         return;
     }
-    if (t.stride && is_astc(t.format) && !astc_native()) {  // never seen: pitch-linear ASTC would need the decoder too
+    if (t.stride && astc_decoded(t.format)) {  // never seen: pitch-linear ASTC would need the decoder too
         log("nvn/vk: pitch-linear ASTC texture %ux%u format %#x: cleared", img.width, img.height, t.format);
         return clear_image(cb, img);
     }
@@ -184,7 +184,7 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
             (unsigned long long)t.storage_size);
         return;
     }
-    if (is_astc(t.format) && !astc_native()) {  // RGBA8 texels from here on
+    if (astc_decoded(t.format)) {  // RGBA8 texels from here on
         decode_astc(t.format, linear, levels, layers, bw, bh);
         bw = bh = 1, bytes = host_bytes = 4;
     }
@@ -194,6 +194,11 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
     if (widen) {
         u = upload_alloc(linear.size() * 2, 16);
         widen_r11g11b10(linear.data(), u.ptr, linear.size() / 4);
+    } else if (linear.size() >= (1u << 20) && !std::getenv("NX_STAGING_RING")) {
+        // 1 MB and up: a staging buffer of its own, so a scene load cannot wrap the ring over itself (DEBUG-2 #72).
+        // NX_STAGING_RING=1: through the ring, as before (bisecting).
+        u = staging_alloc(linear.size());
+        std::memcpy(u.ptr, linear.data(), linear.size());
     } else {
         u = upload(linear.data(), linear.size(), 16);
     }

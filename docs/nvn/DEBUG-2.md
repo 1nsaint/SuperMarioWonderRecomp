@@ -192,3 +192,19 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
       and shader writes to all later reads and writes. `NX_NO_PASS_BARRIER=1`: none, as before.
     - Cost: none measurable (course 58 fps headless on the RTX 3050, as before).
     - Check: the HUD is whole in every frame of the course on both GPUs, and the sky is right with the CPU decoder.
+
+72. **Scene loads wrapped the upload ring over themselves: black and green characters in the opening's cast scene.**
+    - Symptoms (RTX 3050, and the UHD 770 with `NX_ASTC_DECODE=1`; never with native ASTC): at the Flower Castle the
+      Toads' bodies black with sparkles, Mario's and Luigi's faces black with green eyes, Daisy green; once a GPU
+      hang. Gameplay was fine.
+    - Bisecting: decoding only the linear or only the sRGB ASTC formats was right; an artificial delay on native
+      uploads was right (not a race); the log had `upload buffer full (312 MB in this submit)` (the per-frame upload
+      averages hid it).
+    - Cause: the cast loads every character at once. Decoded to RGBA8 (4x to 9x the ASTC size) its textures staged
+      312 MB in one submit through the 256 MB ring, which then wrapped over its own data before the GPU copied it.
+    - Fix (`nvn_frames.cpp` `staging_alloc`, `nvn_upload.cpp`): texture uploads of 1 MB and more get a host-visible
+      buffer of their own, freed when the submit being recorded retires (as images in the grave).
+      `NX_STAGING_RING=1`: through the ring, as before.
+    - Bisecting switches kept: `NX_ASTC_DECODE=linear|srgb|<hex format>,...`.
+    - Tests: `tests/astc_check.py` now compares every mip level and the linear ASTC formats too (32 textures of the
+      cast's models: all within 1 per channel). Check: the cast scene is whole on both GPUs (`tools/wonder_course.ps1`).

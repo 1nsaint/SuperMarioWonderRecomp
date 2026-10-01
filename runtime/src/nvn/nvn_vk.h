@@ -61,6 +61,8 @@ constexpr VkBufferUsageFlags kUploadUsage =
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
 Upload upload_alloc(uint64_t size, uint64_t align);
+// nvn_frames.cpp: a buffer of its own for one big texture upload, freed when the submit being recorded retires.
+Upload staging_alloc(uint64_t size);
 Upload upload(const void* data, uint64_t size, uint64_t align);
 
 // Descriptor sets for this submit (freed when it completes).

@@ -23,7 +23,7 @@ WORK = ROOT / "private" / "wonder" / "astc_check"
 def astc_textures(romfs_file):
     out = subprocess.run([PY, str(ROOT / "tools/maxwell/bntx.py"), romfs_file], capture_output=True, text=True).stdout
     for line in out.splitlines():
-        m = re.search(r": (\S+)\s+ASTC(\d+)x(\d+)(_SRGB)?\s+(\d+)x(\d+)x1 layers=1", line)
+        m = re.search(r": (\S+)\s+ASTC(\d+)x(\d+)(_SRGB|_UNORM)?\s+(\d+)x(\d+)x1 layers=1", line)
         if m:
             yield m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(5)), int(m.group(6))
 
@@ -37,27 +37,27 @@ def check(build, romfs_file, name, bw, bh, w, h):
     tiled = next(d.glob("*.tiled.bin"))
     txt = tiled.with_name(tiled.name.replace(".tiled.bin", ".txt"))
     subprocess.run([str(build / "tiling_test"), str(tiled), str(txt), str(d)], check=True, capture_output=True)
-    linear = next(d.glob("*.linear.bin"))
-    blocks = ((w + bw - 1) // bw) * ((h + bh - 1) // bh) * 16
-    level0 = linear.read_bytes()[:blocks]
-    (d / "level0.bin").write_bytes(level0)
-    ours_path = d / "ours.rgba"
-    subprocess.run([str(build / "astc_test"), str(d / "level0.bin"), str(w), str(h), str(bw), str(bh), "0",
-                    str(ours_path)], check=True, capture_output=True)
-    ours = ours_path.read_bytes()
-    ref = texture2ddecoder.decode_astc(level0, w, h, bw, bh)  # BGRA
-    exact = close = 0
-    worst = 0
-    for k in range(w * h):
-        r = (ref[4 * k + 2], ref[4 * k + 1], ref[4 * k], ref[4 * k + 3])
-        o = tuple(ours[4 * k:4 * k + 4])
-        diff = max(abs(a - b) for a, b in zip(r, o))
-        worst = max(worst, diff)
-        exact += diff == 0
-        close += diff <= 1
-    ok = close >= 0.999 * w * h
-    print(f"{'ok  ' if ok else 'FAIL'} {name:32s} ASTC {bw}x{bh} {w}x{h}: exact {100 * exact / (w * h):6.2f}%, "
-          f"within 1 {100 * close / (w * h):6.2f}%, worst {worst}")
+    linear = next(d.glob("*.linear.bin")).read_bytes()
+    levels = [list(map(int, line.split())) for line in next(d.glob("*.levels.txt")).read_text().splitlines()]
+    exact = close = total = worst = 0
+    for lv, (offset, layer_size, lw, lh, _, _) in enumerate(levels):  # every mip level, layer 0
+        data = linear[offset:offset + layer_size]
+        (d / "level.bin").write_bytes(data)
+        ours_path = d / "ours.rgba"
+        subprocess.run([str(build / "astc_test"), str(d / "level.bin"), str(lw), str(lh), str(bw), str(bh), "0",
+                        str(ours_path)], check=True, capture_output=True)
+        ours = ours_path.read_bytes()
+        ref = texture2ddecoder.decode_astc(data, lw, lh, bw, bh)  # BGRA
+        for k in range(lw * lh):
+            r = (ref[4 * k + 2], ref[4 * k + 1], ref[4 * k], ref[4 * k + 3])
+            diff = max(abs(a - b) for a, b in zip(r, ours[4 * k:4 * k + 4]))
+            worst = max(worst, diff)
+            exact += diff == 0
+            close += diff <= 1
+        total += lw * lh
+    ok = close >= 0.999 * total
+    print(f"{'ok  ' if ok else 'FAIL'} {name:32s} ASTC {bw}x{bh} {w}x{h} ({len(levels)} levels): exact "
+          f"{100 * exact / total:6.2f}%, within 1 {100 * close / total:6.2f}%, worst {worst}")
     return ok
 
 
