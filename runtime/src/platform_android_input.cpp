@@ -208,6 +208,7 @@ void read_pad(PadState& p) {
             p.buttons |= t.button;
         }
     }
+    input_script(p);  // NX_INPUT_SCRIPT (config.txt): scripted runs on the phone, as on the Mac
 }
 
 // The drawn layout's buttons (brighter while pressed) and the stick under the thumb; nothing while a controller is

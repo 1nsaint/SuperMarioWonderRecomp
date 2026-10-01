@@ -1,6 +1,12 @@
 // Scripted input for unattended runs: NX_INPUT_SCRIPT="<seconds>:<button>:<hold seconds>;..." presses buttons at
 // fixed times after the first pad read, e.g. "70:A:0.2;74:A:0.2;80:RIGHT:5" (buttons: A B X Y L R ZL ZR PLUS MINUS
 // LEFT RIGHT UP DOWN; the directions also push the left stick). Added on top of the real pad and keyboard.
+//
+// NX_INPUT_RECORD=1 (or a file path): what the player does is written in that same format, to
+// <data root>/input_record.txt: every press of a button, and the stick past half way as a direction, from the first
+// pad read. Played back through NX_INPUT_SCRIPT, a test run follows a real player's run instead of a blind script.
+#include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -51,14 +57,50 @@ std::vector<Press> parse(const char* s) {
     return v;
 }
 
+// The recorder: per button, when it went down; a release writes "<down>:<name>:<held>;" (flushed at once, so a
+// killed app keeps what was played).
+void record(const PadState& p, double t) {
+    static const char* names[] = {"A", "B", "X", "Y", "L", "R", "ZL", "ZR", "PLUS", "MINUS", "LEFT", "RIGHT", "UP", "DOWN"};
+    static const uint64_t bits[] = {kA, kB, kX, kY, kL, kR, kZL, kZR, kPlus, kMinus, kLeft, kRight, kUp, kDown};
+    static double down[14];
+    static bool init = false;
+    static FILE* f = nullptr;
+    if (!init) {
+        init = true;
+        for (double& d : down) d = -1;
+        const char* e = std::getenv("NX_INPUT_RECORD");
+        std::string path = e && std::strcmp(e, "1") != 0 ? std::string(e) : data_root() + "/input_record.txt";
+        f = fopen_utf8(path, "w");
+    }
+    if (!f) return;
+    constexpr int32_t half = kStickMax / 2;
+    uint64_t now = p.buttons;
+    if (p.lx < -half) now |= kLeft;
+    if (p.lx > half) now |= kRight;
+    if (p.ly > half) now |= kUp;
+    if (p.ly < -half) now |= kDown;
+    for (int k = 0; k < 14; k++) {
+        bool held = now & bits[k];
+        if (held && down[k] < 0) down[k] = t;
+        if (!held && down[k] >= 0) {
+            std::fprintf(f, "%.2f:%s:%.2f;", down[k], names[k], std::max(0.05, t - down[k]));
+            std::fflush(f);
+            down[k] = -1;
+        }
+    }
+}
+
 }  // namespace
 
 void input_script(PadState& p) {
     static const char* env = std::getenv("NX_INPUT_SCRIPT");
-    if (!env) return;
-    static const std::vector<Press> script = parse(env);
+    static const bool recording = std::getenv("NX_INPUT_RECORD") != nullptr;
+    if (!env && !recording) return;
     static const uint64_t start = monotonic_ns();
     double t = double(monotonic_ns() - start) / 1e9;
+    if (recording) record(p, t);  // what the player did, before the script adds to it
+    if (!env) return;
+    static const std::vector<Press> script = parse(env);
     for (const Press& s : script)
         if (t >= s.at && t < s.at + s.hold) {
             p.buttons |= s.bits;
