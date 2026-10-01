@@ -131,6 +131,8 @@ set(NX_RUNTIME_SOURCES
     runtime/src/nvn/nvn_binds.cpp
     runtime/src/nvn/nvn_copy.cpp
     runtime/src/nvn/nvn_pipeline.cpp
+    runtime/src/nvn/nvn_dummy.cpp
+    runtime/src/nvn/nvn_pipeline_cache.cpp
     runtime/src/nvn/nvn_upload.cpp
     runtime/src/nvn/nvn_astc.cpp
     runtime/src/nvn/nvn_spirv_patch.cpp

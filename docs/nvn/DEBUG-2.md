@@ -208,3 +208,20 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
     - Bisecting switches kept: `NX_ASTC_DECODE=linear|srgb|<hex format>,...`.
     - Tests: `tests/astc_check.py` now compares every mip level and the linear ASTC formats too (32 textures of the
       cast's models: all within 1 per channel). Check: the cast scene is whole on both GPUs (`tools/wonder_course.ps1`).
+
+73. **Pipelines compiled in the replay: stutters when new objects come in; an on-disk pipeline cache.**
+    - The course's slow windows had 10-42 ms replays where new objects appeared: `vkCreateGraphicsPipelines` runs
+      the first time a draw needs a pipeline, inside the replay.
+    - `nvn_pipeline_cache.cpp`: a `VkPipelineCache` loaded from `<data root>/pipelines_<vendor>_<device>.bin` and
+      saved every 600 presents when it grew (the driver validates the header). `NX_PIPELINE_CACHE=0`: none.
+    - A new line per 60 frames: `created over 60 frames: n pipelines (ms), n ASTC textures decoded (ms)`.
+    - Measured (RTX 3050, course run with a warm cache): 853 pipelines in 1.2 s in all; 383 ASTC textures decoded
+      in 3.8 s in all, about 10 ms each on the replay thread: the next cost to cut (#74).
+    - `nvn_pipeline.cpp` went over 700 lines: the stand-in images moved to `nvn_dummy.cpp`.
+
+74. **Audio: the limiter crash at boot again on Windows (issue #16, DEBUG.md #28).**
+    - `CRASH ... sdk+228220` (the limiter's apply) under `CommandListProcessor::Process` 3 s into one run of ~25.
+    - An update waits for a render since the previous one, but gave up after 50 ms; with every thread loading at
+      boot a render can take longer, and a second update then overwrites the effect's initialize status.
+    - Now it waits up to 1 s and logs `audio: no render for 1 s since the last update` if it gives up. 12 boots in a
+      row: no crash, the log line never printed. To watch: any further crash with that line before it.

@@ -63,6 +63,12 @@ constexpr VkBufferUsageFlags kUploadUsage =
 Upload upload_alloc(uint64_t size, uint64_t align);
 // nvn_frames.cpp: a buffer of its own for one big texture upload, freed when the submit being recorded retires.
 Upload staging_alloc(uint64_t size);
+// nvn_pipeline_cache.cpp: the on-disk pipeline cache, and the cost of what the replay creates (logged per window).
+VkPipelineCache pipeline_cache();
+void pipeline_cache_save();
+void note_pipeline_created(uint64_t ns);
+void note_astc_decoded(uint64_t ns);
+void creation_log(uint64_t frames);
 Upload upload(const void* data, uint64_t size, uint64_t align);
 
 // Descriptor sets for this submit (freed when it completes).

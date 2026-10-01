@@ -10,6 +10,7 @@
 #include <unordered_map>
 
 #include "nvn_pipeline.h"
+#include "platform.h"
 
 namespace nx::nvn {
 
@@ -34,6 +35,15 @@ VkFormat view_format(const GpuImage& img, uint32_t nvn) {
     if (logged.insert({img.nvn_format, nvn}).second && logged.size() <= 40)
         log("nvn/vk: texture format %#x viewed as %#x%s", img.nvn_format, nvn, ok ? "" : " (not compatible: ignored)");
     return ok ? f : img.format;
+}
+
+VkImageViewType view_type(const ImageShape& s) {  // SPIR-V Dim: 0 1D, 1 2D, 2 3D, 3 Cube
+    switch (s.dim) {
+        case 0: return s.arrayed ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D;
+        case 2: return VK_IMAGE_VIEW_TYPE_3D;
+        case 3: return s.arrayed ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE;
+        default: return s.arrayed ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    }
 }
 
 namespace {
@@ -83,15 +93,6 @@ VkDescriptorSetLayout set_layout(const std::vector<VkDescriptorSetLayoutBinding>
 }
 
 // ---- images ---------------------------------------------------------------------------------------------------------
-
-VkImageViewType view_type(const ImageShape& s) {  // SPIR-V Dim: 0 1D, 1 2D, 2 3D, 3 Cube
-    switch (s.dim) {
-        case 0: return s.arrayed ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D;
-        case 2: return VK_IMAGE_VIEW_TYPE_3D;
-        case 3: return s.arrayed ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE;
-        default: return s.arrayed ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-    }
-}
 
 // Views made for sampling and for rendering, by image; forget_image_views() drops an image's before it is freed.
 using SampledKey = std::tuple<VkImage, VkImageViewType, uint32_t, uint64_t, uint64_t>;
@@ -398,7 +399,10 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     ci.pDynamicState = &dy;
     ci.layout = layout.layout;
     VkPipeline p = VK_NULL_HANDLE;
-    if (p_vkCreateGraphicsPipelines(vk_device(), VK_NULL_HANDLE, 1, &ci, nullptr, &p) != VK_SUCCESS)
+    const uint64_t t0 = plat::monotonic_ns();
+    VkResult made = p_vkCreateGraphicsPipelines(vk_device(), pipeline_cache(), 1, &ci, nullptr, &p);
+    note_pipeline_created(plat::monotonic_ns() - t0);
+    if (made != VK_SUCCESS)
         log("nvn/vk: pipeline for %s + %s failed", key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
     else if (g_trace)
         log("nvn/vk: pipeline %zu: %s + %s", cache.size() + 1, key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
@@ -560,63 +564,6 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
         return dummy_view(cb, shape);
     }
     return v;
-}
-
-std::map<VkImageViewType, GpuImage>& dummies() {
-    static std::map<VkImageViewType, GpuImage> d;
-    return d;
-}
-
-bool dummy_ready(const ImageShape& shape) {
-    auto it = dummies().find(view_type(shape));
-    return it != dummies().end() && it->second.image;
-}
-
-VkImageView dummy_view(VkCommandBuffer cb, const ImageShape& shape) {
-    VkImageViewType type = view_type(shape);
-    auto& d = dummies()[type];
-    if (d.image) return d.view;
-    bool cube = type == VK_IMAGE_VIEW_TYPE_CUBE || type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
-    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ci.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
-    ci.imageType = type == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D
-                   : (type == VK_IMAGE_VIEW_TYPE_1D || type == VK_IMAGE_VIEW_TYPE_1D_ARRAY) ? VK_IMAGE_TYPE_1D
-                                                                                            : VK_IMAGE_TYPE_2D;
-    ci.format = shape.depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
-    ci.extent = {1, 1, 1};
-    ci.mipLevels = 1;
-    ci.arrayLayers = cube ? 6 : 1;
-    ci.samples = VK_SAMPLE_COUNT_1_BIT;
-    ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    p_vkCreateImage(vk_device(), &ci, nullptr, &d.image);
-    VkMemoryRequirements req{};
-    p_vkGetImageMemoryRequirements(vk_device(), d.image, &req);
-    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = req.size;
-    ai.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    p_vkAllocateMemory(vk_device(), &ai, nullptr, &d.memory);
-    p_vkBindImageMemory(vk_device(), d.image, d.memory, 0);
-    d.format = ci.format;
-    d.aspect = shape.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-    d.layers = ci.arrayLayers;
-    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vi.image = d.image;
-    vi.viewType = type;
-    vi.format = ci.format;
-    vi.subresourceRange = {d.aspect, 0, 1, 0, ci.arrayLayers};
-    p_vkCreateImageView(vk_device(), &vi, nullptr, &d.view);
-    transition(cb, d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkImageSubresourceRange r{d.aspect, 0, 1, 0, ci.arrayLayers};
-    if (shape.depth) {
-        VkClearDepthStencilValue v{1.0f, 0};
-        p_vkCmdClearDepthStencilImage(cb, d.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
-    } else {
-        VkClearColorValue v{};
-        if (std::getenv("NX_DUMMY_MAGENTA")) v = {{1.0f, 0.0f, 1.0f, 1.0f}};  // debug: where the dummy is sampled
-        p_vkCmdClearColorImage(cb, d.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
-    }
-    transition(cb, d, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    return d.view;
 }
 
 VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgramLayout& layout) {

@@ -58,7 +58,7 @@ bool copies_fit(const Texture& t, const VkBufferImageCopy* r, uint32_t n, uint64
 }
 
 // ASTC on a GPU without it (nvn_format.cpp): the untiled blocks of every level become RGBA8 texels, and the levels
-// are re-laid out for them (each level's layers back to back, 16-byte aligned). Logged every 500 textures: count,
+// are re-laid out for them (each level's layers back to back, 16-byte aligned). Logged every 200 textures: count,
 // bytes and CPU time, the cost of the decoder at load.
 void decode_astc(uint32_t format, std::vector<uint8_t>& linear, std::vector<LinearLevel>& levels, uint32_t layers,
                  uint32_t bw, uint32_t bh) {
@@ -80,8 +80,10 @@ void decode_astc(uint32_t format, std::vector<uint8_t>& linear, std::vector<Line
                                          bw, bh, srgb, rgba.data() + out[k].offset);
     linear.swap(rgba);
     levels.swap(out);
-    bytes += at, ns += plat::monotonic_ns() - t0;
-    if (++textures % 500 == 1)
+    const uint64_t spent = plat::monotonic_ns() - t0;
+    note_astc_decoded(spent);  // per timing window (nvn_pipeline_cache.cpp)
+    bytes += at, ns += spent;
+    if (++textures % 200 == 1)
         log("nvn/vk: ASTC decoded on the CPU: %llu textures, %.1f MB, %.0f ms, %llu invalid blocks",
             (unsigned long long)textures, double(bytes) / 1e6, double(ns) / 1e6, (unsigned long long)invalid);
 }
