@@ -28,7 +28,7 @@ Windows merge (DEBUG-2.md #89). The studies that build on these numbers are in t
 
 Conclusions so far:
 - Pipelined submission is worth ~20 fps on the phone over synchronous. Whether it can be the Android default
-  depends on the exploded-mesh cause (`PIPELINED-AND-FLICKER.md`).
+  depends on the exploded-mesh cause (`PLAN.md`, sections 3 and 7).
 - In the course both sides are over the 16.7 ms frame: the CPU replay at ~19.6 ms (the M1 does it in ~6) and the
   GPU at ~17 ms.
 - On the replay thread (`phone_pipe1/profile_report.txt`): our code takes 38% of the samples, libc 34%
@@ -53,4 +53,4 @@ Graphics bugs reported by the user on the phone:
 - other graphics bugs, not yet localised.
 
 The sampled frames of `pipe1` look clean: the flicker is temporal and needs frame bursts
-(`PIPELINED-AND-FLICKER.md`).
+(`PLAN.md`, sections 3 and 7).
