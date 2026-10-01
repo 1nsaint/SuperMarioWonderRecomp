@@ -10,6 +10,8 @@
 #   THERMAL=1       wait until the phone is cool first (tools/phone_thermal_wait.py); 0: only record a reading
 #   PROFILE_AT=200  when the 10 s profile starts (s, a multiple of 20)
 #   GPUWATCH=1      the GPU clock and busy % from sysfs every 20 s (gpu.txt)
+#   BURST="200 240" frame bursts at those times (s, multiples of 20): BURST_N consecutive frames each (default 60),
+#                   for glitches that last a frame or two (exploded vertices, flicker)
 S=$1; N=$2; shift 2
 cd "$(dirname "$0")/.."
 PKG=io.github.belmantegu.wonderrecomp
@@ -62,6 +64,7 @@ for t in $(seq 0 20 300); do
     [ "$MEMWATCH" = 1 ] && memsample $((t + 20))
     [ "$GPUWATCH" = 1 ] && echo "$((t + 20)) $(adb -s "$S" shell cat /sys/class/kgsl/kgsl-3d0/devfreq/cur_freq /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage 2>/dev/null | tr '\n' ' ')" >> "$OUT/gpu.txt"
     [ "$t" = "$PROFILE_AT" ] && adb -s "$S" shell "echo 10 > '$D/profile'"
+    for b in $BURST; do [ "$t" = "$b" ] && adb -s "$S" shell "echo ${BURST_N:-60} 1 > '$D/dump_frames'"; done
 done
 [ "$MEMWATCH" = end ] && memsample 320
 adb -s "$S" logcat -d -v time 'wonder:I' '*:S' > "$OUT/logcat.txt"
