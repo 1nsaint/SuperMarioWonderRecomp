@@ -1,4 +1,4 @@
-// BC texture decoding on the CPU (docs/nvn/ANDROID-PORT.md D1, DEBUG-2.md #75): for GPUs without
+// BC texture decoding on the CPU (docs/nvn/ANDROID-PORT.md D1, DEBUG-2.md #85): for GPUs without
 // textureCompressionBC (Mali, most Android phones but Adreno and Xclipse), a BC texture is decoded when it is uploaded
 // and stored as RGBA8 (BC1-3, BC7), R8 (BC4) or RG8 (BC5), UNORM, SNORM or sRGB as the BC format was. D1's ASTC
 // side table (transcoded on the Mac) is meant to replace this for the game's own files; this stays the fallback.
@@ -14,7 +14,7 @@ namespace nx::nvn {
 
 namespace {
 
-// Derived from a reference decoder (Pillow) with blocks whose subsets decode to distinct colours (DEBUG-2.md #75).
+// Derived from a reference decoder (Pillow) with blocks whose subsets decode to distinct colours (DEBUG-2.md #85).
 // Bit i (2 subsets) or bits 2i..2i+1 (3 subsets): the subset of pixel i.
 const uint16_t kPart2[64] = {
     0xcccc, 0x8888, 0xeeee, 0xecc8, 0xc880, 0xfeec, 0xfec8, 0xec80,

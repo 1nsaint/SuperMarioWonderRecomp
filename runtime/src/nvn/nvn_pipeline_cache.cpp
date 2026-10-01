@@ -1,16 +1,10 @@
-// A Vulkan pipeline cache kept on disk (docs/nvn/ANDROID-PORT.md A3, DEBUG-2.md #73): every pipeline built in a
-// session is compiled again in the next one, a hitch at each new scene (Adreno takes tens of ms per pipeline).
-// The cache is <data root>/cache/pipelines2_<vendor>_<device>.bin, loaded when the first pipeline is made and saved
-// every 32 new pipelines (pipeline_cache() is called once per pipeline made): read under the GPU lock, written to the
-// file on a thread of its own. Data from another driver is left out: its header must match this device's vendor,
-// device and cache UUID. NX_PIPELINE_CACHE=0: no cache.
-#include <atomic>
+// A VkPipelineCache kept on disk (<data root>/pipelines_<vendor>_<device>.bin), and the cost of what the replay
+// creates on the fly. Pipelines are compiled the first time a draw needs them, inside the replay: the course's
+// stutters when new objects come in (16-42 ms replays on the RTX 3050). The driver checks the cache header itself
+// (vendor, device, driver build): a stale file is ignored. Saved every 600 presents when it grew.
+// NX_PIPELINE_CACHE=0: no cache (bisecting, or to measure first-run stutter).
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <mutex>
-#include <string>
-#include <thread>
 #include <vector>
 
 #include "nvn_vk.h"
@@ -23,92 +17,69 @@ using namespace nx::vk;
 namespace {
 
 VkPipelineCache g_cache = VK_NULL_HANDLE;
+bool g_tried = false;
+size_t g_saved_size = 0;
 std::string g_path;
-std::atomic<uint32_t> g_new{0};
-std::atomic<bool> g_saving{false};
-
-bool enabled() {
-    static const bool on = [] {
-        const char* e = std::getenv("NX_PIPELINE_CACHE");
-        return !e || e[0] != '0';
-    }();
-    return on;
-}
-
-std::vector<uint8_t> read_file(const std::string& path) {
-    std::vector<uint8_t> v;
-    if (FILE* f = plat::fopen_utf8(path, "rb")) {
-        plat::fseek64(f, 0, SEEK_END);
-        int64_t n = plat::ftell64(f);
-        plat::fseek64(f, 0, SEEK_SET);
-        if (n > 0) v.resize(size_t(n)), v.resize(std::fread(v.data(), 1, v.size(), f));
-        std::fclose(f);
-    }
-    return v;
-}
-
-// The header every cache blob starts with (VkPipelineCacheHeaderVersionOne): it must be this device's.
-bool matches(const std::vector<uint8_t>& data, const VkPhysicalDeviceProperties& props) {
-    if (data.size() < 16 + VK_UUID_SIZE) return false;
-    uint32_t h[4];
-    std::memcpy(h, data.data(), sizeof h);
-    return h[1] == VK_PIPELINE_CACHE_HEADER_VERSION_ONE && h[2] == props.vendorID && h[3] == props.deviceID &&
-           std::memcmp(data.data() + 16, props.pipelineCacheUUID, VK_UUID_SIZE) == 0;
-}
-
-// The cache's contents are read here, on the replaying thread under the GPU lock, where no pipeline is being made;
-// only the file is written on a thread of its own. Read on another thread while pipelines were made (the first
-// version), MoltenVK could serialise a half-updated cache: a run that loaded one drew the course's tree trunk as huge
-// brown triangles from a point on (DEBUG-2.md #76).
-void save() {
-    if (g_saving) return;  // the previous file is still being written
-    size_t n = 0;
-    std::vector<uint8_t> data;
-    for (int tries = 0; tries < 4 && data.empty(); tries++) {  // INCOMPLETE: retried
-        if (p_vkGetPipelineCacheData(vk_device(), g_cache, &n, nullptr) != VK_SUCCESS || !n) break;
-        data.resize(n);
-        if (p_vkGetPipelineCacheData(vk_device(), g_cache, &n, data.data()) != VK_SUCCESS) data.clear();
-    }
-    if (data.empty()) return log("nvn/vk: pipeline cache: the driver returned no data (%u pipelines)", g_new.load());
-    data.resize(n);
-    g_saving = true;
-    std::thread([data = std::move(data)] {
-        std::string tmp = g_path + ".tmp";
-        if (FILE* f = plat::fopen_utf8(tmp, "wb")) {
-            bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
-            ok = std::fclose(f) == 0 && ok;
-            if (ok && std::rename(tmp.c_str(), g_path.c_str()) == 0)
-                log("nvn/vk: pipeline cache saved (%.1f MB)", double(data.size()) / 1e6);
-        }
-        g_saving = false;
-    }).detach();
-}
+uint64_t g_pipelines = 0, g_pipeline_ns = 0, g_astc = 0, g_astc_ns = 0;
 
 }  // namespace
 
 VkPipelineCache pipeline_cache() {
-    static std::once_flag once;
-    std::call_once(once, [] {
-        if (!enabled()) return;
-        VkPhysicalDeviceProperties props{};
-        p_vkGetPhysicalDeviceProperties(vk_physical(), &props);
-        std::string dir = plat::data_root() + "/cache";
-        plat::make_dirs(dir);
-        char name[64];
-        std::snprintf(name, sizeof name, "/pipelines2_%04x_%04x.bin", props.vendorID, props.deviceID);  // 2: #76
-        g_path = dir + name;
-        std::vector<uint8_t> data = read_file(g_path);
-        bool use = matches(data, props);
-        VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-        ci.initialDataSize = use ? data.size() : 0;
-        ci.pInitialData = use ? data.data() : nullptr;
-        if (p_vkCreatePipelineCache(vk_device(), &ci, nullptr, &g_cache) != VK_SUCCESS) g_cache = VK_NULL_HANDLE;
-        log("nvn/vk: pipeline cache %s: %s", g_path.c_str(),
-            use ? "loaded" : data.empty() ? "new" : "from another driver, started over");
-    });
-    // One call per pipeline made, under the GPU lock (replays make them): every 32 the cache is saved.
-    if (g_cache && (g_new.fetch_add(1) + 1) % 32 == 0) save();
+    if (g_tried) return g_cache;
+    g_tried = true;
+    if (const char* e = std::getenv("NX_PIPELINE_CACHE"); e && e[0] == '0') return VK_NULL_HANDLE;
+    VkPhysicalDeviceProperties p{};
+    p_vkGetPhysicalDeviceProperties(vk_physical(), &p);
+    char name[64];
+    std::snprintf(name, sizeof name, "/pipelines_%04x_%04x.bin", p.vendorID, p.deviceID);
+    g_path = plat::data_root() + name;
+    std::vector<uint8_t> data;
+    if (FILE* f = plat::fopen_utf8(g_path, "rb")) {
+        plat::fseek64(f, 0, SEEK_END);
+        int64_t n = plat::ftell64(f);
+        plat::fseek64(f, 0, SEEK_SET);
+        if (n > 0) data.resize(size_t(n)), data.resize(std::fread(data.data(), 1, data.size(), f));
+        std::fclose(f);
+    }
+    VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    ci.initialDataSize = data.size();
+    ci.pInitialData = data.empty() ? nullptr : data.data();
+    if (p_vkCreatePipelineCache(vk_device(), &ci, nullptr, &g_cache) != VK_SUCCESS) {
+        ci.initialDataSize = 0, ci.pInitialData = nullptr;  // a cache the driver refuses: start empty
+        p_vkCreatePipelineCache(vk_device(), &ci, nullptr, &g_cache);
+    }
+    g_saved_size = data.size();
+    log("nvn/vk: pipeline cache %s (%zu bytes loaded)", g_path.c_str(), data.size());
     return g_cache;
+}
+
+void pipeline_cache_save() {
+    if (!g_cache) return;
+    size_t n = 0;
+    if (p_vkGetPipelineCacheData(vk_device(), g_cache, &n, nullptr) != VK_SUCCESS || n <= g_saved_size) return;
+    std::vector<uint8_t> data(n);
+    if (p_vkGetPipelineCacheData(vk_device(), g_cache, &n, data.data()) != VK_SUCCESS) return;
+    std::string tmp = g_path + ".tmp";
+    if (FILE* f = plat::fopen_utf8(tmp, "wb")) {
+        bool ok = std::fwrite(data.data(), 1, n, f) == n;
+        ok = std::fclose(f) == 0 && ok;
+        std::remove(g_path.c_str());
+        if (ok && std::rename(tmp.c_str(), g_path.c_str()) == 0) g_saved_size = n;
+    }
+}
+
+void note_pipeline_created(uint64_t ns) { g_pipelines++, g_pipeline_ns += ns; }
+void note_astc_decoded(uint64_t ns) { g_astc++, g_astc_ns += ns; }
+
+// One line per timing window (nvn_vk.cpp log_timing): what the replay created, and the time it took.
+void creation_log(uint64_t frames) {
+    if (g_pipelines || g_astc)
+        log("nvn/vk: created over %llu frames: %llu pipelines (%.1f ms), %llu ASTC textures decoded (%.1f ms)",
+            (unsigned long long)frames, (unsigned long long)g_pipelines, double(g_pipeline_ns) / 1e6,
+            (unsigned long long)g_astc, double(g_astc_ns) / 1e6);
+    g_pipelines = g_pipeline_ns = g_astc = g_astc_ns = 0;
+    static uint64_t windows = 0;
+    if (++windows % 10 == 0) pipeline_cache_save();
 }
 
 }  // namespace nx::nvn

@@ -470,6 +470,19 @@ void pass_end_only(VkCommandBuffer cb, int reason) {
     g_pass_ends[reason & 7]++, trace_pass("end: reason", g_pass, uint32_t(reason), 0);
     p_vkCmdEndRendering(cb);
     g_rendering = false;
+    // What the pass wrote is read by what follows (sampled, copied, loaded by the next pass), and what it sampled may
+    // be rendered over next. The images stay GENERAL, so transition() records no barrier. Metal (MoltenVK) and the
+    // Intel driver ordered passes anyway; NVIDIA overlaps them, and later passes read half-written tiles: the course
+    // HUD in blocks (DEBUG-2 #71). NX_NO_PASS_BARRIER=1: none, as before (bisecting).
+    static const bool no_barrier = std::getenv("NX_NO_PASS_BARRIER") != nullptr;
+    if (!no_barrier) {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                           VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb,
+                               0, nullptr, 0, nullptr);
+    }
     gpu_profile_mark(cb, "outside passes (clears, uploads, copies)");
 }
 void draw_end_rendering(VkCommandBuffer cb, int reason) {  // and the pending clears (nvn_clears.cpp)

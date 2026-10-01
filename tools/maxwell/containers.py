@@ -526,7 +526,7 @@ def extract(c, outdir, data, unique=False):
         sys.exit(f"refusing to write outside private/: {outdir}")
     os.makedirs(real, exist_ok=True)
     written = set()
-    with open(os.path.join(real, "manifest.tsv"), "w") as m:
+    with open(os.path.join(real, "manifest.tsv"), "w", newline="\n") as m:  # LF on Windows too
         m.write("id\tstage\tcode_off\tcode_size\tctrl_off\tctrl_size\tprogram_start\tprogram_bytes\tconst_off\t"
                 "const_size\tcode_sha1_16\tcode_file\tctrl_file\n")
         for s in all_stages(c):

@@ -309,7 +309,7 @@ std::mutex g_render_system;
 // whether or not it rendered since the last update, so a sound thread that fell behind updated twice in a row, the
 // second update overwrote the status, and the next render applied a LightLimiter whose state was never initialized
 // (null pointers in ApplyLightLimiterEffect, an intermittent crash at startup; docs/nvn/DEBUG.md #28). An update
-// now waits (at most 50 ms, outside the lock) until a render ran since the previous one.
+// now waits (at most 1 s, outside the lock) until a render ran since the previous one.
 std::mutex g_pace_lock;
 std::condition_variable g_pace_cv;
 uint64_t g_renders = 0, g_renders_at_update = ~0ull;
@@ -320,11 +320,17 @@ void AudioRenderSystemUpdate(CPU& c) {
         std::unique_lock pk(g_pace_lock);
         static uint64_t waited = 0;
         if (g_renders == g_renders_at_update && waited++ < 5) log("audio: update waits for a render");
-        g_pace_cv.wait_for(pk, std::chrono::milliseconds(50), [] { return g_renders != g_renders_at_update; });
-        g_renders_at_update = g_renders;
+        // 1 s, not 50 ms: at boot, with every thread loading, a render took longer and the second update went through
+        // (the limiter crash again, once in ~25 Windows runs). The render thread runs every 5 ms: 1 s only bounds a stall.
+        if (!g_pace_cv.wait_for(pk, std::chrono::seconds(1), [] { return g_renders != g_renders_at_update; }))
+            log("audio: no render for 1 s since the last update: updating anyway");
     }
     std::lock_guard lk(g_render_system);
     call(c, real);
+    // Counted after the update, under the render lock (renders count themselves under it too): a render that began
+    // before this update and ended after it no longer passes for one that used it (the limiter crash, DEBUG-2 #74).
+    std::lock_guard pk(g_pace_lock);
+    g_renders_at_update = g_renders;
 }
 
 void CommandListProcessorProcess(CPU& c) {
@@ -415,13 +421,11 @@ void audio_render_thread(CPU& c) {
             call(c, sdk_base() + kExecuteRendering);
             last_rc = c.x[0];
             std::memcpy(c.x, saved, sizeof saved);
-        }
-        busy_ns += plat::monotonic_ns() - t0;
-        if (!list.empty()) {
-            std::lock_guard pk(g_pace_lock);
+            std::lock_guard pk(g_pace_lock);  // counted under the render lock (AudioRenderSystemUpdate)
             g_renders++;
             g_pace_cv.notify_all();
         }
+        busy_ns += plat::monotonic_ns() - t0;
         render_submit();
         if (++frames % 2000 == 0)
             log("audio: %llu frames rendered, %.1f us each, last result %llx", (unsigned long long)frames,

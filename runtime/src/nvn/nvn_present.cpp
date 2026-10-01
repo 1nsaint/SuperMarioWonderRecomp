@@ -1,4 +1,4 @@
-// The NVN present pass (docs/nvn/ANDROID-PORT.md A2; DEBUG-2.md #68): the window texture drawn into the swapchain
+// The NVN present pass (docs/nvn/ANDROID-PORT.md A2; DEBUG-2.md #79): the window texture drawn into the swapchain
 // image by a render pass instead of vkCmdBlitImage.
 // - Rotated by the swapchain's preTransform: phones scan out portrait, and a pre-rotated image goes to the display
 //   controller as is (the compositor rotates otherwise, on the GPU whenever system UI is on top).
@@ -350,7 +350,7 @@ bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop,
     transition(cb, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     // The set and the circles' uniform data come from this submit's slot (descriptor pool and upload ring, reset when
     // the slot is retired): nothing a frame still in flight reads is written. Per swapchain image they were not safe
-    // (MAILBOX can hand an image back before the frame that last drew into it finished; review of DEBUG-2.md #78).
+    // (MAILBOX can hand an image back before the frame that last drew into it finished; review of DEBUG-2.md #88).
     VkDescriptorSet set = descriptor_set(g.set_layout);
     Upload ubo = upload_alloc(sizeof(float) * 4 * kOverlayMax, 256);
     std::memset(ubo.ptr, 0, sizeof(float) * 4 * kOverlayMax);

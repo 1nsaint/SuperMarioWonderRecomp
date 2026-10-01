@@ -46,9 +46,9 @@ NVN implemented over Vulkan (MoltenVK).
 - **Open:**
   - The exploded-mesh glitch (#43) is intermittent. One run of today's showed it, persistently, after loading a
     pipeline cache saved while pipelines were being made. The save is now done under the GPU lock and being
-    re-checked (DEBUG-2 #76).
+    re-checked (DEBUG-2 #86).
   - Windowed fps (#51).
-- Details: [docs/nvn/DEBUG-2.md](docs/nvn/DEBUG-2.md), entries 65-76.
+- Details: [docs/nvn/DEBUG-2.md](docs/nvn/DEBUG-2.md), entries 65-67 and 78-88.
 
 ### 2026-09-30 (evening): 60 fps in the course (headless), W7 fixes
 

@@ -1,7 +1,7 @@
 # BC decoder checks (runtime/src/nvn/nvn_bc.cpp)
 
 - `derive.py` derives the BC7 partition and anchor tables from Pillow's decoder. It builds blocks whose subsets
-  decode to distinct colours (DEBUG-2.md #75); the output is `tables.json`, the source of the tables in
+  decode to distinct colours (DEBUG-2.md #85); the output is `tables.json`, the source of the tables in
   `nvn_bc.cpp`.
 - `compare.py` checks `nvn_bc.cpp` against Pillow on random blocks for BC1, BC2, BC3, BC4, BC5 and BC7, all BC7 modes
   included. It needs the `harness` binary:

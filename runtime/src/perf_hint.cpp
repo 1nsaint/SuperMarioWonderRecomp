@@ -1,4 +1,4 @@
-// Performance hints (docs/nvn/ANDROID-PORT.md A5, DEBUG-2.md #74): on Android the threads that make a frame (the
+// Performance hints (docs/nvn/ANDROID-PORT.md A5, DEBUG-2.md #84): on Android the threads that make a frame (the
 // game's render thread, which also replays NVN, and the presenting one) join an ADPF session (APerformanceHint,
 // Android 13+) with a 16.7 ms target, and each frame's duration is reported. The system then raises the big cores'
 // clocks when a frame runs late instead of guessing from load, which on phones keeps a steady 60 fps cooler and faster

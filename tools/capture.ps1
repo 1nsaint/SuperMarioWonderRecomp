@@ -1,5 +1,6 @@
-# Capture the game window to a PNG.  Usage: tools\capture.ps1 <out.png>
-param([string]$Out = "private\captures\shot.png")
+# Capture the game window to a PNG.  Usage: tools\capture.ps1 <out.png> [-Class <window class>]
+# The class is "<game title>Recomp" (platform_win.cpp): "HadesRecomp", "Super Mario Bros. WonderRecomp".
+param([string]$Out = "private\captures\shot.png", [string]$Class = "HadesRecomp")
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
 using System;
@@ -12,7 +13,7 @@ public static class Win {
     public struct RECT { public int Left, Top, Right, Bottom; }
 }
 "@
-$h = [Win]::FindWindow("HadesRecomp", $null)
+$h = [Win]::FindWindow($Class, $null)
 if ($h -eq [IntPtr]::Zero) { Write-Error "window not found"; exit 1 }
 $r = New-Object Win+RECT
 [Win]::GetWindowRect($h, [ref]$r) | Out-Null

@@ -146,7 +146,7 @@ int run(const std::string& tiled_path, const std::string& params_path, const std
     }
     std::printf("untiled %zu bytes in %.3f ms\n", linear.size(), ms);
 
-    std::string base = tiled_path.substr(tiled_path.find_last_of('/') + 1);
+    std::string base = tiled_path.substr(tiled_path.find_last_of("/\\") + 1);  // either separator (Windows)
     base = base.substr(0, base.find(".tiled.bin"));
     std::ofstream(outdir + "/" + base + ".linear.bin", std::ios::binary)
         .write(reinterpret_cast<const char*>(linear.data()), std::streamsize(linear.size()));

@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
 // NVNformat -> VkFormat (docs/nvn/API.md). The NVN values index the SDK driver's own format table (sdk+d34198,
 // 0x30 bytes each): its block size, bytes per block, bits per channel, integer/normalized flags, sRGB bit and
 // depth/stencil kinds fix what each value is. The families come in the table's order:
@@ -71,12 +73,37 @@ constexpr VkFormat kAstcSrgb[] = {
     VK_FORMAT_ASTC_12x10_SRGB_BLOCK, VK_FORMAT_ASTC_12x12_SRGB_BLOCK,
 };
 
+bool g_astc_native = true;
+uint32_t g_astc_decode = 3;  // bit 0 linear ASTC formats, bit 1 sRGB ones: decoded when not native (bisecting)
+uint32_t g_astc_list[8] = {}, g_astc_listed = 0;  // NX_ASTC_DECODE=<hex format>,...: only those (bisecting)
+
 }  // namespace
+
+// Without textureCompressionASTC_LDR (NVIDIA, AMD) ASTC textures are RGBA8 images, decoded at upload (nvn_astc.cpp).
+// NX_ASTC_DECODE=linear|srgb decodes only that half on a GPU that has ASTC (bisecting).
+void set_astc_native(bool native) {
+    g_astc_native = native;
+    if (const char* e = std::getenv("NX_ASTC_DECODE"); e && native) {
+        g_astc_decode = std::strcmp(e, "linear") == 0 ? 1u : std::strcmp(e, "srgb") == 0 ? 2u : 3u;
+        g_astc_native = false;
+        for (const char* p = e; std::strchr(p, ',') || std::strtoul(p, nullptr, 16) > 1; p = std::strchr(p, ',') + 1) {
+            if (g_astc_listed < 8) g_astc_list[g_astc_listed++] = uint32_t(std::strtoul(p, nullptr, 16));
+            if (!std::strchr(p, ',')) break;
+        }
+    }
+}
+bool astc_native() { return g_astc_native; }
+bool is_astc(uint32_t f) { return f >= 0x79 && f <= 0x94; }
+bool astc_decoded(uint32_t f) {
+    if (g_astc_native || !is_astc(f)) return false;
+    if (g_astc_listed) return std::find(g_astc_list, g_astc_list + g_astc_listed, f) != g_astc_list + g_astc_listed;
+    return g_astc_decode >> (f >= 0x87 ? 1 : 0) & 1;
+}
 
 VkFormat vk_format(uint32_t f) {
     if (f < sizeof kFormats / sizeof kFormats[0]) return kFormats[f].vk;
-    if (f >= 0x79 && f <= 0x86) return kAstc[f - 0x79];
-    if (f >= 0x87 && f <= 0x94) return kAstcSrgb[f - 0x87];
+    if (f >= 0x79 && f <= 0x86) return astc_decoded(f) ? VK_FORMAT_R8G8B8A8_UNORM : kAstc[f - 0x79];
+    if (f >= 0x87 && f <= 0x94) return astc_decoded(f) ? VK_FORMAT_R8G8B8A8_SRGB : kAstcSrgb[f - 0x87];
     switch (f) {
         case 0x95: return VK_FORMAT_B5G6R5_UNORM_PACK16;
         case 0x96:

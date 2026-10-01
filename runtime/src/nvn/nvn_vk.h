@@ -37,6 +37,8 @@ bool vk_depth_clip_control();
 // The core features the device was created with (all the GPU has): depthClamp, depthBiasClamp, depthBounds, ...
 const VkPhysicalDeviceFeatures& vk_features();
 VkPhysicalDevice vk_physical();
+// nvn_gpu_pick.cpp: logs every device and returns the one NX_GPU asks for (default: the first discrete GPU).
+VkPhysicalDevice pick_physical_device(const std::vector<VkPhysicalDevice>& devices);
 uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want);
 
 // The image behind an NVN texture (guest NVNtexture*), made on first use.
@@ -52,7 +54,7 @@ bool present_pass_targets(VkFormat format, const std::vector<VkImage>& images, V
 bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop, uint32_t index);
 void present_pass_release();  // its views of the swapchain images, before the swapchain is destroyed
 bool present_pass_failed();   // the pass could not be made: frames are blitted, upright
-GpuImage* present_pass_test_target();
+GpuImage* present_pass_test_target();  // NX_PRESENT_TEST: an offscreen "display" for the pass (headless dumps)
 // nvn_bc.cpp: BC textures decoded on the CPU where the GPU has no textureCompressionBC (NX_FORCE_BC_DECODE=1 anyway).
 bool bc_host_decode(uint32_t nvn_format);         // a BC format this device cannot sample (BC6H excepted)
 VkFormat bc_decoded_format(uint32_t nvn_format);  // what it is stored as instead
@@ -60,9 +62,6 @@ uint32_t bc_decoded_bytes(uint32_t nvn_format);   // bytes per texel of that
 void bc_decode(uint32_t nvn_format, const uint8_t* blocks, uint32_t width, uint32_t height, uint32_t slices,
                uint8_t* out);  // tightly packed blocks -> tightly packed texels
 bool bc_view_format(const GpuImage& img, uint32_t nvn, VkFormat& out);  // a view of a decoded image
-// nvn_pipeline_cache.cpp: the pipeline cache kept in <data root>/cache (NX_PIPELINE_CACHE=0: none). Called once per
-// pipeline made: every 32 calls it is saved.
-VkPipelineCache pipeline_cache();  // NX_PRESENT_TEST: an offscreen "display" for the pass (headless dumps)
 
 // Per-submit upload memory (host visible, coherent), reset at every submit: data the replayed commands read from
 // guest memory is copied here at replay time (vertex, index, uniform, storage data, texture staging).
@@ -77,6 +76,14 @@ constexpr VkBufferUsageFlags kUploadUsage =
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
 Upload upload_alloc(uint64_t size, uint64_t align);
+// nvn_frames.cpp: a buffer of its own for one big texture upload, freed when the submit being recorded retires.
+Upload staging_alloc(uint64_t size);
+// nvn_pipeline_cache.cpp: the on-disk pipeline cache, and the cost of what the replay creates (logged per window).
+VkPipelineCache pipeline_cache();
+void pipeline_cache_save();
+void note_pipeline_created(uint64_t ns);
+void note_astc_decoded(uint64_t ns);
+void creation_log(uint64_t frames);
 Upload upload(const void* data, uint64_t size, uint64_t align);
 
 // Descriptor sets for this submit (freed when it completes).
@@ -139,6 +146,7 @@ std::shared_ptr<GpuImage> reuse_image(const Texture& t);  // images of textures 
 // nvn_debug.cpp: NX_DUMP_FRAMES, the presented texture read back (recorded into the present's command buffer, written
 // after its fence).
 uint32_t frame_dump_every();
+bool frame_dump_due(uint64_t presents);  // NX_DUMP_FRAMES, or a dump_frames file in the data folder
 bool frame_dump_record(VkCommandBuffer cb, GpuImage& img);
 void frame_dump_write(const GpuImage& img, uint64_t frame);
 bool debug_snapshots_pending();  // NX_SNAP_*: this submit recorded snapshots (it is then waited for)
