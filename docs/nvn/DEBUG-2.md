@@ -225,3 +225,8 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
       boot a render can take longer, and a second update then overwrites the effect's initialize status.
     - Now it waits up to 1 s and logs `audio: no render for 1 s since the last update` if it gives up. 12 boots in a
       row: no crash, the log line never printed. To watch: any further crash with that line before it.
+
+75. **ASTC decoding over a few threads.** Images of 8,192 blocks and more are decoded by up to 6 threads, by rows of
+    blocks (`nvn_astc.cpp`). Course run on the RTX 3050: 379 textures decoded in 2.4 s in all (3.8 s on one thread);
+    `astc_test` and `astc_check.py` still pass. With the warm pipeline cache, pipelines cost 0.36 s in all (1.2 s
+    before the cache had filled). Course median 58 fps headless.

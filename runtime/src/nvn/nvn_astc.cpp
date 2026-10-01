@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <thread>
+#include <vector>
 
 namespace nx::nvn {
 
@@ -399,19 +401,37 @@ bool astc_decode_block(const uint8_t* src, uint32_t bw, uint32_t bh, bool srgb, 
 uint64_t astc_decode_image(const uint8_t* blocks, uint32_t width, uint32_t height, uint32_t slices, uint32_t bw,
                            uint32_t bh, bool srgb, uint8_t* rgba) {
     const uint32_t bx = (width + bw - 1) / bw, by = (height + bh - 1) / bh;
-    uint64_t bad = 0;
-    uint8_t texels[12 * 12 * 4];
-    for (uint32_t z = 0; z < slices; z++)
-        for (uint32_t y = 0; y < by; y++)
+    const uint64_t rows = uint64_t(slices) * by;  // block rows over all slices
+    auto decode_rows = [&](uint64_t first, uint64_t last) {
+        uint64_t bad = 0;
+        uint8_t texels[12 * 12 * 4];
+        for (uint64_t row = first; row < last; row++) {
+            const uint32_t z = uint32_t(row / by), y = uint32_t(row % by);
             for (uint32_t x = 0; x < bx; x++) {
-                const uint8_t* src = blocks + ((uint64_t(z) * by + y) * bx + x) * 16;
+                const uint8_t* src = blocks + (row * bx + x) * 16;
                 bad += !astc_decode_block(src, bw, bh, srgb, texels);
                 const uint32_t w = std::min(bw, width - x * bw), h = std::min(bh, height - y * bh);
                 for (uint32_t r = 0; r < h; r++)
-                    std::memcpy(rgba + ((uint64_t(z) * height + y * bh + r) * width + x * bw) * 4, texels + r * bw * 4,
-                                w * 4);
+                    std::memcpy(rgba + ((uint64_t(z) * height + y * bh + r) * width + x * bw) * 4,
+                                texels + r * bw * 4, w * 4);
             }
-    return bad;
+        }
+        return bad;
+    };
+    // Big images over a few threads, by rows of blocks (each writes its own texel rows). The replay waits for them:
+    // a 2048x2048 6x5 texture took ~40 ms on one core (DEBUG-2 #75).
+    const uint64_t total = rows * bx;
+    unsigned n = total >= 8192 ? std::min(6u, std::max(1u, std::thread::hardware_concurrency() / 2)) : 1u;
+    if (n <= 1) return decode_rows(0, rows);
+    std::vector<std::thread> pool;
+    std::vector<uint64_t> bad(n, 0);
+    for (unsigned k = 1; k < n; k++)
+        pool.emplace_back([&, k] { bad[k] = decode_rows(rows * k / n, rows * (k + 1) / n); });
+    bad[0] = decode_rows(0, rows / n);
+    for (auto& t : pool) t.join();
+    uint64_t sum = 0;
+    for (uint64_t b : bad) sum += b;
+    return sum;
 }
 
 }  // namespace nx::nvn
