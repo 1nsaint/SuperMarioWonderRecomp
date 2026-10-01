@@ -353,6 +353,9 @@ void gpu_profile_log(uint64_t frames) {
     std::vector<std::pair<double, std::string>> v;
     for (auto& [label, e] : g_totals) v.push_back({e.first, label});
     std::sort(v.rbegin(), v.rend());
+    double total = 0;
+    for (auto& e : v) total += e.first;
+    log("gpu profile: %8.2f ms/frame in all, %zu labels", total / double(frames), v.size());
     for (size_t k = 0; k < v.size() && k < 10; k++)
         log("gpu profile: %8.2f ms/frame  %s (%llu passes)", v[k].first / double(frames), v[k].second.c_str(),
             (unsigned long long)g_totals[v[k].second].second);

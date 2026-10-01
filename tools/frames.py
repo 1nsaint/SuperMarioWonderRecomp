@@ -19,8 +19,11 @@ def to_png(src: Path, dst: Path) -> int:
     dst.mkdir(parents=True, exist_ok=True)
     n = 0
     for ppm in sorted(src.glob("*.ppm")):
-        Image.open(ppm).convert("RGB").save(dst / (ppm.stem + ".png"))
-        n += 1
+        try:
+            Image.open(ppm).convert("RGB").save(dst / (ppm.stem + ".png"))
+            n += 1
+        except OSError:  # the last one, cut short when the run was stopped
+            print(f"skipped {ppm.name} (truncated)")
     print(f"{n} frames -> {dst}")
     return n
 

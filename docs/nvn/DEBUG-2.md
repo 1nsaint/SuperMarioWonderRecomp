@@ -230,3 +230,19 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
     blocks (`nvn_astc.cpp`). Course run on the RTX 3050: 379 textures decoded in 2.4 s in all (3.8 s on one thread);
     `astc_test` and `astc_check.py` still pass. With the warm pipeline cache, pipelines cost 0.36 s in all (1.2 s
     before the cache had filled). Course median 58 fps headless.
+
+76. **Exploded meshes in course 1-1 on Windows: the pipelined path. Synchronous by default off macOS.**
+    - The owner's play session (RTX 3050, windowed, pipelined): long black lines across the screen, stretched
+      triangles around the ground and bushes near Elephant Mario, a goal house turned into a sheaf of streaks
+      (`private/wonder/play2`, a frame every 5 s; `tools/find_glitches.py` flags them by near-black pixels in bright
+      scenes).
+    - Scripted runs did not show them: with Parsec taking ~70% of the CPU the game ran at 30 fps and the timing
+      changed. So the A/B ran with the owner playing: the same course with `NX_PIPELINED=0` (and 1-2 after it) had
+      none (`private/wonder/play3`, a frame every 2 s), at a 58 fps median against 40 for the pipelined session.
+    - So it is the overlap of frame N's GPU work with what the game does next (the Mac's #43 "exploded meshes" is
+      likely the same). The pipelined path was made for MoltenVK, which encodes Metal inside `vkQueueSubmit`; native
+      drivers do not need it.
+    - Fix (`nvn_frames.cpp` `pipelined()`): on by default on macOS only. `NX_PIPELINED=1..4` turns it on elsewhere
+      (to find the race itself, which is still open for the Mac).
+    - Tools: `tools/wonder_course.ps1 -Course11` goes on through the opening and the map into course 1-1;
+      `NX_GPU_PROFILE` logs the frame's GPU total.

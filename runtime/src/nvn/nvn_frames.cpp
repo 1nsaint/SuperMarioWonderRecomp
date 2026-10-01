@@ -242,13 +242,19 @@ int env_int(const char* name) {
 
 }  // namespace
 
-// On by default (course 1-1 headless: ~50 -> ~59 fps, same images; DEBUG.md #61). NX_PIPELINED=0: the synchronous
-// path; 2..4: that many submits in flight (2 by default). NX_ASYNC_GPU wins.
+// On by default on macOS only (course 1-1 headless: ~50 -> ~59 fps there; DEBUG.md #61): MoltenVK encodes Metal inside
+// vkQueueSubmit, which is what the overlap hides. With native drivers (Windows, NVIDIA) the synchronous path played
+// at 58 fps against 40 and had none of the exploded meshes the pipelined one shows in course 1-1 (DEBUG-2 #76).
+// NX_PIPELINED=0: synchronous; 1..4: pipelined, that many submits in flight (2 at least). NX_ASYNC_GPU wins.
 bool pipelined() {
     static const bool on = [] {
         if (env_int("NX_ASYNC_GPU") > 0) return false;
         const char* e = std::getenv("NX_PIPELINED");
+#if defined(__APPLE__)
         return !e || std::atoi(e) > 0;
+#else
+        return e && std::atoi(e) > 0;
+#endif
     }();
     return on;
 }
