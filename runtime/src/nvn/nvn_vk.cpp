@@ -234,7 +234,13 @@ bool init() {
     p_vkCreateSemaphore(g_device, &sci, nullptr, &g_acquired);
     p_vkCreateSemaphore(g_device, &sci, nullptr, &g_rendered);
 
-    make_upload_buffer(256ull << 20);  // a busy submit reached 67 MB (uniforms padded to 4 KB, storage to 64 KB)
+    // A busy submit reached 67 MB (uniforms padded to 4 KB, storage to 64 KB). Android: 128 MB, half, for an 8 GB
+    // phone (docs/nvn/android-perf/MEMORY.md: the phone never filled it; big uploads have staging buffers, #72).
+#if defined(__ANDROID__)
+    make_upload_buffer(128ull << 20);
+#else
+    make_upload_buffer(256ull << 20);
+#endif
     if (async_gpu())
         frame_init(g_pool, g_upload, g_upload_ptr, g_upload_size);  // the upload buffer becomes the slots' ring
     else

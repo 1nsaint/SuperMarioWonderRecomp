@@ -28,7 +28,7 @@ adb -s "$S" shell mkdir -p "'$D/frames'"
 adb -s "$S" shell am force-stop "$PKG"
 adb -s "$S" logcat -c
 adb -s "$S" shell am start -n "$PKG/android.app.NativeActivity" > /dev/null
-echo "t_s total_pss_kb graphics_kb native_kb mem_available_kb" > "$OUT/memory.txt"
+echo "t_s total_pss_kb graphics_kb native_kb mem_available_kb swap_pss_kb" > "$OUT/memory.txt"
 for t in $(seq 0 20 300); do
     sleep 20
     M=$(adb -s "$S" shell dumpsys meminfo "$PKG" 2>/dev/null)
@@ -37,7 +37,8 @@ for t in $(seq 0 20 300); do
     GFX=$(echo "$M" | grep -m1 "Graphics:" | awk '{print $2}')
     NAT=$(echo "$M" | grep -m1 "Native Heap:" | awk '{print $3}')
     AVAIL=$(adb -s "$S" shell grep MemAvailable /proc/meminfo | awk '{print $2}')
-    echo "$((t + 20)) $TOTAL $GFX $NAT $AVAIL" >> "$OUT/memory.txt"
+    SWAP=$(echo "$M" | grep -m1 "TOTAL SWAP PSS:" | awk '{print $10}')
+    echo "$((t + 20)) $TOTAL $GFX $NAT $AVAIL $SWAP" >> "$OUT/memory.txt"
     [ "$t" = 200 ] && adb -s "$S" shell "echo 10 > '$D/profile'"
 done
 adb -s "$S" logcat -d -v time 'wonder:I' '*:S' > "$OUT/logcat.txt"
