@@ -226,6 +226,28 @@ uint32_t frame_dump_every() {
     return n;
 }
 
+// NX_DUMP_FRAMES, or on demand while playing: a file named dump_frames in the data folder (optionally holding
+// "<count> [<every>]", default 40 frames, every 2nd) dumps the next presented frames, then is deleted. The game runs
+// at full speed until then, for glitches that only show in a long session (DEBUG-2 #77). Checked once a second.
+bool frame_dump_due(uint64_t presents) {
+    static uint64_t left = 0, every = 2, next_check = 0;
+    if (presents >= next_check) {
+        next_check = presents + 60;
+        std::string path = plat::data_root() + "/dump_frames";
+        if (FILE* f = plat::fopen_utf8(path, "rb")) {
+            unsigned long long n = 40, e = 2;
+            int got = std::fscanf(f, "%llu %llu", &n, &e);
+            std::fclose(f);
+            std::remove(path.c_str());
+            left = got >= 1 && n ? n : 40, every = got >= 2 && e ? e : 2;
+            log("dump_frames: the next %llu frames, every %llu (from present %llu)", (unsigned long long)left,
+                (unsigned long long)every, (unsigned long long)presents);
+        }
+    }
+    if (left && presents % every == 0) return left--, true;
+    return frame_dump_every() && presents % frame_dump_every() == 0;
+}
+
 namespace {
 
 struct Readback {

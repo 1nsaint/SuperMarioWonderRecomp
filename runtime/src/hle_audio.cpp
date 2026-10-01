@@ -324,10 +324,13 @@ void AudioRenderSystemUpdate(CPU& c) {
         // (the limiter crash again, once in ~25 Windows runs). The render thread runs every 5 ms: 1 s only bounds a stall.
         if (!g_pace_cv.wait_for(pk, std::chrono::seconds(1), [] { return g_renders != g_renders_at_update; }))
             log("audio: no render for 1 s since the last update: updating anyway");
-        g_renders_at_update = g_renders;
     }
     std::lock_guard lk(g_render_system);
     call(c, real);
+    // Counted after the update, under the render lock (renders count themselves under it too): a render that began
+    // before this update and ended after it no longer passes for one that used it (the limiter crash, DEBUG-2 #74).
+    std::lock_guard pk(g_pace_lock);
+    g_renders_at_update = g_renders;
 }
 
 void CommandListProcessorProcess(CPU& c) {
@@ -418,13 +421,11 @@ void audio_render_thread(CPU& c) {
             call(c, sdk_base() + kExecuteRendering);
             last_rc = c.x[0];
             std::memcpy(c.x, saved, sizeof saved);
-        }
-        busy_ns += plat::monotonic_ns() - t0;
-        if (!list.empty()) {
-            std::lock_guard pk(g_pace_lock);
+            std::lock_guard pk(g_pace_lock);  // counted under the render lock (AudioRenderSystemUpdate)
             g_renders++;
             g_pace_cv.notify_all();
         }
+        busy_ns += plat::monotonic_ns() - t0;
         render_submit();
         if (++frames % 2000 == 0)
             log("audio: %llu frames rendered, %.1f us each, last result %llx", (unsigned long long)frames,

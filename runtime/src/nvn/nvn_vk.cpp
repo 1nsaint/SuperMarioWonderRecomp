@@ -517,7 +517,7 @@ void present_headless(uint64_t texture) {
     if (presents % (presents < 300 ? 60 : 300) == 0) draw_log_stats();
     if (presents % 60 == 0) log_timing(60), gpu_profile_log(60);
     if (presents % 300 == 0) zero_draws_log();
-    if (!frame_dump_every() || presents % frame_dump_every() != 0) return;
+    if (!frame_dump_due(presents)) return;
     if (src && src->layout != VK_IMAGE_LAYOUT_UNDEFINED && begin()) {
         transition(g_cb, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         bool dump = frame_dump_record(g_cb, *src);
@@ -579,14 +579,15 @@ void gpu_present(uint64_t texture, const int32_t* crop) {
     if (presents % (presents < 300 ? 60 : 300) == 0) draw_log_stats();
     if (presents % 60 == 0) log_timing(60), gpu_profile_log(60);
     if (presents % 300 == 0) zero_draws_log();
-    bool dump = src && frame_dump_every() && presents % frame_dump_every() == 0 && frame_dump_record(g_cb, *src);
+    const bool due = frame_dump_due(presents);
+    bool dump = src && due && frame_dump_record(g_cb, *src);
     VkSemaphore rendered = async_gpu() ? frame_rendered_semaphore(index) : g_rendered;
     if (async_gpu())  // the blit's fence is not waited for (vkQueuePresentKHR waits on `rendered`); a dumped frame is
         frame_submit(acquired, rendered, {}, dump);
     else
         end_and_wait(acquired, rendered);
     if (dump) frame_dump_write(*src, presents);
-    if (frame_dump_every() && presents % frame_dump_every() == 0) debug_dump_textures(presents);
+    if (due) debug_dump_textures(presents);
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &rendered;

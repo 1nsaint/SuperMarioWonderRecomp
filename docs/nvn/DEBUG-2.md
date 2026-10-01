@@ -246,3 +246,15 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
       (to find the race itself, which is still open for the Mac).
     - Tools: `tools/wonder_course.ps1 -Course11` goes on through the opening and the map into course 1-1;
       `NX_GPU_PROFILE` logs the frame's GPU total.
+
+77. **World map: every other frame broken while Mario walks (open), and the limiter crash at boot once more (#74).**
+    - The owner's recording (map, after playing courses): while Mario moves, about half the frames show a flat
+      lavender scene, huge black triangles and Mario as a purple silhouette; standing still is fine.
+    - Not reproduced from a boot straight into the map (headless at 14 fps, windowed at 59 fps with
+      `tools/capture_burst.ps1` taking 116 window captures while a script walked Mario back and forth): it needs the
+      state of a longer session.
+    - Tool for that: a file named `dump_frames` in the data folder (`"<count> [<every>]"`) dumps the next presented
+      frames at full speed (`nvn_debug.cpp` `frame_dump_due`).
+    - #74 again: a render that began before an update and ended after it counted as a render that used it. The update
+      now records the render count after it ran, under the render lock, and renders count themselves under it.
+      20 boots in a row: no crash.
