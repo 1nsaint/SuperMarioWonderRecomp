@@ -60,7 +60,7 @@ echo "t_s total_pss_kb graphics_kb native_kb mem_available_kb swap_pss_kb" > "$O
 for t in $(seq 0 20 300); do
     sleep 20
     [ "$MEMWATCH" = 1 ] && memsample $((t + 20))
-    [ "$GPUWATCH" = 1 ] && echo "$((t + 20)) $(adb -s "$S" shell cat /sys/class/kgsl/kgsl-3d0/gpuclk /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage 2>/dev/null | tr '\n' ' ')" >> "$OUT/gpu.txt"
+    [ "$GPUWATCH" = 1 ] && echo "$((t + 20)) $(adb -s "$S" shell cat /sys/class/kgsl/kgsl-3d0/devfreq/cur_freq /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage 2>/dev/null | tr '\n' ' ')" >> "$OUT/gpu.txt"
     [ "$t" = "$PROFILE_AT" ] && adb -s "$S" shell "echo 10 > '$D/profile'"
 done
 [ "$MEMWATCH" = end ] && memsample 320

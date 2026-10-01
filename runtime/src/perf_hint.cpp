@@ -8,7 +8,11 @@
 
 #if defined(__ANDROID__)
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/syscall.h>
+
+#include <cerrno>
 #include <unistd.h>
 
 #include <algorithm>
@@ -61,6 +65,34 @@ bool g_dirty = false;
 
 }  // namespace
 
+// NX_GPU_TURBO=1 (an experiment, off by default): the Adreno kernel driver's power control off, so the GPU runs at its
+// highest clock (thermal limits still apply). The idea is libadrenotools' adrenotools_set_turbo (BSD-2-Clause); this
+// is written from the kernel's msm_kgsl UAPI: IOCTL_KGSL_SETPROPERTY (type 0x09, nr 0x32) with KGSL_PROP_PWRCTRL (0xE)
+// and the value 0. The 30-fps lock lowered the GPU clock and frames then took longer (MEASUREMENTS.md, phase 4).
+// The setting outlives the process (the GPU stayed at its top clock with the game closed), so every start sets it:
+// off with NX_GPU_TURBO=1, back on (the driver's normal clock control) otherwise.
+void gpu_turbo() {
+    const char* e = std::getenv("NX_GPU_TURBO");
+    const bool turbo = e && e[0] == '1';
+    struct Property {
+        unsigned int type;
+        void* value;
+        size_t sizebytes;
+    };
+    int fd = open("/dev/kgsl-3d0", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        log("gpu turbo: /dev/kgsl-3d0 not opened (errno %d)", errno);
+        return;
+    }
+    unsigned int enable = turbo ? 0 : 1;
+    Property p{0xE, &enable, sizeof enable};
+    int r = ioctl(fd, _IOW(0x09, 0x32, Property), &p);
+    log("gpu turbo: KGSL power control %s: %s (errno %d)", turbo ? "off (NX_GPU_TURBO=1)" : "on (normal)",
+        r == 0 ? "done" : "refused", r == 0 ? 0 : errno);
+    if (!turbo) close(fd);
+    // The descriptor stays open: the driver ties the setting to it.
+}
+
 void perf_hint_thread() {
     if (!api().ok) return;
     thread_local bool joined = false;
@@ -85,6 +117,7 @@ void perf_hint_frame(int64_t ns) {
     if (g_session) a.report(g_session, ns);
 }
 #else
+void gpu_turbo() {}
 void perf_hint_thread() {}
 void perf_hint_frame(int64_t) {}
 #endif

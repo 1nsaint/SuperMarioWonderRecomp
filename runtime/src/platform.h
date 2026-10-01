@@ -77,6 +77,7 @@ size_t touch_overlay(OverlayShape* out, size_t max);
 // a frame's work took `ns`.
 void perf_hint_thread();
 void perf_hint_frame(int64_t ns);
+void gpu_turbo();  // NX_GPU_TURBO=1: the Adreno GPU at its highest clock (perf_hint.cpp; Android)
 // Frame threads and present intervals (frame_stats.cpp): the cores they run on, their CPU time, NX_AFFINITY.
 // role 0: the thread that replays and presents (frame_presented ticks it); 1: the game's main thread.
 void frame_thread_tick(int role);

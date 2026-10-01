@@ -577,6 +577,7 @@ extern "C" void android_main(android_app* app) {
         nx::log("heap: zero-fill off (%d), page release delayed (%d)", zero, decay);
     }
     start_memory_guard();
+    gpu_turbo();
     app->onAppCmd = on_cmd;
     app->onInputEvent = on_input;
     // NX_SHOW_WHEN_LOCKED=1 (unattended test runs, tools/wonder_phone_course.sh): shown over the lock screen and turning
