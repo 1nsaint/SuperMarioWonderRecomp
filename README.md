@@ -45,7 +45,42 @@ The details are in the GitHub milestones.
 - **Windowed confirmation of the W7 glitch fixes (#43-#45, #47):** horizon band, silhouettes, present mode.
 - **Character-select blur:** needs a reference from a real console.
 - **Android port:** planned in [docs/nvn/ANDROID-PORT.md](docs/nvn/ANDROID-PORT.md), in progress on branch
-  `feat/android-wonder`.
+  `feat/android-wonder`. See below.
+- **Windows port:** planned in [docs/nvn/WINDOWS-PORT.md](docs/nvn/WINDOWS-PORT.md), branch `feat/windows-wonder`.
+
+### Android (in progress, branch `feat/android-wonder`)
+
+The same recompiled code runs on arm64 phones with a native Vulkan 1.3 driver. On a Galaxy S23 (Snapdragon 8 Gen 2)
+the game runs at 40-60 fps at the title. Since then these were added:
+- the present pass: rotated to the display, 16:9 with bars, alpha 1;
+- drawn touch controls;
+- a pipeline cache on disk;
+- ADPF performance hints.
+
+They were checked on the Mac, with the phone check pending. Progress and the test list are in ANDROID-PORT.md.
+
+Build and install (macOS or Linux, Android SDK with NDK 28.2):
+
+```sh
+private/venv/bin/python tools/pack_phone_wonder.py        # your data -> private/wonder/Wonder-data.zip (~4 GB)
+CMAKE_BUILD_PARALLEL_LEVEL=4 bash android/build_apk.sh --game wonder   # -> private/wonder/apk/wonder.apk
+bash tools/wonder_push_android.sh <adb serial>             # install + data to Internal storage + all-files access
+bash tools/wonder_run_android.sh <adb serial> 90 run1      # start, wait, save the log, pull frame dumps
+```
+
+Without a computer, copy the APK and the zip to the phone:
+1. Extract the zip into Internal storage. You get `Super Mario Bros. Wonder/`.
+2. Install the APK.
+3. Allow "all files access" when the app asks.
+
+The APK contains recompiled game code built from your own dump. It is for you only: never share or publish it.
+
+Touch controls:
+- **Right side:** A (jump, big), B, Y (dash), X.
+- **Top:** ZR, R, L, + and -.
+- **Left half:** a stick that appears where your thumb lands; pushed all the way, it also dashes.
+
+A Bluetooth or USB controller works too, and the touch controls hide while it is in use.
 
 ### Build and run (macOS, Apple Silicon)
 
@@ -87,7 +122,7 @@ Useful switches:
 | `NX_HANDHELD=1` | handheld mode, 720p |
 | `NX_PIPELINED=0` | waits for every submit, as before 60 fps (diagnosis) |
 
-Every debug switch (draw traces, snapshots, bisecting toggles) is listed in [docs/nvn/DEBUG.md](docs/nvn/DEBUG.md).
+Every debug switch (draw traces, snapshots, bisecting toggles) is listed in [docs/nvn/SWITCHES.md](docs/nvn/SWITCHES.md).
 
 ### How it works, and where it is written down
 

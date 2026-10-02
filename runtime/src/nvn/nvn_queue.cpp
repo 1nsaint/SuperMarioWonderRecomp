@@ -11,7 +11,9 @@
 #include <chrono>
 #include <array>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <atomic>
 #include <vector>
 
@@ -44,16 +46,40 @@ void submit_done() {
     g_sub_cv.notify_all();
 }
 
+// Where the game waits for the replay (docs/nvn/android-perf/PHASE3.md I1): calls, the ones that blocked and for how
+// long, per 600 presents; frame_ns is this main-thread frame's blocked time, for the hitch lines (frame_time_probe).
+struct WaitSite {
+    const char* name;
+    std::atomic<uint64_t> calls{0}, blocked{0}, ns{0}, frame_ns{0};
+};
+WaitSite g_wait_sites[kWaitSites] = {{"sync wait"}, {"queue finish"}, {"pool invalidate"}, {"pool finalize"}};
+
 // Waits until the submits up to `seq` were replayed (2 s at most: a hung replay is logged, not waited forever).
-void wait_submits(uint64_t seq) {
+void wait_submits(uint64_t seq, int site) {
     if (sync_loose() || !seq) return;
+    WaitSite& w = g_wait_sites[site];
+    w.calls++;
     std::unique_lock lk(g_sub_lock);
     if (g_sub_done >= seq) return;
     uint64_t n = ++g_sub_blocked;
     if (n == 1 || n % 1000 == 0) log("nvn: %llu CPU waits blocked on a submit still being replayed", (unsigned long long)n);
+    uint64_t t0 = plat::monotonic_ns();
     if (!g_sub_cv.wait_for(lk, std::chrono::seconds(2), [seq] { return g_sub_done >= seq; }))
         log("nvn: a CPU wait gave up after 2 s on submit %llu (%llu done)", (unsigned long long)seq,
             (unsigned long long)g_sub_done);
+    uint64_t dt = plat::monotonic_ns() - t0;
+    w.blocked++, w.ns += dt, w.frame_ns += dt;
+}
+
+void log_wait_sites() {
+    std::string line;
+    for (WaitSite& w : g_wait_sites) {
+        char b[128];
+        std::snprintf(b, sizeof b, "; %s %llu calls, %llu blocked %.1f ms", w.name, (unsigned long long)w.calls.exchange(0),
+                      (unsigned long long)w.blocked.exchange(0), double(w.ns.exchange(0)) / 1e6);
+        line += b;
+    }
+    log("nvn: game waits on the replay over 600 presents%s", line.c_str());
 }
 
 uint64_t submits_called() {
@@ -63,7 +89,7 @@ uint64_t submits_called() {
 }  // namespace
 
 // MemoryPoolInvalidateMappedRange / Finalize (nvn_objects.cpp): the CPU reads or frees what submits made so far use.
-void wait_submits_so_far() { wait_submits(submits_called()); }
+void wait_submits_so_far(int site) { wait_submits(submits_called(), site); }
 
 namespace {
 
@@ -91,7 +117,7 @@ void signal_sync(uint64_t guest) {
 // for whatever the timeout, 2 s at most (then the GPU hung and the process ends). Correct results before latency.
 void SyncWait(CPU& c) {
     auto* s = get<Sync>(c.x[0]);
-    if (s) wait_submits(s->seq.load());
+    if (s) wait_submits(s->seq.load(), kWaitSync);
     if (s) worker_wait(s->job);
     if (uint64_t serial = s ? s->serial.load() : 0) gpu_wait(serial);
     c.x[0] = 0;
@@ -104,6 +130,7 @@ std::atomic<uint64_t> g_presents{0};
 void QueueInitialize(CPU& c) { c.x[0] = 1; }  // NVNboolean (NVNqueue*, const NVNqueueBuilder*)
 void QueueFinalize(CPU&) {}
 void QueueSubmitCommands(CPU& c) {  // (NVNqueue*, int count, const NVNcommandHandle*)
+    plat::perf_hint_thread();  // this thread replays: part of every frame (perf_hint.cpp)
     std::vector<std::shared_ptr<CmdList>> lists;
     static uint64_t submitted = 0, missing = 0;
     for (uint32_t k = 0; k < uint32_t(c.x[1]); k++) {
@@ -135,7 +162,7 @@ void QueueSubmitCommands(CPU& c) {  // (NVNqueue*, int count, const NVNcommandHa
 }
 void QueueFlush(CPU&) {}
 void QueueFinish(CPU&) {
-    wait_submits(submits_called());
+    wait_submits(submits_called(), kWaitFinish);
     worker_finish();
     gpu_wait(gpu_serial());
 }
@@ -200,6 +227,50 @@ void WindowGetPresentInterval(CPU& c) {
     c.x[0] = w ? uint64_t(w->interval) : 1;
 }
 
+// Our governor over the game's (NX_GOVERNOR; on by default on Android unless NX_MAX_INTERVAL is set). The game's own
+// rule (below) locks 30 fps after 3 frames over 15.83 ms; at 30 fps a phone lowers its clocks, every frame then takes
+// longer, and it never leaves 30 (a Galaxy S23 sat at 30 fps in course with frames that run at 60 when allowed).
+// This one holds 60 (the game's maximum clamped to 1) while it is kept: it watches the main thread's loop period over
+// 120-frame windows, and when two windows in a row had over 20% of their frames past 20 ms (the game would run
+// visibly slow; one window is a scene load), it hands the choice back to the game (30 fps at the right speed) for a
+// while, then tries 60 again, skipping the first 90 frames of a try (the clocks ramp up from the 30-fps level). The
+// wait doubles after each failed try (10 s, 20 s, ... 80 s) and resets once a try holds. Returns 1 (clamp) or 0.
+uint32_t governor_max(uint64_t now) {
+    static const bool on = [] {
+        const char* e = std::getenv("NX_GOVERNOR");
+#if defined(__ANDROID__)
+        return !(e && e[0] == '0');
+#else
+        return e && e[0] == '1';
+#endif
+    }();
+    if (!on) return 0;
+    static uint64_t last = 0, frames = 0, slow = 0, game_until = 0, warm_until = 0, backoff = 600, n = 0;
+    static int bad_windows = 0, held_windows = 0;
+    uint64_t period = last ? now - last : 0;
+    last = now;
+    n++;
+    if (n < game_until) return 0;
+    if (n == game_until) frames = slow = 0, bad_windows = 0, warm_until = n + 90;
+    if (n < warm_until) return 1;
+    frames++, slow += period > 20'000'000ull;
+    if (frames < 120) return 1;
+    bool held = slow * 5 <= frames;
+    if (!held || held_windows++ % 30 == 0)
+        log("nvn: governor: %llu of %llu frames over 20 ms%s", (unsigned long long)slow, (unsigned long long)frames,
+            held ? ": 60 fps holds" : bad_windows ? ": back to the game's choice" : " (once: still 60)");
+    frames = slow = 0;
+    if (held) {
+        bad_windows = 0, backoff = 600;
+        return 1;
+    }
+    held_windows = 0;
+    if (++bad_windows < 2) return 1;
+    game_until = n + backoff;
+    backoff = std::min<uint64_t>(backoff * 2, 4800);
+    return 0;
+}
+
 // Wonder's sead::GameFramework::procFrame_ override (main+e15ec) picks the interval every frame from the main
 // thread's last frame time, fw[0x118] (GetSystemTick ticks from the end of the previous present wait to the end of
 // this frame's calc and draw recording): 2 when it reaches 15.83 ms, locked after 3 slow frames, back to 1 after 15
@@ -208,9 +279,14 @@ void WindowGetPresentInterval(CPU& c) {
 void frame_time_probe(CPU& c) {
     const LoadedModule* m = module_at(c.x[30]);
     if (!m || c.x[30] - m->base != 0xe16ac || !c.x[19]) return;
+    plat::perf_hint_thread();  // the game's main thread makes the frame too (ADPF, PLAN.md R2)
+    plat::frame_thread_tick(1);
     static const char* max_env = std::getenv("NX_MAX_INTERVAL");
-    if (max_env && std::atoi(max_env) >= 1) {
-        uint32_t max = uint32_t(std::atoi(max_env));
+    static uint32_t game_max = 0;  // the game's own maximum (fw[0x24c]), restored when the governor lets go
+    if (!game_max) game_max = ld<uint32_t>(c.x[19] + 0x24c);
+    uint32_t max = max_env && std::atoi(max_env) >= 1 ? uint32_t(std::atoi(max_env)) : governor_max(plat::monotonic_ns());
+    if (!max && !max_env && game_max) st<uint32_t>(c.x[19] + 0x24c, game_max);
+    if (max >= 1) {
         st<uint32_t>(c.x[19] + 0x24c, max);
         if (ld<uint32_t>(c.x[19] + 0x268) > max) st<uint32_t>(c.x[19] + 0x268, max);
         if (ld<uint32_t>(c.x[19] + 0x264) > max) st<uint32_t>(c.x[19] + 0x264, max);
@@ -218,6 +294,29 @@ void frame_time_probe(CPU& c) {
     }
     static uint64_t bins[5] = {}, frames = 0;
     double ms = double(ld<uint64_t>(c.x[19] + 0x118)) / 19200.0;
+    // A main-thread frame over 33 ms: what it waited on (PHASE3.md I1), its CPU time, faults and switches since the
+    // last call, and how much of it a memory-guard read covered (PHASE4.md H0). NX_HITCH_LINES lines at most (300).
+    static int hitches = 0;
+    static const int max_hitches = std::getenv("NX_HITCH_LINES") ? std::atoi(std::getenv("NX_HITCH_LINES")) : 300;
+    static uint64_t cpu_prev = 0;
+    static long faults_prev[2] = {}, switches_prev[2] = {};
+    uint64_t cpu = 0, now = plat::monotonic_ns();
+    long faults[2], switches[2];
+    plat::thread_counters(cpu, faults, switches);
+    if (ms >= 33 && hitches < max_hitches && cpu_prev) {
+        hitches++;
+        uint64_t span = uint64_t(ms * 1e6);
+        log("hitch: frame %llu, main thread %.1f ms (cpu %.1f), blocked: sync %.1f, finish %.1f, invalidate %.1f, "
+            "finalize %.1f ms; faults %ld/%ld, switches %ld/%ld; guard read %.1f ms",
+            (unsigned long long)g_frame.load(), ms, double(cpu - cpu_prev) / 1e6,
+            double(g_wait_sites[0].frame_ns) / 1e6, double(g_wait_sites[1].frame_ns) / 1e6,
+            double(g_wait_sites[2].frame_ns) / 1e6, double(g_wait_sites[3].frame_ns) / 1e6, faults[0] - faults_prev[0],
+            faults[1] - faults_prev[1], switches[0] - switches_prev[0], switches[1] - switches_prev[1],
+            double(plat::memguard_overlap_ns(now > span ? now - span : 0, now)) / 1e6);
+    }
+    cpu_prev = cpu;
+    for (int k = 0; k < 2; k++) faults_prev[k] = faults[k], switches_prev[k] = switches[k];
+    for (WaitSite& w : g_wait_sites) w.frame_ns = 0;
     bins[ms < 12 ? 0 : ms < 15.83 ? 1 : ms < 20 ? 2 : ms < 33 ? 3 : 4]++;
     if (++frames % 600 == 0) {
         log("nvn: main-thread frame time over 600 frames: <12 ms %llu, <15.8 %llu, <20 %llu, <33 %llu, more %llu",
@@ -250,12 +349,18 @@ void pace_present(int interval) {
     if (next > now) plat::sleep_ns(next - now), now = plat::monotonic_ns();
     static uint64_t presents = 0, at2 = 0;  // how often the game asks for 30 fps (interval 2), per 600 presents
     at2 += interval >= 2;
-    if (++presents % 600 == 0) log("nvn: %llu of the last 600 presents at interval >= 2", (unsigned long long)at2), at2 = 0;
+    if (++presents % 600 == 0)
+        log("nvn: %llu of the last 600 presents at interval >= 2", (unsigned long long)at2), at2 = 0, log_wait_sites();
     uint64_t period = uint64_t(interval) * 16'666'667ull;
     next = (next > now || now - next < period ? next : now) + period;
 }
 
 void QueuePresentTexture(CPU& c) {
+    // The frame's work, from the end of the last present's pacing to now (perf_hint.cpp: ADPF on Android).
+    static uint64_t work_from = 0;
+    uint64_t t_in = plat::monotonic_ns();
+    plat::perf_hint_thread();
+    if (work_from) plat::perf_hint_frame(int64_t(t_in - work_from));
     if (auto* w = get<Window>(c.x[1])) {
         // At most two presents queued: the game runs at most two frames ahead of the replay.
         static uint64_t queued[2] = {};
@@ -269,6 +374,7 @@ void QueuePresentTexture(CPU& c) {
         }
         pace_present(w->interval);
     }
+    work_from = plat::monotonic_ns();
     uint64_t n = ++g_presents;
     if (n == 1 || (n & (n - 1)) == 0) log("nvn: present #%llu (texture %d)", (unsigned long long)n, int(c.x[2]));
     g_frame++;

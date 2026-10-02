@@ -226,6 +226,28 @@ uint32_t frame_dump_every() {
     return n;
 }
 
+// NX_DUMP_FRAMES, or on demand while playing: a file named dump_frames in the data folder (optionally holding
+// "<count> [<every>]", default 40 frames, every 2nd) dumps the next presented frames, then is deleted. The game runs
+// at full speed until then, for glitches that only show in a long session (DEBUG-2 #77). Checked once a second.
+bool frame_dump_due(uint64_t presents) {
+    static uint64_t left = 0, every = 2, next_check = 0;
+    if (presents >= next_check) {
+        next_check = presents + 60;
+        std::string path = plat::data_root() + "/dump_frames";
+        if (FILE* f = plat::fopen_utf8(path, "rb")) {
+            unsigned long long n = 40, e = 2;
+            int got = std::fscanf(f, "%llu %llu", &n, &e);
+            std::fclose(f);
+            std::remove(path.c_str());
+            left = got >= 1 && n ? n : 40, every = got >= 2 && e ? e : 2;
+            log("dump_frames: the next %llu frames, every %llu (from present %llu)", (unsigned long long)left,
+                (unsigned long long)every, (unsigned long long)presents);
+        }
+    }
+    if (left && presents % every == 0) return left--, true;
+    return frame_dump_every() && presents % frame_dump_every() == 0;
+}
+
 namespace {
 
 struct Readback {
@@ -310,7 +332,7 @@ double g_period_ns = 1.0;
 }  // namespace
 
 bool gpu_profile_on() {
-    static const bool on = std::getenv("NX_GPU_PROFILE") != nullptr;
+    static const bool on = std::getenv("NX_GPU_PROFILE") && std::atoi(std::getenv("NX_GPU_PROFILE")) == 1;
     return on;
 }
 
@@ -353,6 +375,9 @@ void gpu_profile_log(uint64_t frames) {
     std::vector<std::pair<double, std::string>> v;
     for (auto& [label, e] : g_totals) v.push_back({e.first, label});
     std::sort(v.rbegin(), v.rend());
+    double total = 0;
+    for (auto& e : v) total += e.first;
+    log("gpu profile: %8.2f ms/frame in all, %zu labels", total / double(frames), v.size());
     for (size_t k = 0; k < v.size() && k < 10; k++)
         log("gpu profile: %8.2f ms/frame  %s (%llu passes)", v[k].first / double(frames), v[k].second.c_str(),
             (unsigned long long)g_totals[v[k].second].second);

@@ -215,6 +215,7 @@ VkPipeline pipeline(const Key& key) {
     ri.stencilAttachmentFormat = stencil ? key.depth : VK_FORMAT_UNDEFINED;
     VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     ci.pNext = &ri;
+    if (render_pass_objects()) ci.pNext = nullptr, ci.renderPass = compatible_render_pass(key.count, key.colors, key.depth);
     ci.stageCount = 2;
     ci.pStages = stages;
     ci.pVertexInputState = &vi;
@@ -244,7 +245,7 @@ bool mask_clear(VkCommandBuffer cb, const Targets& t, uint32_t slot, uint32_t ma
     key.count = t.color_count, key.slot = slot, key.mask = mask & 0xF;
     for (uint32_t k = 0; k < t.color_count; k++) {  // as draw_call builds its PipelineKey
         GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
-        key.colors[k] = img ? view_format(*img, t.views.format[k]) : VK_FORMAT_R8G8B8A8_UNORM;
+        key.colors[k] = img ? view_format(*img, t.views.format[k]) : unused_slot_format();
     }
     GpuImage* dimg = t.depth ? image_of(t.depth) : nullptr;
     key.depth = dimg && dimg->aspect != VK_IMAGE_ASPECT_COLOR_BIT ? dimg->format : VK_FORMAT_UNDEFINED;

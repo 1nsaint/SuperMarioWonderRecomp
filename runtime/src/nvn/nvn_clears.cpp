@@ -32,7 +32,7 @@ struct Pending {
     VkClearValue depth{};
 };
 Pending g_pending;
-uint64_t g_deferred = 0, g_as_load = 0, g_alone = 0;
+uint64_t g_deferred = 0, g_as_load = 0, g_alone = 0, g_transfer = 0;
 uint64_t g_scissored = 0, g_masked = 0, g_mask_fallback = 0, g_scissor_lost = 0;  // G6
 
 // begin_rendering's render area for these targets: the smallest attachment at its level.
@@ -116,19 +116,78 @@ uint32_t clears_apply(const Targets& t, VkRenderingAttachmentInfo* colors, VkRen
     return cleared;
 }
 
+// A pending clear that no pass takes, as transfer clears instead of an empty pass (docs/nvn/android-perf/PHASE4.md
+// G5A): on Adreno each pass makes the driver's per-pass objects (~40-57 us), ~11 such passes per course frame. A pending
+// clear covers its whole target (draw_clear defers only those), so clearing the view's level and layer is the same.
+// Not for a view in another format than its image (a loadOp clears through the view, an sRGB view encodes), nor for
+// 3D images (a transfer clear takes every slice): those keep the pass. Android by default (MoltenVK encodes a transfer
+// clear as a Metal encoder of its own, DEBUG.md #31); NX_CLEARS_PASS=1: the pass; NX_CLEARS_TRANSFER=1: elsewhere too.
+bool transfer_clears() {
+    static const bool on = [] {
+#if defined(__ANDROID__)
+        return std::getenv("NX_CLEARS_PASS") == nullptr;
+#else
+        return std::getenv("NX_CLEARS_TRANSFER") != nullptr;
+#endif
+    }();
+    return on;
+}
+
+bool clears_transfer(VkCommandBuffer cb, const Targets& t) {
+    GpuImage* imgs[9] = {};
+    for (uint32_t k = 0; k < t.color_count; k++) {
+        if (!(g_pending.colors >> k & 1)) continue;
+        GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
+        if (!img) continue;
+        if (img->view_type == VK_IMAGE_VIEW_TYPE_3D || view_format(*img, t.views.format[k]) != img->format) return false;
+        imgs[k] = img;
+    }
+    if (g_pending.ds) {
+        GpuImage* d = t.depth ? image_of(t.depth) : nullptr;
+        if (d && (d->aspect & g_pending.ds) != g_pending.ds) return false;
+        imgs[8] = d;
+    }
+    for (uint32_t k = 0; k < 9; k++) {
+        GpuImage* img = imgs[k];
+        if (!img) continue;
+        transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);  // as begin_rendering: rendered images stay GENERAL
+        img->rendered = true;
+        uint32_t level = std::min<uint32_t>(t.views.level[k], img->levels - 1);
+        uint32_t layer = std::min<uint32_t>(t.views.layer[k], img->layers - 1);
+        if (k < 8) {
+            VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, level, 1, layer, 1};
+            p_vkCmdClearColorImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &g_pending.color[k].color, 1, &r);
+        } else {
+            VkImageSubresourceRange r{g_pending.ds, level, 1, layer, 1};
+            p_vkCmdClearDepthStencilImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &g_pending.depth.depthStencil, 1, &r);
+        }
+    }
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr,
+                           0, nullptr);
+    g_pending.on = false;
+    g_transfer++;
+    return true;
+}
+
 void clears_flush(VkCommandBuffer cb) {
     if (!g_pending.on) return;
     Targets t = g_pending.t;
-    g_alone++, g_as_load--;  // counted by clears_apply
-    pass_begin(cb, t);        // takes the clears as its loadOps
+    g_alone++;
+    if (transfer_clears() && clears_transfer(cb, t)) return;
+    g_as_load--;           // counted by clears_apply
+    pass_begin(cb, t);     // takes the clears as its loadOps
     pass_end_only(cb, 3);
 }
 
 void clears_begin_submit() { g_pending.on = false; }
 
 void clears_log() {
-    log("nvn clears: %llu deferred to the next pass on their targets, %llu of those passes with draws, %llu alone",
-        (unsigned long long)g_deferred, (unsigned long long)g_as_load, (unsigned long long)g_alone);
+    log("nvn clears: %llu deferred to the next pass on their targets, %llu of those passes with draws, %llu alone "
+        "(%llu of those as transfer clears)", (unsigned long long)g_deferred, (unsigned long long)g_as_load,
+        (unsigned long long)g_alone, (unsigned long long)g_transfer);
     log("nvn clears: %llu scissored (%llu of those outside the pass: whole target), %llu channel-masked (%llu of those "
         "all channels: integer target or no pipeline)", (unsigned long long)g_scissored,
         (unsigned long long)g_scissor_lost, (unsigned long long)g_masked, (unsigned long long)g_mask_fallback);

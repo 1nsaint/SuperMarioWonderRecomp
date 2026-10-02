@@ -36,6 +36,40 @@ Build products go to `private/build/spirv_harness/` (set in the harness's `Direc
 per project). `Ryujinx.Common` and `Spv.Generator` build inside their own checkout; the translator itself is built by
 `translator/` (below). The build needs `patch` (macOS has it).
 
+### Setup (Windows)
+
+Same pieces, Windows 11 / PowerShell: the system-wide .NET SDK 10.0.401, the same Ryubing archive (`tar` ships with
+Windows), `spirv-val` from the Vulkan SDK. Windows has no `patch`, so on `Windows_NT` the translator csproj runs
+`tools/maxwell/apply_patch.py` instead (same arguments; unified diff after a free-text header, exact hunks with
+patch's offset search, CRLF-insensitive, keeps the source's line ends); it uses `private\venv` if present, else
+`python` (`-p:PatchPython=...`). The harness writes `results.tsv` with LF, strips Windows paths from stack frames
+and orders manifests with `/`, so its output is the same bytes as on macOS.
+
+```powershell
+$T="private\third_party"; mkdir -Force $T\ryubing
+curl.exe -L -o $T\ryubing.tar.gz https://codeberg.org/Software_arch/Ryubing/archive/a82350bb77.tar.gz
+tar -xzf $T\ryubing.tar.gz -C $T\ryubing --strip-components=1; rm $T\ryubing.tar.gz
+dotnet build tools/maxwell/spirv_harness/SpirvHarness.csproj -c Release -m:2      # ~3 min the first time
+private\venv\Scripts\python -m pip install zstandard                               # containers.py reads .zs
+# extract: uber, secred, agl, gsys, effect_<name> (33), layout_<name> (the 103 blarc with shaders), as above
+private\venv\Scripts\python tools\maxwell\exefs_shaders.py private\wonder\analysis\main.bin `
+    --extract private\wonder\shaders_extracted\exefs                               # after the others (see below)
+$env:PATH="C:\VulkanSDK\1.4.357.0\Bin;$env:PATH"
+dotnet private\build\spirv_harness\bin\Release\net10.0\spirv_harness.dll --batch private\wonder\shaders_extracted `
+    --out private\wonder\spirv_regen --jobs 3 --spirv-val C:\VulkanSDK\1.4.357.0\Bin\spirv-val.exe
+```
+
+**`exefs` group.** Besides the RomFS containers, `main` embeds 34 code blocks that no container holds (the glyph
+shaders of *Silent miscompile* among them), hence 12,751 blocks and 47,831 stages in the batch. `exefs_shaders.py`
+finds them by magic in the flat image of `tools/nso2bin.py` and pairs each with the control section whose fields
+describe it (size, start, program length, constant data); it leaves out blocks the other manifests already have.
+
+Measured (2026-09-30, while a `ninja -j6` build shared the machine): extraction 2 min (94 MB), batch with `spirv-val`
+200 s with 3 jobs. All 12,751 `.spv` are byte for byte the Mac's (so the Mac set was built with `spirv-else-if` and
+`spirv-fmz` only, not `spirv-nan`), and `shader_cache_test` passes on the regenerated `results.tsv`. Between two
+runs `results.tsv` differs only in `ms` and, for about 24 `ok-retry` rows, in the stack frame quoted for the first
+attempt's exception (`GenerateCall` or `GetLocalPointer`, depending on JIT inlining).
+
 ## The harness (`tools/maxwell/spirv_harness/`)
 
 | File | What |

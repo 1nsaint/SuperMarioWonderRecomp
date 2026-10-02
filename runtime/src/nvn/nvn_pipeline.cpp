@@ -10,6 +10,7 @@
 #include <unordered_map>
 
 #include "nvn_pipeline.h"
+#include "platform.h"
 
 namespace nx::nvn {
 
@@ -19,6 +20,7 @@ using namespace nx::vk;
 // blends in linear) and samples them the same way. Ignoring it lost one conversion per draw: far too much contrast
 // and saturation (docs/nvn/DEBUG.md #29).
 VkFormat view_format(const GpuImage& img, uint32_t nvn) {
+    if (VkFormat f; bc_view_format(img, nvn, f)) return f;  // decoded BC (nvn_bc.cpp)
     if (!nvn || nvn == img.nvn_format || img.alpha_from_r || img.aspect != VK_IMAGE_ASPECT_COLOR_BIT) return img.format;
     VkFormat f = vk_format(nvn);
     uint32_t bw = 1, bh = 1, bytes = 0, iw = 1, ih = 1, ibytes = 0;
@@ -30,10 +32,26 @@ VkFormat view_format(const GpuImage& img, uint32_t nvn) {
     if (!nvn_sizes && vk_block_bytes(f) && vk_block_bytes(img.format))
         bytes = vk_block_bytes(f), ibytes = vk_block_bytes(img.format);
     bool ok = f != VK_FORMAT_UNDEFINED && format_aspect(nvn) == 0 && bw == iw && bh == ih && bytes == ibytes;
+    if (ok && f != img.format && !img.mutable_format) {  // ubwc_flags: an image made without MUTABLE_FORMAT
+        static std::set<std::pair<uint32_t, uint32_t>> not_mutable;
+        if (not_mutable.insert({img.nvn_format, nvn}).second)
+            log("nvn/vk: texture format %#x viewed as %#x, but the image is not mutable: its own format", img.nvn_format,
+                nvn);
+        return img.format;
+    }
     static std::set<std::pair<uint32_t, uint32_t>> logged;
     if (logged.insert({img.nvn_format, nvn}).second && logged.size() <= 40)
         log("nvn/vk: texture format %#x viewed as %#x%s", img.nvn_format, nvn, ok ? "" : " (not compatible: ignored)");
     return ok ? f : img.format;
+}
+
+VkImageViewType view_type(const ImageShape& s) {  // SPIR-V Dim: 0 1D, 1 2D, 2 3D, 3 Cube
+    switch (s.dim) {
+        case 0: return s.arrayed ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D;
+        case 2: return VK_IMAGE_VIEW_TYPE_3D;
+        case 3: return s.arrayed ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE;
+        default: return s.arrayed ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    }
 }
 
 namespace {
@@ -83,15 +101,6 @@ VkDescriptorSetLayout set_layout(const std::vector<VkDescriptorSetLayoutBinding>
 }
 
 // ---- images ---------------------------------------------------------------------------------------------------------
-
-VkImageViewType view_type(const ImageShape& s) {  // SPIR-V Dim: 0 1D, 1 2D, 2 3D, 3 Cube
-    switch (s.dim) {
-        case 0: return s.arrayed ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D;
-        case 2: return VK_IMAGE_VIEW_TYPE_3D;
-        case 3: return s.arrayed ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE;
-        default: return s.arrayed ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-    }
-}
 
 // Views made for sampling and for rendering, by image; forget_image_views() drops an image's before it is freed.
 using SampledKey = std::tuple<VkImage, VkImageViewType, uint32_t, uint64_t, uint64_t>;
@@ -204,6 +213,29 @@ const ProgramLayout& program_layout(const std::vector<const ShaderInfo*>& stages
             vb.stageFlags |= stage_bit(s->stage);
         }
     ProgramLayout pl;
+    // On by default on Android only (NX_DYNAMIC_UBO=0/1 overrides): on the Mac (MoltenVK) every frame came out black
+    // and the GPU hung a few thousand frames in (2026-10-01), cause not found yet.
+    static const uint32_t max_dynamic = [] {
+        const char* e = std::getenv("NX_DYNAMIC_UBO");
+#if defined(__ANDROID__)
+        if (e && e[0] == '0') return 0u;
+#else
+        if (!e || e[0] != '1') return 0u;
+#endif
+        VkPhysicalDeviceProperties p{};
+        p_vkGetPhysicalDeviceProperties(vk_physical(), &p);
+        log("nvn/vk: uniform buffers bound with dynamic offsets (up to %u per layout)",
+            p.limits.maxDescriptorSetUniformBuffersDynamic);
+        return p.limits.maxDescriptorSetUniformBuffersDynamic;
+    }();
+    uint64_t dynamic = 0;
+    for (auto& [n, b] : sets[0])
+        if (b.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b.descriptorCount == 1 && n < 64) dynamic |= 1ull << n;
+    if (dynamic && uint32_t(__builtin_popcountll(dynamic)) <= max_dynamic) {
+        for (auto& [n, b] : sets[0])
+            if (n < 64 && dynamic >> n & 1) b.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        pl.dynamic = dynamic;
+    }
     for (int k = 0; k < 4; k++) {
         std::vector<VkDescriptorSetLayoutBinding> v;
         for (auto& [n, b] : sets[k]) v.push_back(b);
@@ -386,6 +418,8 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
 
     VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     ci.pNext = &ri;
+    if (render_pass_objects())  // nvn_renderpass.cpp: compatible with every pass of these formats
+        ci.pNext = nullptr, ci.renderPass = compatible_render_pass(key.color_count, key.color_formats, key.depth_format);
     ci.stageCount = nstages;
     ci.pStages = stages;
     ci.pVertexInputState = &vi;
@@ -398,7 +432,10 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     ci.pDynamicState = &dy;
     ci.layout = layout.layout;
     VkPipeline p = VK_NULL_HANDLE;
-    if (p_vkCreateGraphicsPipelines(vk_device(), VK_NULL_HANDLE, 1, &ci, nullptr, &p) != VK_SUCCESS)
+    const uint64_t t0 = plat::monotonic_ns();
+    VkResult made = p_vkCreateGraphicsPipelines(vk_device(), pipeline_cache(), 1, &ci, nullptr, &p);
+    note_pipeline_created(plat::monotonic_ns() - t0);
+    if (made != VK_SUCCESS)
         log("nvn/vk: pipeline for %s + %s failed", key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
     else if (g_trace)
         log("nvn/vk: pipeline %zu: %s + %s", cache.size() + 1, key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
@@ -562,63 +599,6 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
     return v;
 }
 
-std::map<VkImageViewType, GpuImage>& dummies() {
-    static std::map<VkImageViewType, GpuImage> d;
-    return d;
-}
-
-bool dummy_ready(const ImageShape& shape) {
-    auto it = dummies().find(view_type(shape));
-    return it != dummies().end() && it->second.image;
-}
-
-VkImageView dummy_view(VkCommandBuffer cb, const ImageShape& shape) {
-    VkImageViewType type = view_type(shape);
-    auto& d = dummies()[type];
-    if (d.image) return d.view;
-    bool cube = type == VK_IMAGE_VIEW_TYPE_CUBE || type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
-    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ci.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
-    ci.imageType = type == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D
-                   : (type == VK_IMAGE_VIEW_TYPE_1D || type == VK_IMAGE_VIEW_TYPE_1D_ARRAY) ? VK_IMAGE_TYPE_1D
-                                                                                            : VK_IMAGE_TYPE_2D;
-    ci.format = shape.depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
-    ci.extent = {1, 1, 1};
-    ci.mipLevels = 1;
-    ci.arrayLayers = cube ? 6 : 1;
-    ci.samples = VK_SAMPLE_COUNT_1_BIT;
-    ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    p_vkCreateImage(vk_device(), &ci, nullptr, &d.image);
-    VkMemoryRequirements req{};
-    p_vkGetImageMemoryRequirements(vk_device(), d.image, &req);
-    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = req.size;
-    ai.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    p_vkAllocateMemory(vk_device(), &ai, nullptr, &d.memory);
-    p_vkBindImageMemory(vk_device(), d.image, d.memory, 0);
-    d.format = ci.format;
-    d.aspect = shape.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-    d.layers = ci.arrayLayers;
-    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vi.image = d.image;
-    vi.viewType = type;
-    vi.format = ci.format;
-    vi.subresourceRange = {d.aspect, 0, 1, 0, ci.arrayLayers};
-    p_vkCreateImageView(vk_device(), &vi, nullptr, &d.view);
-    transition(cb, d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkImageSubresourceRange r{d.aspect, 0, 1, 0, ci.arrayLayers};
-    if (shape.depth) {
-        VkClearDepthStencilValue v{1.0f, 0};
-        p_vkCmdClearDepthStencilImage(cb, d.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
-    } else {
-        VkClearColorValue v{};
-        if (std::getenv("NX_DUMMY_MAGENTA")) v = {{1.0f, 0.0f, 1.0f, 1.0f}};  // debug: where the dummy is sampled
-        p_vkCmdClearColorImage(cb, d.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
-    }
-    transition(cb, d, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    return d.view;
-}
-
 VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgramLayout& layout) {
     static std::map<std::pair<const ShaderInfo*, VkPipelineLayout>, VkPipeline> cache;
     auto& p = cache[{cs, layout.layout}];
@@ -629,7 +609,7 @@ VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgramLayout& layout) {
         ci.stage.module = module_of(cs);
         ci.stage.pName = "main";
         ci.layout = layout.layout;
-        if (p_vkCreateComputePipelines(vk_device(), VK_NULL_HANDLE, 1, &ci, nullptr, &p) != VK_SUCCESS) {
+        if (p_vkCreateComputePipelines(vk_device(), pipeline_cache(), 1, &ci, nullptr, &p) != VK_SUCCESS) {
             log("nvn/vk: compute pipeline for %s failed", cs->hash.c_str());
             p = VK_NULL_HANDLE;
         }
@@ -685,10 +665,12 @@ void forget_image_views(const GpuImage& img) {
     // a scan of every cached view per destroyed texture, a visible share of the replay time).
     auto drop = [&](auto& cache, auto lowest) {
         for (auto it = cache.lower_bound(lowest); it != cache.end() && std::get<0>(it->first) == img.image;) {
+            forget_framebuffers(it->second);
             if (it->second && it->second != img.view) p_vkDestroyImageView(vk_device(), it->second, nullptr);
             it = cache.erase(it);
         }
     };
+    forget_framebuffers(img.view);  // nvn_renderpass.cpp (attachments may use the whole-image view)
     drop(g_sampled_views, std::make_tuple(img.image, VkImageViewType(0), 0u, uint64_t(0), uint64_t(0)));
     for (ViewHit& h : g_view_hits)
         if (std::get<0>(h.key) == img.image) h = {};

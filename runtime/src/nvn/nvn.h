@@ -70,6 +70,8 @@ std::unordered_map<uint64_t, std::unique_ptr<Object>>& objects();
 // objects live on as deferred objects until drain_objects, which also forgets the records. Game threads (mark 0)
 // always see the current one. NX_TEXTURE_RACE_OLD=1: no records, no marks (the old behaviour).
 inline thread_local uint64_t t_replay_mark = 0;  // the replaying thread's mark; 0 outside a replay
+inline thread_local uint64_t t_replay_serial = 0;  // which replay (ReplayScope counts them): keys get<T>'s replay cache
+bool resolve_cache_on();  // NX_RESOLVE_CACHE (nvn_incarnation.cpp)
 bool texture_race_old();
 Object* find_object(uint64_t guest, uint64_t mark);  // under objects_lock (shared)
 void note_replaced(uint64_t guest);                  // under objects_lock (alone): guest's object is about to change
@@ -90,6 +92,27 @@ struct ReplayScope {
 // replay mark is part of the key: a thread that replays (the render thread) also calls the game-side procs.
 template <typename T>
 T* get(uint64_t guest) {
+    // During a replay every lookup answers as of its mark, and nothing a lookup returns is freed before the replay
+    // ends (drain_objects runs between replays): an answer holds for the whole replay, so it is kept per replay
+    // (docs/nvn/android-perf/PHASE4.md C4). The game threads bump the lock's generation ~180 times a frame, which
+    // emptied the cache below during a replay (get<Texture> was 8.5% of the replay thread). Not for nulls: an object
+    // created after the mark resolves to the current one (DEBUG.md #64). NX_RESOLVE_CACHE=0: off.
+    if (uint64_t serial = t_replay_serial; serial && t_replay_mark && resolve_cache_on()) {
+        struct Slot {
+            uint64_t guest = 0, serial = 0;
+            T* object = nullptr;
+        };
+        thread_local Slot table[1024];
+        Slot& s = table[((guest >> 4) ^ (guest >> 14)) & 1023];
+        if (s.serial == serial && s.guest == guest) return s.object;
+        T* p;
+        {
+            std::shared_lock lk(objects_lock());
+            p = dynamic_cast<T*>(find_object(guest, t_replay_mark));
+        }
+        if (p) s = {guest, serial, p};
+        return p;
+    }
     struct Entry {
         uint64_t guest = 0, generation = 0, mark = 0;
         T* object = nullptr;
@@ -112,7 +135,8 @@ T* get(uint64_t guest) {
 // while a replay may still hold a pointer from get<T>() (nvn_trace.cpp). Under objects_lock.
 void defer_object(std::unique_ptr<Object> o);
 void drain_objects();
-void wait_submits_so_far();  // nvn_queue.cpp: until the submits made so far were replayed (DEBUG.md #59)
+enum { kWaitSync, kWaitFinish, kWaitInvalidate, kWaitFinalize, kWaitSites };  // nvn_queue.cpp's wait sites
+void wait_submits_so_far(int site);  // nvn_queue.cpp: until the submits made so far were replayed (DEBUG.md #59)
 
 template <typename T>
 T& make(uint64_t guest) {
@@ -188,6 +212,7 @@ struct Texture : Object {
     // Pitch-linear textures the CPU keeps writing without a flush (Wonder's glyph cache: 2048x8192 R8): their memory
     // is hashed at most once per submit that samples them, and a change means an upload.
     uint64_t content_hash = 0, hashed_submit = 0;
+    bool watched = false;  // large ones: a write watch instead of the hash (write_watch.cpp)
     std::shared_ptr<GpuImage> image;  // made on first use by the GPU
     std::atomic<uint64_t> last_sampled{0};  // host ns of the last draw that sampled it (kept textures, nvn_objects.cpp)
     ~Texture();  // nvn_vk.cpp: the image is freed once the GPU is done with it
@@ -245,6 +270,11 @@ bool sampler_entry_at(uint64_t pool, uint32_t id, uint64_t mark, SamplerSlot& ou
 // NVNformat -> VkFormat, and whether it is color (0), depth (1), stencil (2) or both (3) (nvn_format.cpp).
 VkFormat vk_format(uint32_t format);
 uint32_t format_aspect(uint32_t format);
+// ASTC on the host (nvn_format.cpp): native, or RGBA8 images filled by the CPU decoder at upload (nvn_upload.cpp).
+void set_astc_native(bool native);
+bool astc_native();
+bool is_astc(uint32_t format);
+bool astc_decoded(uint32_t format);  // an ASTC format this device gets as RGBA8
 // Bytes per texel of a Vulkan format as buffer-image copies count them (nvn_format.cpp); 0 for block-compressed and
 // combined depth/stencil formats, whose NVN size (format_block) is the host's. Differs from the NVN size where a
 // format is stored wider than the game's: 0x3f R11G11B10F is 4 bytes in NVN, RGBA16F (8) here.
@@ -291,6 +321,11 @@ struct CmdList {
     uint64_t handle = 0;     // its NVNcommandHandle
     uint64_t epoch = 0;      // the texture epoch when its recording ended (nvn_incarnation.cpp): what its draws name
     uint32_t skinned = 0;    // NX_TRACE_SKINLISTS: binds of skinned programs (a vertex input at location 6) in it
+    // count_dispatches' scan of cmds (nvn_frames.cpp, replay thread only): its own DispatchCompute commands and the
+    // handles it calls, valid while cmds has scanned_size entries.
+    size_t scanned_size = SIZE_MAX;
+    uint32_t own_dispatches = 0;
+    std::vector<uint64_t> calls;
 };
 // NX_TRACE_SKINLISTS (nvn_cmd.cpp): follows the lists that bind skinned programs, from recording to replay.
 bool skin_lists_on();
@@ -332,6 +367,8 @@ struct TargetViews {  // SetRenderTargets' blob: level and layer per color targe
 };
 
 std::shared_ptr<CmdList> command_list(uint64_t handle);  // a recorded handle's commands (nvn_cmd.cpp)
+std::string explain_handle(uint64_t handle);             // why a handle has no list (NX_CMD_DROPS=1: what dropped it)
+void command_memory_released(uint64_t gpu, uint64_t size);  // a pool finalized: the lists recorded in it go
 // Appends to the command buffer (guest NVNcommandBuffer*) being recorded; `blob` is copied into the list.
 void record(uint64_t cmdbuf, Cmd cmd, const void* blob = nullptr, size_t size = 0);
 

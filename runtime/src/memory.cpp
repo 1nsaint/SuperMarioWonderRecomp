@@ -34,6 +34,8 @@ void memory_init() {
     // transfer memory and thread stacks at random free addresses); everything else is reported inaccessible.
     uint64_t end = kAddressSpaceBase + kAddressSpaceSize;
     vm_set(kAddressSpaceBase, kAliasBase - kAddressSpaceBase, kMemInaccessible, 0);
+    if (kAliasBase + kAliasSize < kStackBase)  // Android: the alias sits below the modules (runtime.h)
+        vm_set(kAliasBase + kAliasSize, kStackBase - (kAliasBase + kAliasSize), kMemInaccessible, 0);
     vm_set(kStackBase + kStackSize, end - (kStackBase + kStackSize), kMemInaccessible, 0);
 }
 

@@ -67,11 +67,37 @@ struct PadState {
     int32_t lx = 0, ly = 0, rx = 0, ry = 0;
 };
 void read_pad(PadState& p);  // player 1
+// Touch controls to draw over the picture (touch_layout.cpp, platform_android_input.cpp): circles at x, y (0..1
+// across the landscape screen), radius r (a fraction of its height), opacity alpha. 0 where nothing is drawn.
+struct OverlayShape {
+    float x, y, r, alpha;
+};
+size_t touch_overlay(OverlayShape* out, size_t max);
+// Performance hints (perf_hint.cpp; Android ADPF, nothing elsewhere): the calling thread takes part in making frames;
+// a frame's work took `ns`.
+void perf_hint_thread();
+void perf_hint_frame(int64_t ns);
+void gpu_turbo();  // NX_GPU_TURBO=1: the Adreno GPU at its highest clock (perf_hint.cpp; Android)
+// Frame threads and present intervals (frame_stats.cpp): the cores they run on, their CPU time, NX_AFFINITY.
+// role 0: the thread that replays and presents (frame_presented ticks it); 1: the game's main thread.
+void frame_thread_tick(int role);
+void frame_presented();  // after each present to the display
+// Write watches (write_watch.cpp; page protection, POSIX): add fails when unsupported or full; take re-arms and
+// says whether the range was written since the last take; the crash handler calls fault first (true: handled).
+bool write_watch_add(uint64_t addr, uint64_t size);
+void write_watch_remove(uint64_t addr);
+bool write_watch_take(uint64_t addr);
+bool write_watch_fault(void* at);
 // NX_HEADLESS=1: no visible window (it is created hidden) and nothing presented; frames still render and
 // NX_DUMP_FRAMES still writes them. For unattended test runs.
 bool headless();
 // Ends the process when its memory footprint passes NX_MEM_LIMIT_GB (default 8); logs it every 30 s (macOS).
 void start_memory_guard();
+// How much of [from, to) (monotonic ns) the memory guard spent reading (memguard_android.cpp; 0 elsewhere).
+uint64_t memguard_overlap_ns(uint64_t from, uint64_t to);
+// The calling thread's CPU time, page faults (major, minor) and context switches (voluntary, involuntary)
+// (frame_stats.cpp; Linux and Android, zeros elsewhere).
+void thread_counters(uint64_t& cpu_ns, long faults[2], long switches[2]);
 void input_script(PadState& p);  // NX_INPUT_SCRIPT presses (input_script.cpp), for unattended runs
 
 // Audio: s16 stereo 48 kHz. `done` is called (on any thread) when a submitted buffer has been played.

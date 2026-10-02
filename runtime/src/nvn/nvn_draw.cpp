@@ -38,6 +38,21 @@ using namespace replay;
 namespace {
 
 bool g_rendering = false;
+bool g_render_pass = false;
+bool g_vertex_pending = false;  // a narrow pass-end barrier since the last one that covers vertex stages (G4)
+uint64_t g_pass_serial = 0, g_vertex_visible_at = 0;  // pass ends so far; the serial a full barrier covered
+uint64_t g_vertex_barriers = 0;
+
+// Off by default (NX_PASS_BARRIER_NARROW=1 turns it on): the first S23 run with it showed a black band over the course
+// background in 2 of 28 frames (phone_n6def, 15000 and 16200), a timing-dependent hazard of the DEBUG-2 #71 class.
+bool narrow_pass_barrier() {
+    static const bool on = std::getenv("NX_PASS_BARRIER_NARROW") != nullptr;
+    return on;
+}
+
+// A vertex shader sampling a rendered image after a narrow pass-end barrier: the pass ends (it cannot take a barrier
+// inside) and the writes so far are made visible to the vertex stages.
+void vertex_read_barrier(VkCommandBuffer cb, const ShaderInfo* vs);  // the open pass is a render pass object (nvn_renderpass.cpp), not dynamic rendering
 Targets g_pass;           // what the open pass renders to
 GpuImage* g_pass_images[9];  // their images (8: depth), resolved once per pass for gather_textures
 uint32_t g_pass_written = 0;  // targets the open pass's draws wrote: bit c colour c, bit 8 depth
@@ -109,6 +124,7 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     VkRenderingAttachmentInfo colors[8]{};
     VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     VkExtent2D extent{UINT32_MAX, UINT32_MAX};
+    VkFormat formats[8]{};  // the views' (render pass objects)
     for (uint32_t k = 0; k < t.color_count; k++) {
         colors[k].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
@@ -118,7 +134,8 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
         transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);  // rendered images stay GENERAL (sampled while rendered)
         img->rendered = true;
         uint32_t level = std::min<uint32_t>(t.views.level[k], img->levels - 1);
-        colors[k].imageView = attachment_view(*img, level, t.views.layer[k], view_format(*img, t.views.format[k]));
+        formats[k] = view_format(*img, t.views.format[k]);
+        colors[k].imageView = attachment_view(*img, level, t.views.layer[k], formats[k]);
         // NX_TRACE_CUBES=<first frame>: writes into cube images from that frame on. With 400 from the start, the log
         // ran out at the first 3D scene (frame ~171) and never reached a course load.
         static const char* trace_cubes = std::getenv("NX_TRACE_CUBES");
@@ -164,7 +181,12 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
         if (dimg->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ri.pDepthAttachment = &depth;
         if (dimg->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ri.pStencilAttachment = &stencil;
     }
-    p_vkCmdBeginRendering(cb, &ri);
+    g_render_pass = render_pass_objects();
+    if (g_render_pass)
+        begin_render_pass(cb, t.color_count, formats, colors, dimg ? dimg->format : VK_FORMAT_UNDEFINED, depth, stencil,
+                          extent);
+    else
+        p_vkCmdBeginRendering(cb, &ri);
     g_rendering = true;
     g_pass_written = cleared | fresh;  // as a clear inside the pass: sampling it needs it stored first
     trace_pass("begin: cleared, fresh", t, cleared, fresh);
@@ -212,6 +234,24 @@ void dispatch(VkCommandBuffer cb, const Cmd& c) {
     p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                            nullptr, 0, nullptr);
     g_stats.dispatches++;
+}
+
+void vertex_read_barrier(VkCommandBuffer cb, const ShaderInfo* vs) {
+    if (!g_vertex_pending || !vs) return;
+    bool reads = false;
+    for (size_t k = 0; k < g_textures.bindings.size() && !reads; k++)
+        if (g_textures.bindings[k].first == vs && k < g_textures.resolved.size() && g_textures.resolved[k].texture)
+            if (GpuImage* img = image_of(g_textures.resolved[k].texture))
+                reads = img->rendered && img->rendered_at > g_vertex_visible_at;
+    if (!reads) return;
+    draw_end_rendering(cb, 1);
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                       VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1, &mb, 0,
+                           nullptr, 0, nullptr);
+    g_vertex_pending = false, g_vertex_barriers++, g_vertex_visible_at = g_pass_serial;
 }
 
 bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, const Cmd& c) {
@@ -275,6 +315,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             }
         return t;
     }();
+    vertex_read_barrier(cb, vs);  // G4
     bool need_break = gathered & kNeedBreak;
     if (gathered & kSampledPending) clears_flush(cb);  // cleared (and stored) before it is sampled
     static const bool bytes = std::getenv("NX_TARGETS_MEMCMP") != nullptr;  // bisecting
@@ -292,6 +333,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         g_stats.no_indices++;
         return false;
     }
+    check_vertex_ranges(vs, fs, indexed, c, in);  // NX_CHECK_VERTS (nvn_written.cpp)
     if (!g_rendering) {
         if (gpu_profile_on()) {
             GpuImage* img = t.color_count && t.colors[0] ? image_of(t.colors[0]) : nullptr;
@@ -318,7 +360,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     key.alpha_to_coverage = g_state.alpha_to_coverage;
     for (uint32_t k = 0; k < t.color_count; k++) {
         GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
-        key.color_formats[k] = img ? view_format(*img, t.views.format[k]) : VK_FORMAT_R8G8B8A8_UNORM;
+        key.color_formats[k] = img ? view_format(*img, t.views.format[k]) : unused_slot_format();
         if (img && (img->nvn_format == 0x3f || t.views.format[k] == 0x3f)) key.ufloat_colors |= 1u << k;  // G4
     }
     GpuImage* dimg = tt.depth ? image_of(tt.depth) : nullptr;
@@ -430,7 +472,9 @@ std::vector<WriteBack> draw_take_write_backs() {  // an asynchronous submit copi
 
 void draw_begin_submit() {
     g_rendering = false;
+    g_vertex_pending = false, g_vertex_visible_at = g_pass_serial;  // each command buffer begins with a full barrier
     g_bound = Bound{};  // a new command buffer
+    submit_lists_reset();
     sets_begin_submit();
     clears_begin_submit();
     g_submit_ns = plat::monotonic_ns();
@@ -442,7 +486,9 @@ void draw_begin_submit() {
 uint64_t recorded_draws();
 
 void draw_log_stats() {
+    if (g_vertex_barriers) log("nvn passes: %llu vertex-read barriers (G4)", (unsigned long long)g_vertex_barriers);
     dedup_log();
+    render_pass_log();
     written_log();
     sampled_ready_log();
     sets_log();
@@ -468,14 +514,44 @@ void draw_log_stats() {
 void pass_end_only(VkCommandBuffer cb, int reason) {
     if (!g_rendering) return;
     g_pass_ends[reason & 7]++, trace_pass("end: reason", g_pass, uint32_t(reason), 0);
-    p_vkCmdEndRendering(cb);
+    if (g_render_pass)
+        p_vkCmdEndRenderPass(cb);
+    else
+        p_vkCmdEndRendering(cb);
     g_rendering = false;
+    // What the pass wrote is read by what follows (sampled, copied, loaded by the next pass), and what it sampled may
+    // be rendered over next. The images stay GENERAL, so transition() records no barrier. Metal (MoltenVK) and the
+    // Intel driver ordered passes anyway; NVIDIA overlaps them, and later passes read half-written tiles: the course
+    // HUD in blocks (DEBUG-2 #71). NX_NO_PASS_BARRIER=1: none, as before (bisecting).
+    // Narrow (PHASE4.md G4; NX_PASS_BARRIER_NARROW=1): the later stages only, so the next pass's vertex work and
+    // binning may start while this one finishes. A draw whose vertex shader samples a rendered image gets a barrier
+    // of its own first (vertex_read_barrier). By default ALL_COMMANDS, as before.
+    static const bool no_barrier = std::getenv("NX_NO_PASS_BARRIER") != nullptr;
+    if (!no_barrier) {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                           VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        VkPipelineStageFlags dst = narrow_pass_barrier()
+                                       ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                                       : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, dst, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        g_vertex_pending |= narrow_pass_barrier();
+    }
+    g_pass_serial++;
+    for (uint32_t k = 0; k < 9; k++)  // this pass's targets only (the other slots may name freed images)
+        if ((k < g_pass.color_count || (k == 8 && g_pass.depth)) && g_pass_images[k])
+            g_pass_images[k]->rendered_at = g_pass_serial;
     gpu_profile_mark(cb, "outside passes (clears, uploads, copies)");
 }
 void draw_end_rendering(VkCommandBuffer cb, int reason) {  // and the pending clears (nvn_clears.cpp)
     pass_end_only(cb, reason);
     clears_flush(cb);
 }
+bool pass_open() { return g_rendering; }
 bool pass_open_on(const Targets& t) { return g_rendering && targets_same(g_pass, t); }
 VkExtent2D pass_extent() { return g_pass_extent; }
 void pass_begin(VkCommandBuffer cb, const Targets& t) { begin_rendering(cb, t); }

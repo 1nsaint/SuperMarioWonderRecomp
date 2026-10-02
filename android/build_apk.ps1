@@ -34,6 +34,22 @@ Pop-Location
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $apk = [System.IO.Compression.ZipFile]::Open("$out\base.apk", "Update")
 [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($apk, "$out\lib\arm64-v8a\lib$Game.so", "lib/arm64-v8a/lib$Game.so", "Optimal") | Out-Null
+# Java of the game's own (games\<game>\java, e.g. Wonder's home screen): javac against android.jar, d8 to classes.dex.
+$java = "$root\games\$Game\java"
+if (Test-Path $java) {
+    $jdk = (Get-ChildItem "C:\Program Files\Microsoft\jdk-*", "C:\Program Files\Java\jdk-*" -Directory -ErrorAction SilentlyContinue |
+        Sort-Object Name | Select-Object -Last 1).FullName
+    if (-not $jdk) { throw "a JDK is needed for games\$Game\java (winget install Microsoft.OpenJDK.17)" }
+    New-Item -ItemType Directory -Force "$out\classes", "$out\dex" | Out-Null
+    $sources = @((Get-ChildItem $java -Recurse -Filter *.java).FullName)
+    & "$jdk\bin\javac.exe" -source 1.8 -target 1.8 -Xlint:-options -bootclasspath $jar -d "$out\classes" @sources
+    if ($LASTEXITCODE) { throw "javac failed" }
+    $classes = @((Get-ChildItem "$out\classes" -Recurse -Filter *.class).FullName)
+    $env:JAVA_HOME = $jdk
+    & "$bt\d8.bat" --release --min-api 30 --lib $jar --output "$out\dex" @classes
+    if ($LASTEXITCODE) { throw "d8 failed" }
+    [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($apk, "$out\dex\classes.dex", "classes.dex", "Optimal") | Out-Null
+}
 $apk.Dispose()
 
 & "$bt\zipalign.exe" -f -p 4 "$out\base.apk" "$out\aligned.apk"

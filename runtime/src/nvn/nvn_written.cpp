@@ -10,6 +10,7 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <string>
 #include <vector>
 
 #include "nvn_draw_state.h"
@@ -217,6 +218,55 @@ bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const C
     uint64_t bytes = uint64_t(count) * index_size(c.mask);
     if (!written_read(cb, p, bytes, bytes, index_size(c.mask), in.index)) in.index = upload(p, bytes, 16);
     return true;
+}
+
+void check_vertex_ranges(const ShaderInfo* vs, const ShaderInfo* fs, bool indexed, const Cmd& c, const DrawInputs& in) {
+    static const bool on = std::getenv("NX_CHECK_VERTS") != nullptr;
+    static uint64_t found = 0;
+    if (!on || !vs) return;
+    // The vertices and instances the draw fetches.
+    uint64_t lo = 0, hi = 0;  // vertex indices [lo, hi]
+    uint32_t count = uint32_t(indexed ? c.i[0] : c.i[1]);
+    if (!count) return;
+    if (indexed) {
+        const uint8_t* p = guest_bytes(c.a[0]);
+        if (!p) return;
+        uint32_t isz = index_size(c.mask), restart = isz == 1 ? 0xFF : isz == 2 ? 0xFFFF : 0xFFFFFFFFu;
+        uint32_t mn = UINT32_MAX, mx = 0;
+        for (uint32_t k = 0; k < count; k++) {
+            uint32_t v = isz == 1 ? p[k] : isz == 2 ? reinterpret_cast<const uint16_t*>(p)[k] : reinterpret_cast<const uint32_t*>(p)[k];
+            if (v == restart) continue;
+            mn = std::min(mn, v), mx = std::max(mx, v);
+        }
+        if (mn == UINT32_MAX) return;
+        lo = uint64_t(int64_t(mn) + c.i[1]), hi = uint64_t(int64_t(mx) + c.i[1]);
+    } else {
+        lo = uint32_t(c.i[0]), hi = uint64_t(uint32_t(c.i[0])) + count - 1;
+    }
+    uint64_t inst_hi = uint64_t(uint32_t(c.i[2])) + uint32_t(std::max(1, c.i[3])) - 1;
+    for (const ShaderIo& io : vs->refl.inputs) {
+        if (io.location >= g_state.attribs.size()) continue;
+        const VertexAttrib& va = g_state.attribs[io.location];
+        if (va.stream >= 15 || va.stream >= g_state.streams.size() || !(in.used >> va.stream & 1)) continue;
+        const VertexStream& st = g_state.streams[va.stream];
+        const Range& r = g_state.vertex_buffers[va.stream];
+        uint64_t last = st.divisor ? inst_hi / st.divisor : hi;
+        uint64_t end = last * st.stride + va.offset + vk_block_bytes(vk_vertex_format(va.format));
+        uint64_t copied = r.address && guest_bytes(r.address) ? std::min<uint64_t>(r.size, 64ull << 20) : 0;
+        if (end <= copied) continue;
+        found++;
+        static std::map<std::string, uint64_t> seen;
+        std::string key = vs->hash + (fs ? fs->hash : std::string("-")) + char('a' + va.stream);
+        uint64_t n = ++seen[key];
+        if (n <= 3 || (n & (n - 1)) == 0)
+            log("nvn: vertex fetch past the bound range (%llu so far; #%llu of vs %s fs %s): stream %u loc %u fmt %#x off %u "
+                "stride %u div %u, vertices %llu..%llu instances ..%llu, needs %llu bytes, bound %llu at %llx (copied %llu)",
+                (unsigned long long)found, (unsigned long long)n, vs->hash.c_str(), fs ? fs->hash.c_str() : "-", va.stream,
+                io.location, va.format, va.offset, st.stride, st.divisor, (unsigned long long)lo, (unsigned long long)hi,
+                (unsigned long long)inst_hi, (unsigned long long)end, (unsigned long long)r.size,
+                (unsigned long long)r.address, (unsigned long long)copied);
+        break;
+    }
 }
 
 void written_cpu_write(const uint8_t* p, uint64_t size) {

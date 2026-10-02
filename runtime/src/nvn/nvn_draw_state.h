@@ -54,6 +54,7 @@ const uint8_t* guest_bytes(uint64_t gpu);
 uint32_t handle_texture(uint64_t handle, uint32_t* sampler);
 // The texture and sampler a handle names in the bound pools.
 void texture_for(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, ViewInfo* view = nullptr);
+std::string explain_texture_slot(uint64_t handle);  // NX_FRAME_SIG: the slot at the mark and now (nvn_sets.cpp)
 
 // NX_SNAP_FOLLOW (nvn_draw_trace.cpp): log and snapshot this draw.
 bool snap_follow(const Targets& t, const ShaderInfo* vs, const ShaderInfo* fs, const std::vector<uint64_t>& handles);
@@ -102,6 +103,8 @@ struct DrawInputs {
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
 };
 bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in);
+// NX_CHECK_VERTS=1: logs draws that fetch vertices or instances past their bound vertex buffer range (debugging).
+void check_vertex_ranges(const ShaderInfo* vs, const ShaderInfo* fs, bool indexed, const Cmd& c, const DrawInputs& in);
 
 // nvn_sets.cpp: the descriptor sets of a draw or dispatch, and the replay's CPU shortcuts (docs/nvn/PERF-PLAN.md).
 // NX_DRAW_SLOW=1 turns every shortcut off, for bisecting; letters instead of 1 pick them: m the scratch memory kept

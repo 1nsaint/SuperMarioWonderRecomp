@@ -2,6 +2,7 @@
 // state; NX_TRACE_TARGET, NX_TRACE_FS_HASH, NX_TRACE_COUNT select them; NX_TRACE_VS_BLOCKS and NX_TRACE_GLYPHS add
 // uniform blocks and glyph records. Moved out of nvn_draw.cpp, which calls trace_draw() after every draw.
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -158,6 +159,129 @@ bool snap_follow(const Targets& t, const ShaderInfo* vs, const ShaderInfo* fs, c
     return !nosnap;
 }
 
+// NX_FRAME_SIG=1 (DEBUG-2 #92): per presented frame, the number of draws, a hash of their fragment shaders in order,
+// and every small non-indexed draw (fullscreen passes): fragment shader, colour target, a hash of its fragment
+// uniform blocks. Frames that render differently from their neighbours stand out in the log.
+struct FrameSig {
+    uint32_t draws = 0;
+    uint32_t order = 2166136261u;
+    std::string passes;
+    std::map<std::string, int> keys;  // "<fs>" (draws) and "C<cs>" (dispatches): how many
+    struct Block {
+        const uint8_t* p;
+        uint64_t size;
+        uint32_t hash;
+        std::string name;
+    };
+    std::map<uint64_t, Block> blocks;  // uniform blocks looked at
+    uint32_t zero = 0;
+    std::string zeros;
+    std::set<std::string> watched;
+    std::string watch;
+};
+FrameSig g_sig;
+std::map<std::string, int> g_sig_last;
+bool frame_sig_on() {
+    static const bool on = std::getenv("NX_FRAME_SIG") != nullptr;
+    return on;
+}
+uint32_t fnv(uint32_t h, const void* p, size_t n) {
+    for (size_t k = 0; k < n; k++) h = (h ^ static_cast<const uint8_t*>(p)[k]) * 16777619u;
+    return h;
+}
+void frame_sig_draw(const Targets& t, bool indexed, uint32_t count, uint32_t instances, const ShaderInfo* fs,
+                    const TexBindings& tex_bindings, const std::vector<uint64_t>& handles) {
+    if (!frame_sig_on()) return;
+    // NX_FRAME_SIG=<fs prefix>,...: the first draw of each of those shaders in the frame: its textures (image, size,
+    // format, the serial of the pass that last rendered it) and its fragment uniform blocks (address, content hash).
+    static const std::string watch = std::getenv("NX_FRAME_SIG");
+    if (fs && watch.size() > 2 && watch.find(fs->hash.substr(0, 6)) != std::string::npos &&
+        g_sig.watched.insert(fs->hash.substr(0, 6)).second) {
+        std::string s = " [" + fs->hash.substr(0, 6);
+        for (size_t k = 0; k < tex_bindings.size() && k < handles.size(); k++) {
+            uint64_t texture = 0;
+            SamplerInfo si;
+            texture_for(handles[k], texture, si);
+            GpuImage* img = texture ? image_of(texture) : nullptr;
+            char b[96];
+            std::snprintf(b, sizeof b, " t%zu=%llx/%llx %ux%u f%x r%llu", k, (unsigned long long)(texture & 0xFFFFF),
+                          (unsigned long long)(uintptr_t(img) & 0xFFFFFF), img ? img->width : 0, img ? img->height : 0,
+                          img ? img->nvn_format : 0, (unsigned long long)(img && img->rendered ? img->rendered_at : 0));
+            s += b;
+            if (img && img->rendered && watch.find('+') != std::string::npos) s += explain_texture_slot(handles[k]);
+        }
+        for (int n = 0; n < 18; n++)
+            if (const Range& r = g_state.uniforms[4][n]; r.address && r.size)
+                if (const uint8_t* p = guest_bytes(r.address)) {
+                    char b[64];
+                    std::snprintf(b, sizeof b, " c%d=%llx:%08x", n, (unsigned long long)r.address,
+                                  fnv(2166136261u, p, std::min<uint64_t>(r.size, 4096)));
+                    s += b;
+                }
+        g_sig.watch += s + "]";
+    }
+    g_sig.draws++;
+    g_sig.order = fnv(g_sig.order, fs ? fs->hash.data() : "-", fs ? std::min<size_t>(fs->hash.size(), 8) : 1);
+    char k[48];
+    std::snprintf(k, sizeof k, "%.6s", fs ? fs->hash.c_str() : "-");
+    g_sig.keys[k]++;
+    // Uniform blocks of the vertex and fragment stages: all zeros, or rewritten between their first use in the frame
+    // and its present (a block caught while the game rewrites it).
+    for (int st : {0, 4})
+        for (int n = 0; n < 18; n++)
+            if (const Range& r = g_state.uniforms[st][n]; r.address && r.size >= 16 && !g_sig.blocks.count(r.address))
+                if (const uint8_t* p = guest_bytes(r.address)) {
+                    uint64_t size = std::min<uint64_t>(r.size, 4096), z = 0;
+                    char b[96];
+                    std::snprintf(b, sizeof b, " %c%d:%llx+%llx(%.6s)", st ? 'f' : 'v', n,
+                                  (unsigned long long)r.address, (unsigned long long)r.size, fs ? fs->hash.c_str() : "-");
+                    g_sig.blocks[r.address] = {p, size, fnv(2166136261u, p, size), b};
+                    while (z < size && !p[z]) z++;
+                    if (z == size && (g_sig.zero++, g_sig.zeros.size() < 600)) g_sig.zeros += b;
+                }
+    if (indexed || count > 6 || instances != 1 || g_sig.passes.size() > 2000) return;
+    uint32_t u = 2166136261u;
+    for (int n = 0; n < 18; n++)
+        if (const Range& r = g_state.uniforms[4][n]; r.address && r.size)
+            if (const uint8_t* p = guest_bytes(r.address)) u = fnv(u, p, std::min<uint64_t>(r.size, 4096));
+    char b[64];
+    std::snprintf(b, sizeof b, " %.6s>%llx:%08x", fs ? fs->hash.c_str() : "-",
+                  (unsigned long long)(t.colors[0] & 0xFFFFF), u);
+    g_sig.passes += b;
+}
+
+}  // namespace nx::nvn::replay
+
+namespace nx::nvn {
+void frame_sig_flush(uint64_t presents) {
+    using replay::g_sig;
+    if (!replay::frame_sig_on()) return;
+    std::string diff;  // against the frame before: +key*n new or more, -key*n gone or fewer
+    auto& last = replay::g_sig_last;
+    for (auto& [k, n] : g_sig.keys)
+        if (auto it = last.find(k); it == last.end() || it->second != n)
+            diff += " " + k + "*" + std::to_string(n - (it == last.end() ? 0 : it->second));
+    for (auto& [k, n] : last)
+        if (!g_sig.keys.count(k)) diff += " " + k + "*-" + std::to_string(n);
+    if (diff.size() > 1500) diff.resize(1500);
+    static auto t_last = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(now - t_last).count();
+    t_last = now;
+    uint32_t changed = 0;
+    std::string ch;
+    for (auto& [a, b] : g_sig.blocks)
+        if (replay::fnv(2166136261u, b.p, b.size) != b.hash && (changed++, ch.size() < 800)) ch += b.name;
+    log("fsig %llu: %.1f ms, %u draws, order %08x:%s | %zu blocks, %u zero:%s | %u rewritten:%s | watch%s | diff%s",
+        (unsigned long long)presents, ms, g_sig.draws, g_sig.order, g_sig.passes.c_str(), g_sig.blocks.size(),
+        g_sig.zero, g_sig.zeros.c_str(), changed, ch.c_str(), g_sig.watch.c_str(), diff.c_str());
+    last = std::move(g_sig.keys);
+    g_sig = {};
+}
+}  // namespace nx::nvn
+
+namespace nx::nvn::replay {
+
 void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, const ShaderInfo* vs,
                 const ShaderInfo* fs, const TexBindings& tex_bindings, const std::vector<uint64_t>& handles) {
     // Always: the first draws with a huge vertex or instance count (a GPU hang candidate).
@@ -167,6 +291,7 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
         log("nvn: huge draw %llu: vs %s fs %s %s count %u x%u", (unsigned long long)g_stats.done, vs->hash.c_str(),
             fs ? fs->hash.c_str() : "-", indexed ? "indexed" : "arrays", count, instances);
     trace_cube_draw(t, vs, fs, tex_bindings, handles);
+    frame_sig_draw(t, indexed, count, instances, fs, tex_bindings, handles);
     // NX_TRACE_DRAWS=<first draw>: logs 80 draws from there.
     static const char* trace_env = std::getenv("NX_TRACE_DRAWS");
     static const uint64_t trace_from = trace_env ? std::strtoull(trace_env, nullptr, 10) : 0;
@@ -425,6 +550,7 @@ void trace_skin(bool indexed, const Cmd& c, const ShaderInfo* vs, const ShaderIn
 
 // The first dispatch of each compute shader: its groups and what its bindings point at.
 void trace_compute_once(const ShaderInfo* cs, uint32_t x, uint32_t y, uint32_t z) {
+        if (frame_sig_on()) g_sig.keys["C" + cs->hash.substr(0, 6)]++;
         static std::set<std::string> seen;
         if (seen.insert(cs->hash).second) {
             std::string res;

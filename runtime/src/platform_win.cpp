@@ -186,10 +186,12 @@ static void window_thread(std::atomic<bool>* ready) {
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     int w = r.right - r.left, h = r.bottom - r.top;
     int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2, y = (sh - h) / 2;
-    g_window = CreateWindowW(wc.lpszClassName, (widen(nx::game::kInfo.title) + L" (Switch recomp)  -  F11: fullscreen").c_str(), kWindowed,
+    // NX_HEADLESS: created hidden (the surface still needs a window), never brought to the front.
+    const DWORD style = headless() ? (kWindowed & ~WS_VISIBLE) : kWindowed;
+    g_window = CreateWindowW(wc.lpszClassName, (widen(nx::game::kInfo.title) + L" (Switch recomp)  -  F11: fullscreen").c_str(), style,
                              std::max(0, x), std::max(0, y), w, h, nullptr, nullptr, wc.hInstance, nullptr);
-    if (const char* f = std::getenv("NX_FULLSCREEN"); f && *f == '1') toggle_fullscreen(g_window);
-    SetForegroundWindow(g_window);
+    if (const char* f = std::getenv("NX_FULLSCREEN"); f && *f == '1' && !headless()) toggle_fullscreen(g_window);
+    if (!headless()) SetForegroundWindow(g_window);
     *ready = true;
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
@@ -268,6 +270,7 @@ void read_pad(PadState& p) {
     if (key('C')) p.buttons |= kZR;
     if (key(VK_RETURN)) p.buttons |= kPlus;
     if (key(VK_ESCAPE)) p.buttons |= kMinus;
+    input_script(p);  // NX_INPUT_SCRIPT (input_script.cpp): unattended runs
 }
 
 // ---- audio: XAudio2 -------------------------------------------------------------------------------------------
@@ -278,18 +281,18 @@ std::atomic<uint32_t> g_queued{0};
 AudioDone g_done = nullptr;
 
 struct Voice : IXAudio2VoiceCallback {
-    void STDMETHODCALLTYPE OnBufferEnd(void* ctx) override {
+    void STDMETHODCALLTYPE OnBufferEnd(void* ctx) noexcept override {
         auto* p = static_cast<std::pair<void*, std::vector<uint8_t>>*>(ctx);
         g_queued--;
         g_done(p->first);
         delete p;
     }
-    void STDMETHODCALLTYPE OnVoiceProcessingPassStart(UINT32) override {}
-    void STDMETHODCALLTYPE OnVoiceProcessingPassEnd() override {}
-    void STDMETHODCALLTYPE OnStreamEnd() override {}
-    void STDMETHODCALLTYPE OnBufferStart(void*) override {}
-    void STDMETHODCALLTYPE OnLoopEnd(void*) override {}
-    void STDMETHODCALLTYPE OnVoiceError(void*, HRESULT) override {}
+    void STDMETHODCALLTYPE OnVoiceProcessingPassStart(UINT32) noexcept override {}
+    void STDMETHODCALLTYPE OnVoiceProcessingPassEnd() noexcept override {}
+    void STDMETHODCALLTYPE OnStreamEnd() noexcept override {}
+    void STDMETHODCALLTYPE OnBufferStart(void*) noexcept override {}
+    void STDMETHODCALLTYPE OnLoopEnd(void*) noexcept override {}
+    void STDMETHODCALLTYPE OnVoiceError(void*, HRESULT) noexcept override {}
 };
 
 IXAudio2* g_xa = nullptr;
@@ -300,6 +303,8 @@ Voice g_callback;
 
 bool audio_open(AudioDone done) {
     g_done = done;
+    // Headless test runs (and NX_MUTE=1) are silent: no device, the callers pace themselves with a timer.
+    if (headless() || std::getenv("NX_MUTE")) return false;
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(XAudio2Create(&g_xa, 0, XAUDIO2_DEFAULT_PROCESSOR))) return false;
     IXAudio2MasteringVoice* master = nullptr;
@@ -393,11 +398,48 @@ LONG WINAPI watch_handler(EXCEPTION_POINTERS* e) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+// "<module>+<offset>" for a host code address; our own exe as the linker's VA (tools/symbolize.py reads the map).
+std::string host_where(uint64_t pc) {
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(pc), &m))
+        return "?";
+    char b[MAX_PATH + 32];
+    if (m == GetModuleHandleW(nullptr)) {
+        std::snprintf(b, sizeof b, "%s.exe+%llx", nx::game::kInfo.id, (unsigned long long)exe_va(reinterpret_cast<void*>(pc)));
+        return b;
+    }
+    char path[MAX_PATH] = "?";
+    GetModuleFileNameA(m, path, MAX_PATH);
+    const char* name = std::max(std::strrchr(path, '\\'), std::strrchr(path, '/'));
+    std::snprintf(b, sizeof b, "%s+%llx", name ? name + 1 : path, (unsigned long long)(pc - uint64_t(m)));
+    return b;
+}
+
+// The host call stack at the fault, unwound from its context with the x64 unwind tables.
+void host_backtrace(const CONTEXT& at) {
+    CONTEXT c = at;
+    for (int k = 0; k < 16 && c.Rip; k++) {
+        nx::log("  host #%-2d %s", k, host_where(c.Rip).c_str());
+        DWORD64 base = 0;
+        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c.Rip, &base, nullptr);
+        if (!f) {  // a leaf function: the return address is at rsp
+            c.Rip = *reinterpret_cast<DWORD64*>(c.Rsp);
+            c.Rsp += 8;
+            continue;
+        }
+        void* handler_data = nullptr;
+        DWORD64 frame = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, f, &c, &handler_data, &frame, nullptr);
+    }
+}
+
 LONG WINAPI crash_handler(EXCEPTION_POINTERS* e) {
     auto* r = e->ExceptionRecord;
     uint64_t info = r->NumberParameters > 1 ? r->ExceptionInformation[1] : 0;
-    nx::log("CRASH: exception %08lx at %s.exe+%llx (tools/symbolize.py), data address %llx", r->ExceptionCode, nx::game::kInfo.id,
-            (unsigned long long)exe_va(r->ExceptionAddress), (unsigned long long)info);
+    nx::log("CRASH: exception %08lx at %s (tools/symbolize.py for the exe), data address %llx", r->ExceptionCode,
+            host_where(uint64_t(r->ExceptionAddress)).c_str(), (unsigned long long)info);
+    host_backtrace(*e->ContextRecord);
     dump_guest(nx::current_cpu());
     return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -420,6 +462,7 @@ LONG WINAPI throw_tracer(EXCEPTION_POINTERS* e) {
 }
 
 int main() {
+    nx::plat::start_memory_guard();  // before anything can grow: a leak must never freeze the machine (memguard_win.cpp)
     SetUnhandledExceptionFilter(crash_handler);
     if (const char* t = std::getenv("NX_THROW_TRACE"); t && *t == '1') AddVectoredExceptionHandler(1, throw_tracer);
     if (const char* w = std::getenv("NX_WATCH")) {
