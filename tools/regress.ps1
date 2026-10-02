@@ -2,6 +2,7 @@
 #
 #   tools\regress.ps1 -Builds "base=private\wonder\regress\bin\wonder-base.exe,merged=private\wonder\regress\bin\wonder-merged.exe"
 #   tools\regress.ps1 -Compare base,merged        the table and the verdict (exit code 1 on a regression)
+#   tools\regress.ps1 -Rescore base,merged        results.json again from the run folders kept under each label
 #
 # The builds run interleaved (boot base, boot merged, ...; course base, course merged, ...), so whatever else loads the
 # laptop (Parsec, another game, the antivirus) weighs on both alike. Per build: boots (headless, 25 s each) and the
@@ -11,6 +12,7 @@
 param(
     [string]$Builds = "",
     [string[]]$Compare = @(),
+    [string[]]$Rescore = @(),            # recompute results.json of these labels from their kept run folders
     [int]$Boots = 5,
     [int]$Repeat = 2,
     [int]$Seconds = 180,
@@ -41,17 +43,20 @@ function RunStats($dir) {
     }
     [ordered]@{
         fps_median = Percentile $fps 0.5; fps_p10 = Percentile $fps 0.1; replay_ms_median = Percentile $replay 0.5
+        fps = $fps; replay = $replay
         mem_peak_gb = if ($mem.Count) { ($mem | Measure-Object -Maximum).Maximum } else { 0 }
         crashes = @($log | Select-String 'CRASH|GPU hang|over the .* limit').Count
         vk_errors = @($log | Select-String 'nvn/vk: .* failed \(').Count; glitch_frames = $glitch; windows = $fps.Count
     }
 }
 
+# Over the windows of all runs pooled (the median of two per-run medians would be the lower one).
 function Summary($runs) {
+    $fps = @($runs | ForEach-Object { $_.fps }); $replay = @($runs | ForEach-Object { $_.replay })
     [ordered]@{
-        fps_median = Percentile ($runs | ForEach-Object { $_.fps_median }) 0.5
-        fps_p10 = ($runs | ForEach-Object { $_.fps_p10 } | Measure-Object -Minimum).Minimum
-        replay_ms_median = Percentile ($runs | ForEach-Object { $_.replay_ms_median }) 0.5
+        fps_median = Percentile $fps 0.5
+        fps_p10 = Percentile $fps 0.1
+        replay_ms_median = Percentile $replay 0.5
         mem_peak_gb = ($runs | ForEach-Object { $_.mem_peak_gb } | Measure-Object -Maximum).Maximum
         crashes = ($runs | ForEach-Object { $_.crashes } | Measure-Object -Sum).Sum
         vk_errors = ($runs | ForEach-Object { $_.vk_errors } | Measure-Object -Sum).Sum
@@ -69,8 +74,12 @@ function Interleave($spec) {
         $res[$l] = [ordered]@{ label = $l; exe = $builds[$l]; when = (Get-Date -Format s); boot_failures = 0; unit_failed = 0 }
     }
     # Unit tests of the build in private\wonder\build (the candidate's), counted for every label.
+    # (Windows PowerShell 5.1 turns a native command's stderr under 2>&1 into errors, which "Stop" makes fatal: ctest
+    # writes "Errors while running CTest" there exactly when a test fails.)
     . .\dev.ps1 *> $null
-    $ct = ctest --test-dir private\wonder\build 2>&1 | Select-String 'tests passed, (\d+) tests failed out of (\d+)'
+    $ErrorActionPreference = "Continue"
+    $ct = ctest --test-dir private\wonder\build 2>&1 | ForEach-Object { "$_" } | Select-String 'tests passed, (\d+) tests failed out of (\d+)'
+    $ErrorActionPreference = "Stop"
     $unit = if ($ct) { [int]$ct.Matches[0].Groups[1].Value } else { -1 }
     foreach ($l in $builds.Keys) { $res[$l].unit_failed = $unit }
     # Boots: a crash or no frame within 25 s fails.
@@ -109,11 +118,11 @@ function Interleave($spec) {
 
 # Base against candidate. A loss: unit tests or boots failing, a crash, more glitch frames, median fps down more than
 # 3% (p10 more than 10%), replay CPU up more than 10% (+0.3 ms), peak memory up more than 10%.
-function CompareRuns($a, $b) {
-    $A = Get-Content "$out\$a\results.json" -Raw | ConvertFrom-Json
-    $B = Get-Content "$out\$b\results.json" -Raw | ConvertFrom-Json
-    if (Test-Path "$out\$a\phone.json") { $A | Add-Member -NotePropertyName phone -NotePropertyValue (Get-Content "$out\$a\phone.json" -Raw | ConvertFrom-Json) -Force }
-    if (Test-Path "$out\$b\phone.json") { $B | Add-Member -NotePropertyName phone -NotePropertyValue (Get-Content "$out\$b\phone.json" -Raw | ConvertFrom-Json) -Force }
+function CompareRuns($la, $lb) {  # ($a/$b would be $A/$B: PowerShell names ignore case)
+    $A = Get-Content "$out\$la\results.json" -Raw | ConvertFrom-Json
+    $B = Get-Content "$out\$lb\results.json" -Raw | ConvertFrom-Json
+    if (Test-Path "$out\$la\phone.json") { $A | Add-Member -NotePropertyName phone -NotePropertyValue (Get-Content "$out\$la\phone.json" -Raw | ConvertFrom-Json) -Force }
+    if (Test-Path "$out\$lb\phone.json") { $B | Add-Member -NotePropertyName phone -NotePropertyValue (Get-Content "$out\$lb\phone.json" -Raw | ConvertFrom-Json) -Force }
     $script:loss = @()
     $script:rows = @()
     $row = { param($what, $x, $y, $bad) $script:rows += "{0,-34} {1,10} {2,10}  {3}" -f $what, $x, $y, $(if ($bad) { 'LOSS' } else { 'ok' }); if ($bad) { $script:loss += $what } }
@@ -130,13 +139,32 @@ function CompareRuns($a, $b) {
         & $row "$gpu Vulkan errors" $x.vk_errors $y.vk_errors ($y.vk_errors -gt $x.vk_errors)
         & $row "$gpu glitch frames" $x.glitch_frames $y.glitch_frames ($y.glitch_frames -gt $x.glitch_frames)
     }
-    "{0,-34} {1,10} {2,10}" -f "", $a, $b
+    "{0,-34} {1,10} {2,10}" -f "", $la, $lb
     $script:rows
     if ($script:loss.Count) { "VERDICT: LOSS in " + ($script:loss -join ", "); exit 1 }
     "VERDICT: no loss"
     exit 0
 }
 
-if ($Compare.Count -eq 2) { CompareRuns $Compare[0] $Compare[1] }
+# Again from the run folders kept under private\wonder\regress\<label>\ (after a change to RunStats or Summary).
+function Rescore($labels) {
+    foreach ($l in $labels) {
+        $res = Get-Content "$out\$l\results.json" -Raw | ConvertFrom-Json
+        foreach ($gpu in "discrete", "integrated") {
+            $dirs = @(Get-ChildItem "$out\$l" -Directory -Filter "regress-$l-$gpu-*")
+            if (-not $dirs.Count) { continue }
+            $sum = Summary @($dirs | ForEach-Object { RunStats $_.FullName })
+            $res | Add-Member -NotePropertyName $gpu -NotePropertyValue $sum -Force
+        }
+        $res | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 "$out\$l\results.json"
+        "$l rescored: $out\$l\results.json"
+    }
+}
+
+# powershell -File passes "-Compare base,merged" as one string.
+if ($Compare.Count -eq 1) { $Compare = @($Compare[0] -split ',') }
+if ($Rescore.Count -eq 1) { $Rescore = @($Rescore[0] -split ',') }
+if ($Rescore.Count) { Rescore $Rescore }
+elseif ($Compare.Count -eq 2) { CompareRuns $Compare[0] $Compare[1] }
 elseif ($Builds) { Interleave $Builds }
-else { Write-Host 'usage: tools\regress.ps1 -Builds "base=<exe>,merged=<exe>" | -Compare <base>,<candidate>'; exit 2 }
+else { Write-Host 'usage: tools\regress.ps1 -Builds "base=<exe>,merged=<exe>" | -Compare <base>,<candidate> | -Rescore <labels>'; exit 2 }

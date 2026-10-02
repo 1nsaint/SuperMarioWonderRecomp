@@ -19,7 +19,8 @@ param(
     [switch]$Course11,                   # go on through the opening and the map into course 1-1 (-Seconds 320)
     [string]$Env = "",
     [double]$MinFps = 0,
-    [string]$Exe = ""                    # another build (tools\regress.ps1 runs two side by side)
+    [string]$Exe = "",                   # another build (tools\regress.ps1 runs two side by side)
+    [switch]$KeepSave                    # keep private\wonder\user\save (default: a new game)
 )
 $s = "20:L:0.4;20:R:0.4"
 for ($t = 26; $t -le 50; $t += 3) { $s += ";$($t + $Delay):A:0.25" }
@@ -39,6 +40,7 @@ $run = @{ Name = $Name; Gpu = $Gpu; Seconds = $Seconds; DumpEvery = $DumpEvery; 
            MaxMemGB = 6; MinFps = $MinFps }
 if ($Handheld) { $run.Handheld = $true }
 if ($Exe) { $run.Exe = $Exe }
+if ($KeepSave) { $run.KeepSave = $true }
 if (-not $Windowed) { $run.Headless = $true }
 & "$PSScriptRoot\wonder_run.ps1" @run
 exit $LASTEXITCODE
