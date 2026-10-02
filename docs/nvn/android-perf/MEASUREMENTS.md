@@ -225,3 +225,32 @@ more battery. It stays opt-in: `NX_GPU_TURBO=1` in config.txt.
 **G4 (narrow pass-end barrier):** off by default again. `n6def` (G4 on, turbo off) showed a black band over the
 course background in 2 of 28 frames (15000 and 16200); none of the other 8 runs did. `NX_PASS_BARRIER_NARROW=1` turns
 it back on for study.
+
+## Hand-off (2026-10-01): rendering bugs, still open
+
+The performance side is in place: S23 course median 58.5-59.9 fps in the default config. The user then asked for
+the rendering bugs. A study (RENDER-BUGS.md) was started, then stopped before it wrote anything, because the work
+moves to Windows. What is known:
+
+| Bug | Evidence | Leading suspects |
+|---|---|---|
+| Exploded black vertices | user report while playing with `NX_PIPELINED=1`; 1 in 600 dumped frames cannot catch it | the pipelined CPU race of PLAN.md §3.2 (game writes vertex/uniform memory during the replay); stale data from today's per-submit caches (`NX_RESOLVE_CACHE`, `NX_CALL_TABLE`, `NX_SET_CACHE`, dynamic uniform offsets); ring wrap |
+| Black silhouettes | `phone_h1b` frames 12600-16200 (player and nearby enemies) | the dark-Mario class (DEBUG.md #39: AO targets of re-created textures, `NX_IMAGE_REUSE`); intermittent |
+| Black band over the background | `phone_n6def` frames 15000 and 16200, with G4 on | G4 (narrow pass barrier, now off by default) or another intermittent hazard |
+| Background glow flicker | user report | PLAN.md §7 |
+
+**Tools ready:**
+- `BURST="200 240 280"` in `tools/wonder_phone_course.sh`: 60 consecutive frames at each time.
+- `tools/burst_anomalies.py <frames dir> --out <dir>`: frames that differ from both neighbours (one-frame glitches),
+  with side-by-side images.
+- Every new optimization has its off switch for bisecting: `NX_RESOLVE_CACHE=0`, `NX_CALL_TABLE=0`, `NX_SET_CACHE=0`,
+  `NX_DYNAMIC_UBO=0`, `NX_JANITOR=0`, `NX_STAGING_MIN=0`, `NX_SUBMIT_CHUNK_DRAWS=0`, `NX_CLEARS_PASS=1`,
+  `NX_R11G11B10_EMULATE=1`, `NX_UBWC_FLAGS=0`, `NX_PIPELINED=0`.
+
+**Suggested first steps:**
+1. A burst run with the user's play, pipelined, then `burst_anomalies.py` on its frames.
+2. If the vertex explosions show, the same run with `NX_PIPELINED=0`, then with the caches off one at a time.
+
+**Before merging into the Windows branch**, run course 1-1 on the NVIDIA PC once. These changes are on for every
+platform and were tested on the Mac only: the set cache, the janitor, the resolve cache, the CallList table and the
+ring uploads.
