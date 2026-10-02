@@ -542,7 +542,14 @@ extern "C" void android_main(android_app* app) {
     g_app = app;
     // Game data: Internal storage/<game title> (put there by the player, needs all-files access) or the app's own
     // external files folder (adb push).
-    const std::string shared = std::string("/storage/emulated/0/") + nx::game::kInfo.title;
+    // The folder picked on the home screen (games/<game>/java Home.java writes <files>/data_root.txt) comes first.
+    std::string chosen;
+    if (app->activity->internalDataPath) {
+        std::ifstream f(std::string(app->activity->internalDataPath) + "/data_root.txt");
+        std::getline(f, chosen);
+        while (!chosen.empty() && (chosen.back() == '\r' || chosen.back() == '\n' || chosen.back() == ' ')) chosen.pop_back();
+    }
+    const std::string shared = !chosen.empty() ? chosen : std::string("/storage/emulated/0/") + nx::game::kInfo.title;
     const std::string own = app->activity->externalDataPath ? app->activity->externalDataPath : shared;
     if (!has_data(own) && !has_all_files_access(app)) {
         request_all_files_access(app);
@@ -555,7 +562,8 @@ extern "C" void android_main(android_app* app) {
             }
         }
     }
-    g_root = has_data(own) ? own : shared;
+    // The picked folder wins over the app's own one; else the own one (adb push), else Internal storage/<title>.
+    g_root = !chosen.empty() && has_data(chosen) ? chosen : has_data(own) ? own : shared;
     // config.txt's NX_* lines become environment variables (the NVN layer reads its switches with getenv), without
     // overriding a variable already set. Android defaults: handheld (720p, the lighter GPU load).
     {

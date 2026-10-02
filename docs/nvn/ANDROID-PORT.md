@@ -288,6 +288,19 @@ files would move every texture after the first changed one. Instead the data pac
 - time the encoder on the whole set on the M1 (it runs once per pack);
 - compare a few transcoded textures against the BC originals (PSNR) before committing to the 6x6 mapping.
 
+### D2. Home screen: the player picks the data folder (2026-10-01)
+
+The app opens on a home screen (`games/wonder/java/.../Home.java`, the APK's only Java, built by
+`android\build_apk.ps1` with `javac` + `d8` when `games\<game>\java` exists; the interface is built in code).
+- It finds the data by itself, or lets the player browse the internal storage and pick a folder. Any of our zips
+  extracted as they come works: the phone's (`Super Mario Bros. Wonder/`), the PC's (`private/wonder/`, also below a
+  `SwitchGamesRecomp/` folder) and the portable one (`WonderPC/data/`), or the folder itself.
+- It shows what the folder has (modules, RomFS, `spirv/results.tsv`, the button font) and asks for all-files access
+  when missing. "Jogar" writes the path to `<files>/data_root.txt` and starts `android.app.NativeActivity`.
+- `android_main` (`platform_android.cpp`) uses that folder first, then the app's own folder (adb push), then
+  `Internal storage/<title>` as before. Test runs that start the NativeActivity directly read the same file: pick
+  the default folder on the home screen before them, or their `config.txt` goes to another folder.
+- `minSdkVersion` 30 (Android 11): all-files access is checked with `Environment.isExternalStorageManager`.
 ## 8. Phased plan
 
 Rough effort is for one developer working at the Mac track's pace. The Mac track stays the reference: every Android

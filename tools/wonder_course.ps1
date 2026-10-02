@@ -18,7 +18,8 @@ param(
     [switch]$Windowed,
     [switch]$Course11,                   # go on through the opening and the map into course 1-1 (-Seconds 320)
     [string]$Env = "",
-    [double]$MinFps = 0
+    [double]$MinFps = 0,
+    [string]$Exe = ""                    # another build (tools\regress.ps1 runs two side by side)
 )
 $s = "20:L:0.4;20:R:0.4"
 for ($t = 26; $t -le 50; $t += 3) { $s += ";$($t + $Delay):A:0.25" }
@@ -37,6 +38,7 @@ for ($t = $walk + 1; $t -lt $Seconds; $t += 1.5) { $s += ";${t}:A:0.35" }
 $run = @{ Name = $Name; Gpu = $Gpu; Seconds = $Seconds; DumpEvery = $DumpEvery; Script = $s; Env = $Env;
            MaxMemGB = 6; MinFps = $MinFps }
 if ($Handheld) { $run.Handheld = $true }
+if ($Exe) { $run.Exe = $Exe }
 if (-not $Windowed) { $run.Headless = $true }
 & "$PSScriptRoot\wonder_run.ps1" @run
 exit $LASTEXITCODE
