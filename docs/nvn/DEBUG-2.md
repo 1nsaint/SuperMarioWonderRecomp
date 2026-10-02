@@ -247,7 +247,8 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
     - Tools: `tools/wonder_course.ps1 -Course11` goes on through the opening and the map into course 1-1;
       `NX_GPU_PROFILE` logs the frame's GPU total.
 
-77. **World map: every other frame broken while Mario walks (open), and the limiter crash at boot once more (#74).**
+77. **World map: every other frame broken while Mario walks (fixed by #91), and the limiter crash at boot once more
+    (#74).**
     - The owner's recording (map, after playing courses): while Mario moves, about half the frames show a flat
       lavender scene, huge black triangles and Mario as a purple silhouette; standing still is fine.
     - Not reproduced from a boot straight into the map (headless at 14 fps, windowed at 59 fps with
@@ -255,6 +256,7 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
       state of a longer session.
     - Tool for that: a file named `dump_frames` in the data folder (`"<count> [<every>]"`) dumps the next presented
       frames at full speed (`nvn_debug.cpp` `frame_dump_due`).
+    - Cause found in #91: the command-list safety net dropped the map's lists after 3+ minutes in a course.
     - #74 again: a render that began before an update and ended after it counted as a render that used it. The update
       now records the render count after it ran, under the render lock, and renders count themselves under it.
       20 boots in a row: no crash.
@@ -452,3 +454,30 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
       `record_run.ps1 -Course11` (330 s: opening, map, course 1-1 with two respawns) clean, no unknown handle.
       `tools/regress.ps1 -NoIntegrated -Repeat 2`, interleaved before/after: no loss (course median 47.8 / 48.6 fps,
       p10 30.6 / 30.3, replay 9.16 / 9.15 ms, 0 glitch frames, unit tests pass).
+
+91. **World map lavender with black wedges after a course (#77): live command lists dropped by the safety net.**
+    - The owner's session: back from a course, the map stayed a flat lavender with one huge black wedge, only the HUD
+      and the course balloon right; the log had `called handle ... is unknown` for low (early) handles just before.
+    - Cause (nvn_cmd.cpp): the safety net that bounds the number of command lists counted `g_handle_order`, which
+      keeps an entry for every list ever recorded, dropped ones included. Past 2^18 recordings (2-3 minutes of play)
+      it ran at every EndRecording and dropped any live list not called in the last 2^18 recordings. The map's lists,
+      recorded at its first visit and not called during 3+ minutes in a course, were gone on the way back.
+    - Also: lists recorded in a memory pool stayed live after the pool was finalized (GPU addresses are never
+      reused, so nothing recorded over them): +3,000-7,000 live lists per course entry, which made the net run.
+    - Fix: the net counts live lists (`g_handles`) and compacts stale queue entries; a finalized pool drops the lists
+      recorded in its memory (`command_memory_released`). `NX_HANDLES_OLD=1`, `NX_CMD_POOL_DROP=0`: as before;
+      `NX_KEEP_HANDLES=<n>`: the limit (reproduces it quickly with a small n). `NX_CMD_DROPS=1` tells, on each
+      `called handle ... is unknown` line, what dropped it.
+    - Check: the owner played map ↔ course cycles after the fix: map clean. (The study was stopped before its own
+      validation runs; a formal repro run is still to do.)
+
+92. **Course 1-1's background without its haze for single frames.**
+    - The distant towers lost their aerial-perspective haze for one frame now and then (6.5% of course frames).
+    - Cause (nvn_sets.cpp): Wonder registers its 64x36 haze texture in a new pool slot every frame and re-initializes
+      the same NVNtexture struct as a dynamic-resolution target of the same format, over other memory, before the
+      replay. The slot resolved through the struct to the new texture, so the haze pass sampled that target.
+    - Fix: a pool slot whose texture struct was re-initialized over other memory keeps sampling the registered copy;
+      a target re-initialized in place (same memory, new size) is still followed (#45). `NX_SNAPSHOT_MEMORY=0`: as
+      before. Diagnosis tool: `NX_FRAME_SIG` (per-frame draw signature, `nvn_draw_trace.cpp`) and
+      `tools/find_haze_flicker.py`.
+    - Check: the owner's play after the fix: no haze flicker. Formal recordings still to do.

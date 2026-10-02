@@ -233,6 +233,7 @@ bool zero_draws_begin(VkCommandBuffer cb, const std::string& label);
 void zero_draws_end(VkCommandBuffer cb);
 void zero_draws_collect();
 void zero_draws_log();
+void frame_sig_flush(uint64_t presents);  // NX_FRAME_SIG=1: the frame's draw signature, logged (nvn_draw_trace.cpp)
 void debug_snapshot(VkCommandBuffer cb, GpuImage& img, uint64_t draw);
 void debug_snapshots_write();  // nvn_pipeline.cpp: before an image is freed
 

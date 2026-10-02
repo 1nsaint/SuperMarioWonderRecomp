@@ -67,8 +67,11 @@ void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth
                         replay_list(cb, st, *l, depth + 1);
                         cb = frame_cb(cb);  // NX_PIPELINED: the called list may have split the submit
                     } else {
-                        static int missing = 0;
-                        if (++missing <= 5) log("nvn: called handle %llx is unknown", (unsigned long long)c.a[0]);
+                        static uint64_t missing = 0;
+                        if (++missing <= 20 || missing % 1000 == 0)
+                            log("nvn: called handle %llx is unknown (%llu calls of unknown handles): %s",
+                                (unsigned long long)c.a[0], (unsigned long long)missing,
+                                explain_handle(c.a[0]).c_str());
                     }
                 }
                 break;

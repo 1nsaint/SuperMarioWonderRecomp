@@ -367,6 +367,8 @@ struct TargetViews {  // SetRenderTargets' blob: level and layer per color targe
 };
 
 std::shared_ptr<CmdList> command_list(uint64_t handle);  // a recorded handle's commands (nvn_cmd.cpp)
+std::string explain_handle(uint64_t handle);             // why a handle has no list (NX_CMD_DROPS=1: what dropped it)
+void command_memory_released(uint64_t gpu, uint64_t size);  // a pool finalized: the lists recorded in it go
 // Appends to the command buffer (guest NVNcommandBuffer*) being recorded; `blob` is copied into the list.
 void record(uint64_t cmdbuf, Cmd cmd, const void* blob = nullptr, size_t size = 0);
 

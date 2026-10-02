@@ -84,17 +84,59 @@ void lookup_handle(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, Vie
         // it broke the course's foreground flowers (dynamic-resolution targets re-initialized every frame are meant
         // to be followed) and did not light the Goombas (docs/nvn/DEBUG.md #45).
         static const bool kind_only = std::getenv("NX_SNAPSHOT_SHAPE") == nullptr;
+        // Re-initialized over other memory: the struct now holds another texture, while the pool's descriptor still
+        // names the registered memory. Wonder registers its 64x36 aerial-haze texture in a new slot every frame and
+        // reuses the struct for a dynamic-resolution target of the same format before the replay: 6.5% of course
+        // frames sampled that target instead, and the background lost its haze for a frame (DEBUG-2 #92). A target
+        // re-initialized in place (same memory, new size) is still followed (#45). NX_SNAPSHOT_MEMORY=0: as before.
+        static const bool memory_rule = [] {
+            const char* e = std::getenv("NX_SNAPSHOT_MEMORY");
+            return !(e && e[0] == '0');
+        }();
         if (texture && e.snapshot) {
             Texture* now = get<Texture>(texture);
             Texture* then = get<Texture>(e.snapshot);
             bool moved = now && then && !kind_only &&
                          (now->memory != then->memory || now->width != then->width || now->height != then->height ||
                           now->depth != then->depth || now->levels != then->levels);
+            moved = moved || (now && then && memory_rule && now->memory != then->memory);
             if (then && (!now || moved || now->target != then->target || now->format != then->format)) texture = e.snapshot;
         }
         if (view && e.has_view) *view = e.view;
     }
 }
+
+}  // namespace
+
+// NX_FRAME_SIG's watched draws: how a handle's texture slot resolves (the mark's entry against the current one).
+std::string explain_texture_slot(uint64_t handle) {
+    uint32_t sid = 0, tid = handle_texture(handle, &sid);
+    auto* tp = get<DescriptorPool>(g_state.texture_pool);
+    if (!tp) return "no pool";
+    std::shared_lock lk(objects_lock());
+    PoolEntry e;
+    bool at_mark = pool_entry_at(g_state.texture_pool, tid, t_replay_mark, e);
+    auto cur = tp->textures.find(tid);
+    auto cs = tp->snapshots.find(tid);
+    auto desc = [](uint64_t key) {
+        auto o = objects().find(key);
+        auto* t = o == objects().end() ? nullptr : dynamic_cast<Texture*>(o->second.get());
+        char b[96];
+        std::snprintf(b, sizeof b, "%llx(%ux%u f%x m%llx)", (unsigned long long)(key & 0xFFFFF), t ? t->width : 0,
+                      t ? t->height : 0, t ? t->format : 0, (unsigned long long)(t ? t->memory : 0));
+        return std::string(b);
+    };
+    char b[160];
+    std::snprintf(b, sizeof b, "{id %x mark %llu now %llu: ", tid, (unsigned long long)t_replay_mark,
+                  (unsigned long long)current_epoch());
+    std::string s = b;
+    if (at_mark) s += "at mark " + (e.has ? desc(e.texture) : std::string("empty")) + " snap " + desc(e.snapshot) + "; ";
+    s += "current " + (cur != tp->textures.end() ? desc(cur->second) : std::string("none")) + " snap " +
+         (cs != tp->snapshots.end() ? desc(cs->second) : std::string("none")) + "}";
+    return s;
+}
+
+namespace {
 
 // What a handle resolves to, once per submit (docs/nvn/PERF-PLAN.md step 4). The replay's mark (nvn_incarnation.cpp,
 // DEBUG.md #55-#57) makes (texture pool, sampler pool, handle) -> (texture, its object, view) constant within a

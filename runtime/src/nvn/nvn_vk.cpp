@@ -664,6 +664,7 @@ void gpu_present(uint64_t texture, const int32_t* crop) {
     if (presents % (presents < 300 ? 60 : 300) == 0) draw_log_stats();
     if (presents % 60 == 0) log_timing(60), gpu_profile_log(60);
     if (presents % 300 == 0) zero_draws_log();
+    frame_sig_flush(presents);
     const bool due = frame_dump_due(presents);
     bool dump = src && due;
     if (dump) transition(g_cb, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);  // the present pass left it sampled

@@ -9,6 +9,7 @@
 // CallCommands(cmd, int count, const NVNcommandHandle*).
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <deque>
@@ -54,6 +55,9 @@ struct HandleEntry {
     uint64_t queued = 0, used = 0;  // g_handle_clock values
     uint64_t start = 0, end = 0;    // command memory bytes: memory address + usage estimate
     uint64_t pool = 0;              // the NVNmemoryPool* of that memory
+    uint64_t cb = 0;                // the NVNcommandBuffer* it was recorded in
+    double t = 0;                   // seconds since the first list, when it was recorded
+    uint64_t calls = 0;             // lookups (replays and submits)
 };
 uint64_t g_cross_pool_drops = 0;  // lists dropped by a list recorded in another pool (only with NX_CMD_REGION_OLD)
 
@@ -75,6 +79,59 @@ std::deque<std::pair<uint64_t, uint64_t>> g_handle_order;  // (handle, queued at
 constexpr size_t kKeepHandles = 1 << 18;
 uint64_t g_handle_clock = 0;
 std::atomic<uint64_t> g_next_handle{1};
+
+// The safety net counted g_handle_order, which keeps an entry for every list recorded, also those already dropped by
+// the overlap rule: past 2^18 lists ever recorded (2-3 minutes of play) it ran on every EndRecording and dropped any
+// live list not called in the last 2^18 recordings. The world map's lists, recorded at its first visit and not called
+// while Mario was in a course for 3 minutes, were gone on the way back: the map lavender with black wedges for good
+// (DEBUG-2 #77, #91). Now it counts live lists (g_handles) and stale queue entries are compacted away.
+// NX_HANDLES_OLD=1: the old count. NX_KEEP_HANDLES=<n>: the limit (to reproduce it quickly).
+bool handles_old() {
+    static const bool on = std::getenv("NX_HANDLES_OLD") != nullptr;
+    return on;
+}
+size_t keep_handles() {
+    static const size_t n = [] {
+        const char* e = std::getenv("NX_KEEP_HANDLES");
+        return e ? size_t(std::strtoull(e, nullptr, 0)) : kKeepHandles;
+    }();
+    return n;
+}
+double seconds_now() {
+    static const auto t0 = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// NX_CMD_DROPS=1: what dropped each list (a ring by handle), told when a dropped handle is called (explain_handle).
+struct Dropped {
+    uint64_t handle = 0, by = 0;  // by: the list recorded over it; 0: the safety net
+    uint64_t start = 0, end = 0, pool = 0, cb = 0, calls = 0;
+    uint64_t by_start = 0, by_end = 0, by_pool = 0, by_cb = 0;
+    float t = 0, t_drop = 0;
+};
+constexpr size_t kDropRing = 1 << 19;
+std::vector<Dropped> g_dropped;
+std::map<uint64_t, Dropped> g_aged_lists;  // the safety net's drops, by handle
+uint64_t g_aged = 0, g_aged_called = 0, g_overlap_drops = 0, g_pool_drops = 0;
+bool drops_on() {
+    static const bool on = std::getenv("NX_CMD_DROPS") != nullptr;
+    return on;
+}
+void note_drop(uint64_t h, const HandleEntry& e, uint64_t by, uint64_t by_start, uint64_t by_end, uint64_t by_pool,
+               uint64_t by_cb) {
+    if (by == ~0ull) g_pool_drops++;
+    else if (by) g_overlap_drops++;
+    else g_aged++, g_aged_called += e.calls != 0;
+    Dropped d{h,     by,       e.start, e.end,   e.pool, e.cb, e.calls, by_start, by_end, by_pool,
+              by_cb, float(e.t), float(seconds_now())};
+    if (!by) {  // few: kept by handle (the ring below is overwritten by later handles' overlap drops)
+        if (g_aged_lists.size() > 100000) g_aged_lists.clear();
+        g_aged_lists[h] = d;
+    }
+    if (!drops_on()) return;
+    if (g_dropped.empty()) g_dropped.resize(kDropRing);
+    g_dropped[h % kDropRing] = d;
+}
 
 
 void CommandBufferInitialize(CPU& c) {  // NVNboolean (NVNcommandBuffer*, NVNdevice*)
@@ -138,6 +195,7 @@ bool skinned_program(uint64_t program) {
 void CommandBufferEndRecording(CPU& c) {  // NVNcommandHandle
     std::shared_ptr<CmdList> list = std::make_shared<CmdList>();
     uint64_t start = 0, end = 0, pool = 0;
+    const uint64_t cb_guest = c.x[0];
     if (auto* cb = get<CommandBuffer>(c.x[0])) {
         std::lock_guard lk(cb->lock);
         size_t n = cb->recording->cmds.size() + 1;  // + the end of the list, so even an empty one used something
@@ -191,33 +249,54 @@ void CommandBufferEndRecording(CPU& c) {  // NVNcommandHandle
         if (r != g_regions.begin()) --r;
         while (r != g_regions.end() && r->first < end) {
             if (r->second.first > start) {
-                if (auto old = g_handles.find(r->second.second); old != g_handles.end() && old->second.pool != pool &&
-                                                                  ++g_cross_pool_drops <= 5)
-                    log("nvn: list %llx (pool %llx) dropped by list %llx recorded in pool %llx", (unsigned long long)old->first,
-                        (unsigned long long)old->second.pool, (unsigned long long)h, (unsigned long long)pool);
-                g_handles.erase(r->second.second);
+                if (auto old = g_handles.find(r->second.second); old != g_handles.end()) {
+                    if (old->second.pool != pool && ++g_cross_pool_drops <= 5)
+                        log("nvn: list %llx (pool %llx) dropped by list %llx recorded in pool %llx",
+                            (unsigned long long)old->first, (unsigned long long)old->second.pool, (unsigned long long)h,
+                            (unsigned long long)pool);
+                    note_drop(old->first, old->second, h, start, end, pool, cb_guest);
+                    g_handles.erase(old);
+                }
                 r = g_regions.erase(r);
             } else {
                 ++r;
             }
         }
         g_regions[start] = {end, h};
-        g_handles[h] = {list, now, 0, start, end, pool};
+        g_handles[h] = {list, now, 0, start, end, pool, cb_guest, seconds_now(), 0};
         g_handle_order.push_back({h, now});
-        for (size_t turns = g_handle_order.size(); g_handle_order.size() > kKeepHandles && turns; turns--) {
+        // The safety net (see handles_old): over the limit of live lists, the oldest not called since they were
+        // queued go. The queue's entries of lists already dropped are compacted away when they outnumber the live.
+        const bool old_rule = handles_old();
+        if (!old_rule && g_handle_order.size() > 2 * g_handles.size() + 4096) {
+            std::deque<std::pair<uint64_t, uint64_t>> live;
+            for (auto& e : g_handle_order)
+                if (auto it = g_handles.find(e.first); it != g_handles.end() && it->second.queued == e.second)
+                    live.push_back(e);
+            g_handle_order.swap(live);
+        }
+        const size_t keep = keep_handles();
+        for (size_t turns = g_handle_order.size();
+             (old_rule ? g_handle_order.size() : g_handles.size()) > keep && turns && !g_handle_order.empty(); turns--) {
             auto [old, queued] = g_handle_order.front();
             g_handle_order.pop_front();
             auto it = g_handles.find(old);
-            if (it == g_handles.end()) continue;
+            if (it == g_handles.end() || it->second.queued != queued) continue;  // dropped, or queued again later
             if (it->second.used > queued || !it->second.used) {  // in use, or not called yet: queue it again
                 it->second.queued = ++g_handle_clock;
                 g_handle_order.push_back({old, it->second.queued});
             } else {
                 auto reg = g_regions.find(it->second.start);
                 if (reg != g_regions.end() && reg->second.second == old) g_regions.erase(reg);
+                note_drop(old, it->second, 0, 0, 0, 0, 0);
                 g_handles.erase(it);
             }
         }
+        if ((g_ends & 4095) == 0)
+            log("nvn: handles: %zu live, %zu queued, %llu dropped by overlap, %llu with their pool, %llu by the safety "
+                "net (%llu of them called before)",
+                g_handles.size(), g_handle_order.size(), (unsigned long long)g_overlap_drops,
+                (unsigned long long)g_pool_drops, (unsigned long long)g_aged, (unsigned long long)g_aged_called);
     }
     c.x[0] = h;
 }
@@ -359,7 +438,64 @@ std::shared_ptr<CmdList> command_list(uint64_t handle) {
     auto it = g_handles.find(handle);
     if (it == g_handles.end()) return nullptr;
     it->second.used = ++g_handle_clock;
+    it->second.calls++;
     return it->second.list;
+}
+
+// A memory pool finalized: the lists recorded in its memory are gone with it (on the GPU they are invalid). GPU
+// addresses are never reused (gpu_alloc), so without this nothing records over them again and every course load's
+// lists stayed live for the session (+3,000-7,000 per course entry), until the safety net had to run again
+// (DEBUG-2 #91). NX_CMD_POOL_DROP=0: they stay.
+void command_memory_released(uint64_t gpu, uint64_t size) {
+    static const bool off = [] {
+        const char* e = std::getenv("NX_CMD_POOL_DROP");
+        return e && e[0] == '0';
+    }();
+    if (off || !gpu) return;
+    std::lock_guard lk(g_handles_lock);
+    size_t n = 0;
+    for (auto r = g_regions.lower_bound(gpu); r != g_regions.end() && r->first < gpu + size;) {
+        if (auto it = g_handles.find(r->second.second); it != g_handles.end()) {
+            note_drop(it->first, it->second, ~0ull, gpu, gpu + size, 0, 0);
+            g_handles.erase(it), n++;
+        }
+        r = g_regions.erase(r);
+    }
+    static int logged = 0;
+    if (n && logged++ < 20)
+        log("nvn: memory pool at gpu %llx (%llu KB) finalized: %zu command lists in it dropped", (unsigned long long)gpu,
+            (unsigned long long)(size >> 10), n);
+}
+
+// For the "handle ... is unknown" lines: what dropped it (NX_CMD_DROPS=1), or why that is not known.
+std::string explain_handle(uint64_t handle) {
+    std::lock_guard lk(g_handles_lock);
+    char b[400];
+    if (handle >= g_next_handle.load()) return "never recorded";
+    auto aged = g_aged_lists.find(handle);
+    if (aged == g_aged_lists.end() &&
+        (!drops_on() || g_dropped.empty() || g_dropped[handle % kDropRing].handle != handle))
+        return drops_on() ? "dropped by overlap (not in the ring any more)" : "dropped (NX_CMD_DROPS=1 tells by what)";
+    const Dropped& d = aged != g_aged_lists.end() ? aged->second : g_dropped[handle % kDropRing];
+    if (d.by == ~0ull)
+        std::snprintf(b, sizeof b, "its memory pool (gpu %llx-%llx) was finalized at %.1f s (recorded at %.1f s in cmd "
+                      "%llx, %llu calls)", (unsigned long long)d.by_start, (unsigned long long)d.by_end, d.t_drop, d.t,
+                      (unsigned long long)d.cb, (unsigned long long)d.calls);
+    else if (!d.by)
+        std::snprintf(b, sizeof b,
+                      "aged out by the safety net at %.1f s (recorded at %.1f s in cmd %llx, %llu calls, memory %llx-%llx "
+                      "pool %llx)",
+                      d.t_drop, d.t, (unsigned long long)d.cb, (unsigned long long)d.calls, (unsigned long long)d.start,
+                      (unsigned long long)d.end, (unsigned long long)d.pool);
+    else
+        std::snprintf(b, sizeof b,
+                      "dropped at %.1f s by list %llx (cmd %llx, memory %llx-%llx pool %llx); it was recorded at %.1f s "
+                      "in cmd %llx, %llu calls, memory %llx-%llx pool %llx",
+                      d.t_drop, (unsigned long long)d.by, (unsigned long long)d.by_cb, (unsigned long long)d.by_start,
+                      (unsigned long long)d.by_end, (unsigned long long)d.by_pool, d.t, (unsigned long long)d.cb,
+                      (unsigned long long)d.calls, (unsigned long long)d.start, (unsigned long long)d.end,
+                      (unsigned long long)d.pool);
+    return b;
 }
 
 NX_HLE("nvnCommandBufferInitialize", CommandBufferInitialize);
