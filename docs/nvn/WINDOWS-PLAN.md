@@ -95,6 +95,19 @@ mode is the natural target.
 4. **Exit.** Title and menus at 60 fps; course 1-1 at a steady 30 fps or better on the UHD 770; the same images as
    the RTX 3050.
 
+## Another PC (no build tools there)
+
+`private/venv/Scripts/python tools/pack_pc_portable.py` writes `private/wonder/pc/WonderPC-portable.zip` (4.1 GB,
+stored): `wonder.exe`, the C++ runtime DLLs (app-local), `Jogar.bat` (sets `NX_DATA_ROOT` to `data\`),
+`LEIA-ME.txt` and `data\` (modules, RomFS, SPIR-V with `results.tsv`, button font, the save; `--no-save` for a new
+game). Needs Windows 10/11 x64, a CPU with AVX2 and a Vulkan 1.3 GPU. Checked by extracting it outside the
+repository and running it from there: 60 fps headless. Three things the LEIA-ME tells:
+- extract to a short path (`C:\WonderPC`): some RomFS paths pass Windows' 260-character limit in deep folders;
+- the first start takes minutes (the antivirus reads ~31,000 new files once);
+- the zip is over 4 GiB: not on a FAT32 USB stick (exFAT/NTFS, or a cloud drive).
+
+The owner's own data: never share it.
+
 ## Rules
 
 As in WINDOWS-PORT.md: branch `feat/windows-wonder`; no AI attribution in commits; files under 700 lines; only the
