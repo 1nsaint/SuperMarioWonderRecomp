@@ -415,3 +415,40 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
       - the audio limiter pacing (#74);
       - on-demand frame dumps (#77);
       - the recompiler split into files under the line cap, same output.
+
+## PC quality (2026-10-02; pc-quality/PLAN.md)
+
+90. **Exploded geometry at course 1-1's start and after each respawn, for a whole session (#76's rest): command lists
+    of one memory pool dropped by lists of another.**
+    - Symptom (RTX 3050, synchronous submits, windowed; `pc-quality/E1-baseline.md`): for 1-4 s at the course start
+      and after every respawn, black columns from the sky down to the ground, a black band along the ground, thin
+      lines from the top of the screen; or a flat lavender band and the Talking Flower drawn black. 2 of 6 course
+      sessions; a session that had it kept it. The same processes also drew a brown rock blown up over the world map,
+      with black holes, in the first frame back on the map (the kind of #77).
+    - Repro: an input script enters 1-1 from the owner's map save, pauses, exits and enters again, 8 times in 7 min;
+      the window is recorded (`tools/record_run.ps1`) and the frames at 2 per second go through `find_glitches.py`
+      and `find_lavender.py`, sorted by the script's phase (course start, map return). Glitchy processes showed it
+      in 1-2 of 8 entries; some processes never did, so a variant needs several processes.
+    - Ruled out on the way: the five Android caches off together (`NX_SET_CACHE`, `NX_RESOLVE_CACHE`,
+      `NX_CALL_TABLE`, `NX_JANITOR`, `NX_STAGING_MIN` all 0): glitch in 2 of 8 entries. `NX_IMAGE_REUSE=0` with
+      `NX_NO_IMAGE_SHARE=1` cannot run (the 8 GB memory guard stopped it 36 s in).
+    - Found with `NX_CHECK_VERTS=1` (new: draws that fetch vertices past their bound vertex buffer range). In the
+      glitchy runs, draws of vs `21d4f4c0`/`82906934` and others indexed vertices 0..1211 of 12 bytes (14.5 KB) with
+      684, 2,928 or 8,652 bytes bound: earlier draws' buffers. Clean runs had none. Every glitchy run's log also had
+      `nvn: called handle ... is unknown` (a CallCommands of a list we no longer had), and no clean one; the same split
+      holds for E1's seven logs (rec-c11-1 and rec-long: 5 lines each; the five clean runs: none).
+    - Cause (`nvn_cmd.cpp`): a list lives as long as its command memory, so a list recorded over the bytes of older
+      ones drops them (DEBUG.md #26). Those bytes were keyed by the `NVNmemoryPool*`, the guest struct's address, plus
+      the offset. Pool structs sit a few KB apart while the offsets reach megabytes, so a list in one pool
+      "overlapped" lists of another and dropped them: `list c463 (pool 5014c7d060) dropped by list 14246 recorded in
+      pool 5014c7dbf0` (0xb90 apart). Wonder records objects' draw lists when a course loads and calls them each
+      frame. A call to a dropped list skipped its vertex buffer binds, and the draws after it read the buffers bound
+      before them through their own indices. Where a load puts the lists decides which get dropped: hence per
+      session, and only on the objects drawn through them (the Talking Flower near the start).
+    - Fix: the key is the pool's GPU address plus the offset (pools have disjoint GPU ranges), so only lists over
+      the same memory drop each other. `NX_CMD_REGION_OLD=1`: the old key, with the first 5 cross-pool drops logged.
+    - Validation, before: unknown handles in 5 of 7 repro processes (glitch frames in 3). After: 2 repro processes
+      (16 course entries, 14 map returns, 15 min) with no glitch frame, no unknown handle and no out-of-range fetch;
+      `record_run.ps1 -Course11` (330 s: opening, map, course 1-1 with two respawns) clean, no unknown handle.
+      `tools/regress.ps1 -NoIntegrated -Repeat 2`, interleaved before/after: no loss (course median 47.8 / 48.6 fps,
+      p10 30.6 / 30.3, replay 9.16 / 9.15 ms, 0 glitch frames, unit tests pass).

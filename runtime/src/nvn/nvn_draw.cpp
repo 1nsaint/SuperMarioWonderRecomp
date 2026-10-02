@@ -333,6 +333,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         g_stats.no_indices++;
         return false;
     }
+    check_vertex_ranges(vs, fs, indexed, c, in);  // NX_CHECK_VERTS (nvn_written.cpp)
     if (!g_rendering) {
         if (gpu_profile_on()) {
             GpuImage* img = t.color_count && t.colors[0] ? image_of(t.colors[0]) : nullptr;

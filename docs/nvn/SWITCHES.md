@@ -64,3 +64,5 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
 | `NX_STAGING_RING=1` | big texture uploads through the upload ring, as before DEBUG-2 #72 (bisecting) | nvn_upload.cpp |
 | `NX_PIPELINE_CACHE=0` | no on-disk pipeline cache (DEBUG-2 #73) | nvn_pipeline_cache.cpp |
 | `NX_PIPELINED=0..4` | Windows/Android: synchronous by default; 1..4 turns pipelined fences on (macOS default; DEBUG-2 #76) | nvn_frames.cpp |
+| `NX_CMD_REGION_OLD=1` | command memory keyed by the `NVNmemoryPool*` plus offset again, as before DEBUG-2 #90 (lists of one pool dropped by another's: exploded geometry); logs the first 5 such drops | nvn_cmd.cpp |
+| `NX_CHECK_VERTS=1` | logs draws that fetch vertices or instances past their bound vertex buffer range (vs/fs, indices, bound size; DEBUG-2 #90) | nvn_written.cpp |

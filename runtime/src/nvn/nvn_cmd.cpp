@@ -33,7 +33,8 @@ struct CommandBuffer : Object {
     // the total.
     uint64_t command_size = 0, control_size = 0;
     uint64_t command_base = 0, control_base = 0;  // usage before this recording
-    uint64_t command_memory = 0;                  // the memory added last: pool address + offset
+    uint64_t command_memory = 0;                  // the memory added last: its GPU address (see AddCommandMemory)
+    uint64_t command_pool = 0;                    // its NVNmemoryPool*
 };
 
 constexpr uint64_t kCommandBytes = 16, kControlBytes = 4;  // per recorded command
@@ -52,7 +53,21 @@ struct HandleEntry {
     std::shared_ptr<CmdList> list;
     uint64_t queued = 0, used = 0;  // g_handle_clock values
     uint64_t start = 0, end = 0;    // command memory bytes: memory address + usage estimate
+    uint64_t pool = 0;              // the NVNmemoryPool* of that memory
 };
+uint64_t g_cross_pool_drops = 0;  // lists dropped by a list recorded in another pool (only with NX_CMD_REGION_OLD)
+
+// Where command memory is, for the overlap rule above: the pool's GPU address plus the offset. It was the
+// NVNmemoryPool* (the guest struct's address) plus the offset: pool structs sit a few hundred bytes apart while the
+// offsets reach megabytes, so a list recorded in one pool "overlapped" lists of another and dropped them. Wonder records
+// its draw lists when a course loads; a dropped one left its draws on the vertex buffers bound before them (exploded
+// geometry at course 1-1's start for the session, DEBUG-2 #90). NX_CMD_REGION_OLD=1: the old key.
+uint64_t command_memory_address(uint64_t pool, uint64_t offset) {
+    static const bool old = std::getenv("NX_CMD_REGION_OLD") != nullptr;
+    if (!old)
+        if (auto* p = get<MemoryPool>(pool)) return p->gpu + offset;
+    return pool + offset;
+}
 std::map<uint64_t, std::pair<uint64_t, uint64_t>> g_regions;  // start -> (end, handle)
 std::mutex g_handles_lock;
 std::map<uint64_t, HandleEntry> g_handles;
@@ -81,7 +96,8 @@ void AddCommandMemory(CPU& c) {  // (cmd, const NVNmemoryPool*, ptrdiff_t offset
         std::lock_guard lk(cb->lock);
         cb->command_size = c.x[3];
         cb->command_base = 0;
-        cb->command_memory = c.x[1] + c.x[2];
+        cb->command_memory = command_memory_address(c.x[1], c.x[2]);
+        cb->command_pool = c.x[1];
     }
 }
 
@@ -121,11 +137,12 @@ bool skinned_program(uint64_t program) {
 
 void CommandBufferEndRecording(CPU& c) {  // NVNcommandHandle
     std::shared_ptr<CmdList> list = std::make_shared<CmdList>();
-    uint64_t start = 0, end = 0;
+    uint64_t start = 0, end = 0, pool = 0;
     if (auto* cb = get<CommandBuffer>(c.x[0])) {
         std::lock_guard lk(cb->lock);
         size_t n = cb->recording->cmds.size() + 1;  // + the end of the list, so even an empty one used something
         start = cb->command_memory + cb->command_base;
+        pool = cb->command_pool;
         cb->command_base = used(cb->command_size, cb->command_base, n, kCommandBytes);
         end = std::max(cb->command_memory + cb->command_base, start + 1);
         cb->control_base = used(cb->control_size, cb->control_base, n, kControlBytes);
@@ -174,6 +191,10 @@ void CommandBufferEndRecording(CPU& c) {  // NVNcommandHandle
         if (r != g_regions.begin()) --r;
         while (r != g_regions.end() && r->first < end) {
             if (r->second.first > start) {
+                if (auto old = g_handles.find(r->second.second); old != g_handles.end() && old->second.pool != pool &&
+                                                                  ++g_cross_pool_drops <= 5)
+                    log("nvn: list %llx (pool %llx) dropped by list %llx recorded in pool %llx", (unsigned long long)old->first,
+                        (unsigned long long)old->second.pool, (unsigned long long)h, (unsigned long long)pool);
                 g_handles.erase(r->second.second);
                 r = g_regions.erase(r);
             } else {
@@ -181,7 +202,7 @@ void CommandBufferEndRecording(CPU& c) {  // NVNcommandHandle
             }
         }
         g_regions[start] = {end, h};
-        g_handles[h] = {list, now, 0, start, end};
+        g_handles[h] = {list, now, 0, start, end, pool};
         g_handle_order.push_back({h, now});
         for (size_t turns = g_handle_order.size(); g_handle_order.size() > kKeepHandles && turns; turns--) {
             auto [old, queued] = g_handle_order.front();

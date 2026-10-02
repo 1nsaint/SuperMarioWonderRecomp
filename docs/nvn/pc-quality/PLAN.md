@@ -12,7 +12,7 @@ Goal set by the owner for the morning, on the RTX 3050 laptop (Windows, synchron
 
 | Item | State | Where |
 |---|---|---|
-| Exploded meshes, black lines (course 1-1) | gone in the owner's play with synchronous submits; pipelined is off by default off macOS | DEBUG-2 #76 |
+| Exploded meshes, black lines (course 1-1) | pipelined off by default off macOS (#76); the per-session rest was command lists dropped across memory pools, fixed | DEBUG-2 #76, #90 |
 | Map: every other frame lavender + black triangles while walking | open; seen after a long session, not from a boot into the map | DEBUG-2 #77 |
 | HUD in blocks, black sky | fixed: barrier after each pass | DEBUG-2 #71 |
 | Characters black/green at the cast scene | fixed: staging buffers for big uploads | DEBUG-2 #72 |
@@ -49,3 +49,10 @@ Newest last.
   capture): course 1-1 shows black or lavender exploded geometry at its start and on every respawn in 2 of 6
   course sessions (#76 not gone); opening, cutscenes and map clean; #77 not reproduced. Course 1-1 runs at
   30-42 fps windowed: the game asks for present interval 2 when its main thread runs over 16.7 ms.
+- 2026-10-02 05:05, E2 (DEBUG-2 #90): the course 1-1 exploded geometry (#76's per-session rest) was command lists
+  dropped because command memory was keyed by the `NVNmemoryPool*` struct address plus offset (lists of one pool
+  "overlapped" another's); now by the pool's GPU address (`NX_CMD_REGION_OLD=1`: old). Found with the new
+  `NX_CHECK_VERTS=1`; the log line `called handle ... is unknown` marked every glitchy run. Repro (8 course entries
+  per process, recorded): before, unknown handles in 5 of 7 processes; after, 16 entries and a 330 s `-Course11`
+  recording clean; regress (dGPU, 2 runs) no loss. The map's blown-up rock on returning from the course, seen in the
+  same processes, went with it.

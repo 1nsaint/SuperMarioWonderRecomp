@@ -102,6 +102,8 @@ struct DrawInputs {
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
 };
 bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in);
+// NX_CHECK_VERTS=1: logs draws that fetch vertices or instances past their bound vertex buffer range (debugging).
+void check_vertex_ranges(const ShaderInfo* vs, const ShaderInfo* fs, bool indexed, const Cmd& c, const DrawInputs& in);
 
 // nvn_sets.cpp: the descriptor sets of a draw or dispatch, and the replay's CPU shortcuts (docs/nvn/PERF-PLAN.md).
 // NX_DRAW_SLOW=1 turns every shortcut off, for bisecting; letters instead of 1 pick them: m the scratch memory kept
