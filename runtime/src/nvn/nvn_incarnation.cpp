@@ -156,8 +156,18 @@ ReplayScope::ReplayScope(uint64_t lists_epoch) {
     g_floor = mark;
     drain_objects();
     t_replay_mark = mark;
+    static std::atomic<uint64_t> serial{0};
+    t_replay_serial = ++serial;
 }
 
-ReplayScope::~ReplayScope() { t_replay_mark = 0; }
+ReplayScope::~ReplayScope() { t_replay_mark = 0, t_replay_serial = 0; }
+
+bool resolve_cache_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("NX_RESOLVE_CACHE");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 
 }  // namespace nx::nvn

@@ -43,7 +43,16 @@
           Inputs="@(ShaderPatch);@(ShaderPatch->'$(ShaderSrc)%(File)')"
           Outputs="@(ShaderPatch->'$(PatchedDir)%(File)')">
     <MakeDir Directories="@(ShaderPatch->'$(PatchedDir)%(File)'->'%(RootDir)%(Directory)')" />
-    <Exec Command="patch --quiet --forward -o &quot;$(PatchedDir)%(ShaderPatch.File)&quot; &quot;$(ShaderSrc)%(ShaderPatch.File)&quot; &quot;%(ShaderPatch.FullPath)&quot;" />
+    <Exec Condition="'$(OS)' != 'Windows_NT'"
+          Command="patch --quiet --forward -o &quot;$(PatchedDir)%(ShaderPatch.File)&quot; &quot;$(ShaderSrc)%(ShaderPatch.File)&quot; &quot;%(ShaderPatch.FullPath)&quot;" />
+    <!-- Windows has no `patch`: tools/maxwell/apply_patch.py does the same (unified diff, exact hunks, -o).
+         Python: the repo's venv if present, else `python` on PATH (override with -p:PatchPython=...). -->
+    <PropertyGroup Condition="'$(OS)' == 'Windows_NT' And '$(PatchPython)' == ''">
+      <PatchPython Condition="Exists('$(MSBuildThisFileDirectory)../../../../private/venv/Scripts/python.exe')">$(MSBuildThisFileDirectory)../../../../private/venv/Scripts/python.exe</PatchPython>
+      <PatchPython Condition="'$(PatchPython)' == ''">python</PatchPython>
+    </PropertyGroup>
+    <Exec Condition="'$(OS)' == 'Windows_NT'"
+          Command="&quot;$(PatchPython)&quot; &quot;$(MSBuildThisFileDirectory)../../apply_patch.py&quot; --quiet --forward -o &quot;$(PatchedDir)%(ShaderPatch.File)&quot; &quot;$(ShaderSrc)%(ShaderPatch.File)&quot; &quot;%(ShaderPatch.FullPath)&quot;" />
   </Target>
 
 </Project>

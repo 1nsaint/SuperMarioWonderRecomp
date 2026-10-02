@@ -434,6 +434,7 @@ std::vector<uint32_t> patched_spirv(const ShaderInfo* s, const uint8_t* kinds, u
 }
 
 uint64_t dynamic_uniform_bindings(const ShaderInfo* s) {
+    if (s->masks_known) return s->dynamic_uniforms;
     static std::mutex lock;
     static std::map<const ShaderInfo*, uint64_t> cache;
     std::lock_guard lk(lock);
@@ -449,6 +450,7 @@ uint64_t dynamic_uniform_bindings(const ShaderInfo* s) {
 // them. Compute results are copied back to guest memory after the submit only for these, and a submit with
 // write-backs is waited for before the next replay (NX_ASYNC_GPU): read-only storage counted too (DEBUG.md #32).
 uint64_t written_storage_bindings(const ShaderInfo* s) {
+    if (s->masks_known) return s->written_storage;
     static std::mutex lock;
     static std::map<const ShaderInfo*, uint64_t> cache;
     std::lock_guard lk(lock);

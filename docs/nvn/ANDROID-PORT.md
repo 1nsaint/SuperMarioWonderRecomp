@@ -134,6 +134,9 @@ devices are estimates and are marked as such. Nothing here was run on a phone.
        dump, so it is allowed.
 
      First count BC bytes in the RomFS to size this. ASTC stays native (it is native on the M1 too).
+
+     **Decided (2026-09-30, by the project owner): transcode on the Mac, when the phone's data pack is built.** See
+     "Decisions" below for how.
    - **Storage images without format.** Ryujinx declares images as `Unknown` format, and the harness adds
      `StorageImageRead/WriteWithoutFormat` (TRANSLATOR.md:134). `shaderStorageImageReadWithoutFormat` is often false
      on Adreno and Mali. Fix: in `nvn_spirv_patch.cpp`, rewrite the image's format from the texture bound at draw
@@ -241,6 +244,50 @@ devices are estimates and are marked as such. Nothing here was run on a phone.
    (`runtime/src/nvn/nvn.h` stays our own, from traces). Ryujinx (MIT) stays offline tooling; no code from GPL
    emulators. Only the user's own dump, keys and firmware fonts.
 
+## Decisions
+
+### D1. BC textures: transcoded to ASTC on the Mac, in the data pack (2026-09-30)
+
+Chosen by the project owner, over decoding at load time on the phone. Why:
+- the phone spends no CPU on it at load;
+- it spends no extra memory: decoding to RGBA8 takes up to 8x the memory of BC1/BC4;
+- the phone's GPU reads ASTC natively.
+
+The cost is a slight quality loss, far less visible than any glitch. It is also derived from the owner's own dump,
+so it is within the ground rules.
+
+**How.** The BNTX files in the RomFS are not rewritten. BC and ASTC blocks differ in size for BC1/BC4 (8 bytes per
+4x4 block, where ASTC always uses 16), and the game computes its texture memory and tiling from the file. Rewritten
+files would move every texture after the first changed one. Instead the data pack carries a side table:
+1. `tools/pack_phone_wonder.py` walks the RomFS textures (`tools/maxwell/bntx.py` already reads BNTX). For each BC
+   image and mip level it:
+   - untiles the image as the runtime does (`nvn_texture_layout`);
+   - transcodes it with an ASTC encoder run on the Mac, at a mapping that keeps the bits per texel:
+
+     | BC | ASTC |
+     |---|---|
+     | BC7, BC3 (RGBA, 8 bpp) | 4x4 (8 bpp) |
+     | BC5 (RG, 8 bpp) | 4x4 (8 bpp) |
+     | BC1 (RGB, 4 bpp) | 6x6 (3.56 bpp) |
+     | BC4 (R, 4 bpp) | 6x6 |
+     | BC6H (HDR) | ASTC HDR 4x4 where the phone has it, else RGBA16F at load (the only runtime decode, for few textures) |
+
+   - stores the result in `astc.pack`, one indexed file keyed by a hash of the tiled BC bytes and the level, so a
+     lookup costs one hash.
+2. At upload (`nvn_upload.cpp`), when the device has no `textureCompressionBC`:
+   - a BC image is created as the table's ASTC format and size;
+   - the table's data is uploaded in place of the BC bytes;
+   - views and samplers follow the image format, as the R11G11B10F → RGBA16F widening already does.
+
+   The guest never sees the change: its memory keeps the BC bytes. A miss (a BC texture the pack does not have, for
+   example one written by the GPU) falls back to a CPU decode and is logged, so the pack can be completed.
+3. Devices with `textureCompressionBC` (Xclipse, and Macs) keep BC as is: the table is ignored.
+
+**First step (A2):**
+- count BC images, bytes and formats in the RomFS;
+- time the encoder on the whole set on the M1 (it runs once per pack);
+- compare a few transcoded textures against the BC originals (PSNR) before committing to the 6x6 mapping.
+
 ## 8. Phased plan
 
 Rough effort is for one developer working at the Mac track's pace. The Mac track stays the reference: every Android
@@ -250,12 +297,53 @@ milestone compares frame dumps (`NX_DUMP_FRAMES`) against the Mac on the same sc
 |---|---|---|---|---|
 | A0 | Groundwork | split `platform_android.cpp` under 700 lines; `games/wonder/AndroidManifest.xml`; `-march=armv8.2-a+crypto` and 16 KB page alignment in CMake; `config.txt` → `setenv`; `memguard_android.cpp`; Roboto font fallback; data pack tool (single-file SPIR-V) | `build_apk.sh --game wonder` produces an installable APK; the Mac build is unchanged | 3-4 days |
 | A1 | CPU side on the phone, headless | boot with `NX_HEADLESS=1` on an Adreno 740 phone | 2,000+ frames, no crash, fps and memory in `nx.log`; the main thread's frame time is measured (the key number for risk 1) | 2-3 days |
-| A2 | First pixels | present through `vk_present.cpp` (rotation, crop); surface loss; SUBOPTIMAL not treated as a rebuild; device feature and limit report; D24 native; BC decode path; depth-clip fallback | the title screen matches the Mac dump (the key-art texel within ±2); home and back works 10 times | 1.5-2 weeks |
+| A2 | First pixels | present through `vk_present.cpp` (rotation, crop); surface loss; SUBOPTIMAL not treated as a rebuild; device feature and limit report; D24 native; BC → ASTC side table (D1); depth-clip fallback | the title screen matches the Mac dump (the key-art texel within ±2); home and back works 10 times | 1.5-2 weeks |
 | A3 | Course correct | read-without-format patch; subgroup and interlock audit; descriptor-limit check; R11G11B10 native trial; `Invariant` position; pipeline cache on disk | course 1-1 frames match the Mac across the W7 glitch set; zero pipeline failures; second launch with no compile hitch over 50 ms | 2-3 weeks |
 | A4 | Playable | drawn touch overlay; controller mapping; audio paced from AAudio; A-hold fix | 1-1 finished with touch and with a pad; 10 min with no audio underrun in the log | 1 week |
 | A5 | Performance | ADPF and affinity; push descriptors; pass load/store and clear merging; pipeline pre-build; FIFO with Choreographer vsync | 1-1 handheld at 60 fps (99% of frames under 16.7 ms) on 8 Gen 3-class; a stable 30 on 8 Gen 2 if 60 is not reached; a 30-min run holds its target | 3-4 weeks |
 | A6 | Memory | the cuts of section 6; memory budget via JNI | peak PSS + GPU budget under 3.5 GB; 30 min on a 12 GB phone with no kill; one 8 GB phone reported | 1-2 weeks |
 | A7 | Breadth | a Mali/Immortalis device and an Xclipse device; World 1 end to end; saves across app kills | the W7 glitch set is clean on 2 vendors; world 1 done; the save survives a force stop | 2-3 weeks |
+
+### Progress (branch `feat/android-wonder`)
+
+A0, 2026-09-30:
+- `platform_android.cpp` is split into window/threads/main (568 lines), `platform_android_input.cpp` and
+  `platform_android_audio.cpp`, with `platform_android.h` between them.
+- `games/wonder/AndroidManifest.xml`: package `io.github.belmantegu.wonderrecomp`, Vulkan 1.3 required, landscape.
+- CMake adds `-march=armv8.2-a+crypto` (game code and runtime) and `-Wl,-z,max-page-size=16384`.
+- `config.txt`: its `NX_*` lines become environment variables before boot. `NX_HANDHELD=1` is the Android default.
+- `memguard_android.cpp`: Pss from `/proc/self/smaps_rollup`; the limit is `NX_MEM_LIMIT_GB`, else 60% of RAM.
+- The shared font falls back to Roboto.
+- `tools/pack_phone_wonder.py` makes `Wonder-data.zip`: 31,766 files, 3.92 GB, stored. The SPIR-V stays loose files
+  for now; the single-file pack is moved to A2, where its loading time can be measured.
+- All 62 runtime objects, the NVN layer included, compile with NDK 28.2. The Mac build is unchanged.
+- **Exit met (build side):** `android/build_apk.sh --game wonder` produces `private/wonder/apk/wonder.apk`: 58 MB
+  (libwonder.so 187 MB stripped), package `io.github.belmantegu.wonderrecomp`, min SDK 29, signature verified. A clean
+  NDK build at `-j4` took about 2 hours on the M1 (1,332 objects, with `-g`). Installing it waits for a phone (A1).
+
+A1, 2026-09-30, Galaxy S23 (DEBUG-2.md #78):
+- First fixes: the alias region moved below the modules (Android's zygote sits in the old one at random), and the
+  data went to Internal storage with all-files access by `appops`.
+- **Exit met:** the game runs on the phone at 40-60 fps at the title, with no failed draw and no crash, and memory
+  under the guard (5 GB set in `config.txt`).
+- Tools: `tools/wonder_push_android.sh` (install and push, any serial) and `tools/wonder_run_android.sh` (run, log,
+  pull the frame dumps).
+
+A2, in progress (DEBUG-2.md #79, #80, #82):
+- The present pass (`nvn_present.cpp`): rotation, fit, alpha 1, surface format and composite alpha from the surface,
+  and a new window after home or the lock screen. Checked on the Mac with `NX_PRESENT_TEST`; the on-device check
+  waits for the phone.
+- BC is native on Adreno: D1 is for Mali.
+- The emulator cannot render on the M1 (SwiftShader only).
+
+A4, started (DEBUG-2.md #81):
+- Drawn touch controls for Wonder, with dash at full tilt.
+- Short taps work in the menus.
+
+**To test when the phone is back:**
+1. `bash tools/wonder_push_android.sh <serial> --no-data` installs the new APK and keeps the data.
+2. `bash tools/wonder_run_android.sh <serial> 90 s23b`.
+3. Look at the screen: the title, upright, with bars and the touch controls drawn.
 
 Total: about 12-16 weeks. A0-A2 can start while the Mac track finishes W7. They share no files with the glitch work
 except `nvn_vk.cpp` (present and swapchain) and `nvn_format.cpp`, where the Android changes are per-device branches

@@ -5,8 +5,11 @@
 // into a slot's, not waited for, nvn_frames.cpp); image layouts are tracked per image, in submission order. The image
 // behind a texture is nvn_image.cpp. On macOS this is MoltenVK: the instance enumerates portability drivers and the
 // device enables VK_KHR_portability_subset.
-#include <unistd.h>
+#if !defined(_WIN32)
+#include <unistd.h>  // _exit (stdlib.h on Windows)
+#endif
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -44,6 +47,8 @@ VkSurfaceKHR g_surface = VK_NULL_HANDLE;
 VkSwapchainKHR g_swapchain = VK_NULL_HANDLE;
 std::vector<VkImage> g_sc_images;
 VkExtent2D g_sc_extent{};
+VkExtent2D g_sc_current{};  // the surface's currentExtent when the swapchain was made (SUBOPTIMAL: did it change?)
+VkSurfaceTransformFlagBitsKHR g_sc_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
 VkFormat g_sc_format = VK_FORMAT_B8G8R8A8_UNORM;
 VkSemaphore g_acquired = VK_NULL_HANDLE, g_rendered = VK_NULL_HANDLE;
 VkBool32 g_depth_clip_control = VK_FALSE;
@@ -88,6 +93,9 @@ bool has_extension(const std::vector<VkExtensionProperties>& list, const char* n
     return false;
 }
 
+void* g_gipa = nullptr;  // vkGetInstanceProcAddr, for surfaces made later (make_surface)
+bool make_surface();
+
 bool init() {
     if (g_ready || g_failed) return g_ready;
     g_failed = true;  // until everything below succeeds
@@ -123,9 +131,13 @@ bool init() {
     p_enum_physical = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(gipa(g_instance, "vkEnumeratePhysicalDevices"));
     p_create_device = reinterpret_cast<PFN_vkCreateDevice>(gipa(g_instance, "vkCreateDevice"));
 
-    n = 1;
-    p_enum_physical(g_instance, &n, &g_physical);
-    if (!n || !g_physical) {
+    n = 0;
+    p_enum_physical(g_instance, &n, nullptr);
+    std::vector<VkPhysicalDevice> gpus(n);
+    p_enum_physical(g_instance, &n, gpus.data());
+    gpus.resize(n);
+    g_physical = pick_physical_device(gpus);  // NX_GPU, default: the first discrete GPU (nvn_gpu_pick.cpp)
+    if (!g_physical) {
         log("nvn/vk: no GPU");
         return false;
     }
@@ -133,12 +145,8 @@ bool init() {
     p_vkGetPhysicalDeviceProperties(g_physical, &props);
     p_vkGetPhysicalDeviceMemoryProperties(g_physical, &g_memory);
 
-    uint64_t surface = 0;
-    void* layer = plat::create_window();
-    if (!check(VkResult(plat::vulkan_create_surface(g_instance, layer, &surface, reinterpret_cast<void*>(gipa))),
-               "surface"))
-        return false;
-    g_surface = reinterpret_cast<VkSurfaceKHR>(surface);
+    g_gipa = reinterpret_cast<void*>(gipa);
+    if (!make_surface()) return false;
 
     p_vkGetPhysicalDeviceQueueFamilyProperties(g_physical, &n, nullptr);
     std::vector<VkQueueFamilyProperties> families(n);
@@ -190,10 +198,14 @@ bool init() {
     p_vkGetPhysicalDeviceFeatures2(g_physical, &features);
     g_depth_clip_control = fclip.depthClipControl;
     g_features = features.features;
+    // NX_ASTC_DECODE=1|linear|srgb: the CPU decoder even where the GPU has ASTC (to compare the two on one GPU).
+    set_astc_native(g_features.textureCompressionASTC_LDR);
+    log("nvn/vk: ASTC %s", astc_native() ? "native" : "decoded to RGBA8 at upload (no textureCompressionASTC_LDR)");
     log("nvn/vk: depthClamp %u, depthBiasClamp %u, depthBounds %u, depth clip control %u (extension %u)",
         g_features.depthClamp, g_features.depthBiasClamp, g_features.depthBounds, g_depth_clip_control,
         has_extension(dext, "VK_EXT_depth_clip_control") ? 1u : 0u);
     log("nvn/vk: portability: format reinterpretation %u, format swizzle %u", fport.fields[2], fport.fields[3]);
+    log_device_caps(g_physical, dext);  // nvn_caps.cpp
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = g_family;
@@ -223,9 +235,15 @@ bool init() {
     p_vkCreateSemaphore(g_device, &sci, nullptr, &g_acquired);
     p_vkCreateSemaphore(g_device, &sci, nullptr, &g_rendered);
 
-    make_upload_buffer(256ull << 20);  // a busy submit reached 67 MB (uniforms padded to 4 KB, storage to 64 KB)
+    // A busy submit reached 67 MB (uniforms padded to 4 KB, storage to 64 KB). Android: 128 MB, half, for an 8 GB
+    // phone (docs/nvn/android-perf/MEMORY.md: the phone never filled it; big uploads have staging buffers, #72).
+#if defined(__ANDROID__)
+    make_upload_buffer(128ull << 20);
+#else
+    make_upload_buffer(256ull << 20);
+#endif
     if (async_gpu())
-        frame_init(g_pool, g_upload, g_upload_ptr, g_upload_size);  // the upload buffer becomes the slots' ring
+        frame_init(g_pool, g_family, g_upload, g_upload_ptr, g_upload_size);  // the upload buffer: the slots' ring
     else
         g_descriptors = make_descriptor_pool();
     log("nvn/vk: %s, Vulkan %u.%u, queue family %u", props.deviceName, VK_API_VERSION_MAJOR(props.apiVersion),
@@ -235,10 +253,42 @@ bool init() {
     return true;
 }
 
+// The window's surface, and the swapchain format from what the surface offers: B8G8R8A8_UNORM (the Mac), else
+// R8G8B8A8_UNORM (Android surfaces offer no BGRA: a swapchain made with it showed nothing on a Galaxy S23), else the
+// first. A new Android window (the app back from home or the lock screen) needs a new surface (gpu_present).
+void* g_window = nullptr;
+uint64_t g_window_gen = 0;
+bool make_surface() {
+    if (g_surface) p_vkDestroySurfaceKHR(g_instance, g_surface, nullptr);
+    if (g_window) plat::release_window(g_window);
+    g_surface = VK_NULL_HANDLE;
+    g_window = plat::create_window();  // waits for a window (Android); the generation is read once it is there
+    g_window_gen = plat::window_generation();
+    uint64_t surface = 0;
+    if (!check(VkResult(plat::vulkan_create_surface(g_instance, g_window, &surface, g_gipa)), "surface")) return false;
+    g_surface = reinterpret_cast<VkSurfaceKHR>(surface);
+    uint32_t n = 0;
+    p_vkGetPhysicalDeviceSurfaceFormatsKHR(g_physical, g_surface, &n, nullptr);
+    std::vector<VkSurfaceFormatKHR> formats(n);
+    p_vkGetPhysicalDeviceSurfaceFormatsKHR(g_physical, g_surface, &n, formats.data());
+    auto offered = [&](VkFormat f) {
+        for (const VkSurfaceFormatKHR& x : formats)
+            if (x.format == f) return true;
+        return false;
+    };
+    g_sc_format = offered(VK_FORMAT_B8G8R8A8_UNORM)   ? VK_FORMAT_B8G8R8A8_UNORM
+                  : offered(VK_FORMAT_R8G8B8A8_UNORM) ? VK_FORMAT_R8G8B8A8_UNORM
+                  : n                                  ? formats[0].format
+                                                       : VK_FORMAT_B8G8R8A8_UNORM;
+    log("nvn/vk: surface: %u formats offered, swapchain format %d", n, int(g_sc_format));
+    return true;
+}
+
 bool make_swapchain() {
     if (g_swapchain) {
         if (async_gpu()) frame_wait_all();
         p_vkDeviceWaitIdle(g_device);
+        present_pass_release();
         p_vkDestroySwapchainKHR(g_device, g_swapchain, nullptr);
         g_swapchain = VK_NULL_HANDLE;
     }
@@ -262,7 +312,30 @@ bool make_swapchain() {
     ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
+    // The present pass (nvn_present.cpp) draws the picture pre-rotated: the images are in the display's own
+    // orientation (portrait on a phone held sideways). Without it the images stay upright (the Mac: identity).
+    bool sideways = caps.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR);
+    bool pass = present_pass_wanted() && !present_pass_failed();
+    g_sc_current = caps.currentExtent;
+    if (pass && sideways && extent.width > extent.height) std::swap(extent.width, extent.height);
+    if (!pass && (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR))
+        ci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    // Some drivers report maxImageExtent in the other orientation: the larger side bounds both.
+    uint32_t most = std::max(caps.maxImageExtent.width, caps.maxImageExtent.height);
+    if (most) extent.width = std::min(extent.width, most), extent.height = std::min(extent.height, most);
+    ci.imageExtent = extent;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if (!(caps.supportedCompositeAlpha & ci.compositeAlpha))
+        for (VkCompositeAlphaFlagBitsKHR a : {VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR, VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
+                                              VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR})
+            if (caps.supportedCompositeAlpha & a) {
+                ci.compositeAlpha = a;
+                break;
+            }
+    log("nvn/vk: surface %ux%u (current %ux%u), transform %u of %#x, composite alpha %#x of %#x, usage %#x",
+        extent.width, extent.height, caps.currentExtent.width, caps.currentExtent.height, unsigned(caps.currentTransform),
+        caps.supportedTransforms, unsigned(ci.compositeAlpha), caps.supportedCompositeAlpha,
+        caps.supportedUsageFlags);
     // The game paces itself on its vsync event (hle_vi.cpp, 60 Hz): a FIFO present also waited for the display's own
     // refresh, two clocks drifting against each other (stutter near 60 fps, docs/nvn/DEBUG.md #33). MAILBOX never
     // blocks and shows the newest frame at each refresh; else IMMEDIATE (MoltenVK: no display sync in the Metal
@@ -288,7 +361,15 @@ bool make_swapchain() {
     g_sc_images.resize(n);
     p_vkGetSwapchainImagesKHR(g_device, g_swapchain, &n, g_sc_images.data());
     g_sc_extent = extent;
-    log("nvn/vk: swapchain %ux%u, %u images", extent.width, extent.height, n);
+    g_sc_transform = ci.preTransform;
+    if (n > 8) log("nvn/vk: %u swapchain images: more than the 8 present semaphores (nvn_frames.cpp)", n);
+    bool drawn = pass && present_pass_targets(g_sc_format, g_sc_images, extent, ci.preTransform);
+    if (pass && !drawn && present_pass_failed()) {  // the pass is out: an upright swapchain for the blit
+        log("nvn/vk: present pass failed: swapchain made again for the blit");
+        return make_swapchain();
+    }
+    log("nvn/vk: swapchain %ux%u, %u images, transform %u, %s", extent.width, extent.height, n,
+        unsigned(ci.preTransform), drawn ? "drawn by the present pass" : "blitted");
     return true;
 }
 
@@ -340,7 +421,8 @@ VkDescriptorSet descriptor_set(VkDescriptorSetLayout layout) {
 VkDescriptorPool make_descriptor_pool() {
     VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 65536}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16384},
                                     {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 65536}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4096},
-                                    {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024}};
+                                    {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024},
+                                    {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 65536}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 32768;
     dpi.poolSizeCount = uint32_t(sizeof sizes / sizeof sizes[0]);
@@ -361,8 +443,7 @@ void make_upload_buffer(uint64_t size) {
     p_vkGetBufferMemoryRequirements(g_device, g_upload, &req);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
-    ai.memoryTypeIndex =
-        memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    ai.memoryTypeIndex = upload_memory_type(req.memoryTypeBits);  // nvn_caps.cpp (NX_RING_CACHED)
     p_vkAllocateMemory(g_device, &ai, nullptr, &g_upload_memory);
     p_vkBindBufferMemory(g_device, g_upload, g_upload_memory, 0);
     void* p = nullptr;
@@ -428,6 +509,7 @@ void log_timing(uint64_t frames) {
         ms(t.fence_ns), ms(t.submit_ns > known ? t.submit_ns - known : 0), ms(t.present_ns),
         double(t.upload_bytes) / 1e6 / double(frames));
     frame_log(frames);
+    creation_log(frames);  // pipelines and ASTC decodes of the window; saves the pipeline cache now and then
     g_timing = {};
 }
 
@@ -506,20 +588,24 @@ void present_headless(uint64_t texture) {
     if (presents % (presents < 300 ? 60 : 300) == 0) draw_log_stats();
     if (presents % 60 == 0) log_timing(60), gpu_profile_log(60);
     if (presents % 300 == 0) zero_draws_log();
-    if (!frame_dump_every() || presents % frame_dump_every() != 0) return;
+    if (!frame_dump_due(presents)) return;
     if (src && src->layout != VK_IMAGE_LAYOUT_UNDEFINED && begin()) {
-        transition(g_cb, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        bool dump = frame_dump_record(g_cb, *src);
+        GpuImage* shown = src;  // NX_PRESENT_TEST: what the present pass would put on a display (nvn_present.cpp)
+        if (GpuImage* test = present_pass_test_target(); test && present_pass_record(g_cb, *src, nullptr, 0))
+            test->layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, shown = test;
+        transition(g_cb, *shown, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        bool dump = frame_dump_record(g_cb, *shown);
         if (async_gpu())
             frame_submit(VK_NULL_HANDLE, VK_NULL_HANDLE, {}, dump);  // a dumped frame is waited for
         else
             end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);
-        if (dump) frame_dump_write(*src, presents);
+        if (dump) frame_dump_write(*shown, presents);
     }
     debug_dump_textures(presents);
 }
 
 void gpu_present(uint64_t texture, const int32_t* crop) {
+    plat::perf_hint_thread();  // the thread that presents takes part in the frame (perf_hint.cpp)
     std::lock_guard lk(g_gpu);
     PresentTimer timer;
     drain_objects();  // under the GPU lock, as in gpu_submit
@@ -527,6 +613,15 @@ void gpu_present(uint64_t texture, const int32_t* crop) {
     if (!async_gpu() || pipelined()) free_retired_images(async_gpu() ? frame_completed() : UINT64_MAX);
     if (plat::headless()) return present_headless(texture);
     if (plat::window_minimized()) return;
+    if (plat::window_generation() != g_window_gen) {  // Android: a new window after home or the lock screen
+        if (async_gpu()) frame_wait_all();
+        p_vkDeviceWaitIdle(g_device);
+        present_pass_release();
+        if (g_swapchain) p_vkDestroySwapchainKHR(g_device, g_swapchain, nullptr);
+        g_swapchain = VK_NULL_HANDLE;
+        log("nvn/vk: new window: surface and swapchain re-made");
+        if (!make_surface()) return;
+    }
     if (!g_swapchain && !make_swapchain()) return;
     uint32_t index = 0;
     VkSemaphore acquired = async_gpu() ? frame_acquire_semaphore() : g_acquired;
@@ -547,10 +642,11 @@ void gpu_present(uint64_t texture, const int32_t* crop) {
             VkImageSubresourceRange rr{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             p_vkCmdClearColorImage(g_cb, src->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &rr);
         }
-        transition(g_cb, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     }
-    transition(g_cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    if (src) {
+    bool drawn = src && present_pass_record(g_cb, *src, crop, index);  // nvn_present.cpp: leaves dst PRESENT_SRC
+    if (src && !drawn) transition(g_cb, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    if (!drawn) transition(g_cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    if (src && !drawn) {
         VkImageBlit blit{};
         blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         blit.srcOffsets[1] = {int32_t(src->width), int32_t(src->height), 1};
@@ -562,20 +658,23 @@ void gpu_present(uint64_t texture, const int32_t* crop) {
         p_vkCmdBlitImage(g_cb, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.image,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
     }
-    transition(g_cb, dst, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    if (!drawn) transition(g_cb, dst, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     static uint64_t presents = 0;
     presents++;
     if (presents % (presents < 300 ? 60 : 300) == 0) draw_log_stats();
     if (presents % 60 == 0) log_timing(60), gpu_profile_log(60);
     if (presents % 300 == 0) zero_draws_log();
-    bool dump = src && frame_dump_every() && presents % frame_dump_every() == 0 && frame_dump_record(g_cb, *src);
+    const bool due = frame_dump_due(presents);
+    bool dump = src && due;
+    if (dump) transition(g_cb, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);  // the present pass left it sampled
+    dump = dump && frame_dump_record(g_cb, *src);
     VkSemaphore rendered = async_gpu() ? frame_rendered_semaphore(index) : g_rendered;
     if (async_gpu())  // the blit's fence is not waited for (vkQueuePresentKHR waits on `rendered`); a dumped frame is
         frame_submit(acquired, rendered, {}, dump);
     else
         end_and_wait(acquired, rendered);
     if (dump) frame_dump_write(*src, presents);
-    if (frame_dump_every() && presents % frame_dump_every() == 0) debug_dump_textures(presents);
+    if (due) debug_dump_textures(presents);
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &rendered;
@@ -583,7 +682,17 @@ void gpu_present(uint64_t texture, const int32_t* crop) {
     pi.pSwapchains = &g_swapchain;
     pi.pImageIndices = &index;
     r = p_vkQueuePresentKHR(g_queue, &pi);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) make_swapchain();
+    plat::frame_presented();  // cores, CPU time, present intervals (frame_stats.cpp)
+    // SUBOPTIMAL re-makes the swapchain only when the surface size changed: Android returns it for every present when
+    // the swapchain's transform is not the display's (a Galaxy S23 did for Hades), a rebuild per frame.
+    bool remake = r == VK_ERROR_OUT_OF_DATE_KHR;
+    if (r == VK_SUBOPTIMAL_KHR) {  // compared with what the swapchain was made from (its extent may be turned)
+        VkSurfaceCapabilitiesKHR caps{};
+        p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_physical, g_surface, &caps);
+        remake = caps.currentExtent.width != g_sc_current.width || caps.currentExtent.height != g_sc_current.height ||
+                 (present_pass_wanted() && !present_pass_failed() && caps.currentTransform != g_sc_transform);
+    }
+    if (remake) make_swapchain();
 }
 
 }  // namespace nx::nvn

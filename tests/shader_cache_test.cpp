@@ -8,8 +8,9 @@
 //
 // Build and run (standalone, no runtime):
 //   clang++ -std=c++20 -O2 -DNX_SHADERS_STANDALONE -Iruntime/src/nvn tests/shader_cache_test.cpp \
-//       runtime/src/nvn/nvn_shaders.cpp -o private/build/shader_cache_test
+//       runtime/src/nvn/nvn_shaders.cpp runtime/src/nvn/nvn_spirv_reflect.cpp -o private/build/shader_cache_test
 //   private/build/shader_cache_test [private/wonder]
+// or through CMake (-DNX_TESTS=ON, ctest), which runs it on private/wonder when that folder exists.
 #include <algorithm>
 #include <cstdio>
 #include <cstring>

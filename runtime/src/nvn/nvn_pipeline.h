@@ -50,6 +50,9 @@ struct ByteKeyHash {
 struct ProgramLayout {
     VkDescriptorSetLayout sets[4] = {};
     VkPipelineLayout layout = VK_NULL_HANDLE;
+    // Set 0 bindings (< 64) that are UNIFORM_BUFFER_DYNAMIC: their ring offset goes with vkCmdBindDescriptorSets, so
+    // the set depends only on which buffers and sizes it names (the set cache, nvn_sets.cpp). NX_DYNAMIC_UBO=0: none.
+    uint64_t dynamic = 0;
 };
 const ProgramLayout& program_layout(const std::vector<const ShaderInfo*>& stages);
 
@@ -131,6 +134,7 @@ void forget_image_views(const GpuImage& img);
 // True when sampled_view() would need no transfer or layout change (it can then be called inside a render pass).
 bool sampled_ready(uint64_t texture);
 void pipeline_begin_submit();  // per-submit state (the content checks of pitch-linear textures)
+VkImageViewType view_type(const ImageShape& shape);  // the view type a shader's image declaration samples
 bool dummy_ready(const ImageShape& shape);
 // A 1x1 black texture of the shape, for bindings with nothing behind them.
 VkImageView dummy_view(VkCommandBuffer cb, const ImageShape& shape);

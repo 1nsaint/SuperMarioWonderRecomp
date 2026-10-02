@@ -122,7 +122,7 @@ namespace SpirvHarness
                     r.Status = "exception";
                     r.Error = $"{e.GetType().Name}: {e.Message}";
                     string frame = e.StackTrace?.Split('\n').FirstOrDefault(l => l.Contains("Ryujinx.Graphics.Shader"))?.Trim();
-                    if (frame != null) r.Error += $" @ {Regex.Replace(frame, @" in /.*", "")}";
+                    if (frame != null) r.Error += $" @ {Regex.Replace(frame, @" in (/|[A-Za-z]:\\).*", "")}";
                 }
                 lock (gpu.Messages) r.Messages = gpu.Messages.Distinct().ToList();
                 r.Queries = string.Join(',', gpu.DrawTimeQueries);
@@ -167,7 +167,8 @@ namespace SpirvHarness
         static List<Job> LoadJobs(string root)
         {
             Dictionary<string, Job> jobs = new();
-            foreach (string manifest in Directory.EnumerateFiles(root, "manifest.tsv", SearchOption.AllDirectories).OrderBy(x => x))
+            foreach (string manifest in Directory.EnumerateFiles(root, "manifest.tsv", SearchOption.AllDirectories)
+                                                .OrderBy(x => x.Replace('\\', '/'), StringComparer.Ordinal))  // same order on Windows
             {
                 string dir = Path.GetDirectoryName(manifest);
                 string group = Path.GetRelativePath(root, dir);
@@ -256,7 +257,7 @@ namespace SpirvHarness
 
         static void WriteResults(string path, List<Result> all)
         {
-            using StreamWriter w = new(path);
+            using StreamWriter w = new(path) { NewLine = "\n" };  // LF on Windows too: same bytes as on macOS
             w.WriteLine("hash\tgroup\tstage\tstages_using\tstatus\tms\tspv_bytes\tresources\ttranslator_messages\terror\tdraw_time_queries");
             foreach (Result r in all)
             {

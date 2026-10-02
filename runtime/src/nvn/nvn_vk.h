@@ -26,6 +26,8 @@ struct GpuImage {
     bool texels = false;
     VkComponentMapping swizzle{};  // for sampling (attachment views stay identity)
     bool storage = false;          // created with VK_IMAGE_USAGE_STORAGE_BIT (compute shaders write it)
+    bool mutable_format = true;
+    uint64_t rendered_at = 0;      // the pass-end serial of the last pass that rendered into it (nvn_draw.cpp, G4)    // views may use another format (MUTABLE_FORMAT; nvn_image.cpp, ubwc_flags)
     // An R8 texture always read as (1, 1, 1, R) (a glyph cache): stored as RGBA8 (255, 255, 255, R) and sampled
     // without swizzle. MoltenVK returned alpha 0 for that view swizzle on a 2D-array view, so all text was invisible.
     bool alpha_from_r = false;
@@ -37,6 +39,8 @@ bool vk_depth_clip_control();
 // The core features the device was created with (all the GPU has): depthClamp, depthBiasClamp, depthBounds, ...
 const VkPhysicalDeviceFeatures& vk_features();
 VkPhysicalDevice vk_physical();
+// nvn_gpu_pick.cpp: logs every device and returns the one NX_GPU asks for (default: the first discrete GPU).
+VkPhysicalDevice pick_physical_device(const std::vector<VkPhysicalDevice>& devices);
 uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want);
 
 // The image behind an NVN texture (guest NVNtexture*), made on first use.
@@ -45,6 +49,21 @@ GpuImage* image_of(uint64_t texture);
 // default they are 2D / 2D-array images of height 1, which the translated shaders (1D sampled as 2D) can view (G8).
 bool vk_1d_images();
 void transition(VkCommandBuffer cb, GpuImage& img, VkImageLayout to);
+// nvn_present.cpp: the window texture drawn into the swapchain (rotated, fit, alpha 1) instead of blitted.
+bool present_pass_wanted();
+bool present_pass_targets(VkFormat format, const std::vector<VkImage>& images, VkExtent2D extent,
+                          VkSurfaceTransformFlagBitsKHR transform);
+bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop, uint32_t index);
+void present_pass_release();  // its views of the swapchain images, before the swapchain is destroyed
+bool present_pass_failed();   // the pass could not be made: frames are blitted, upright
+GpuImage* present_pass_test_target();  // NX_PRESENT_TEST: an offscreen "display" for the pass (headless dumps)
+// nvn_bc.cpp: BC textures decoded on the CPU where the GPU has no textureCompressionBC (NX_FORCE_BC_DECODE=1 anyway).
+bool bc_host_decode(uint32_t nvn_format);         // a BC format this device cannot sample (BC6H excepted)
+VkFormat bc_decoded_format(uint32_t nvn_format);  // what it is stored as instead
+uint32_t bc_decoded_bytes(uint32_t nvn_format);   // bytes per texel of that
+void bc_decode(uint32_t nvn_format, const uint8_t* blocks, uint32_t width, uint32_t height, uint32_t slices,
+               uint8_t* out);  // tightly packed blocks -> tightly packed texels
+bool bc_view_format(const GpuImage& img, uint32_t nvn, VkFormat& out);  // a view of a decoded image
 
 // Per-submit upload memory (host visible, coherent), reset at every submit: data the replayed commands read from
 // guest memory is copied here at replay time (vertex, index, uniform, storage data, texture staging).
@@ -59,6 +78,14 @@ constexpr VkBufferUsageFlags kUploadUsage =
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
 Upload upload_alloc(uint64_t size, uint64_t align);
+// nvn_frames.cpp: a buffer of its own for one big texture upload, freed when the submit being recorded retires.
+Upload staging_alloc(uint64_t size);
+// nvn_pipeline_cache.cpp: the on-disk pipeline cache, and the cost of what the replay creates (logged per window).
+VkPipelineCache pipeline_cache();
+void pipeline_cache_save();
+void note_pipeline_created(uint64_t ns);
+void note_astc_decoded(uint64_t ns);
+void creation_log(uint64_t frames);
 Upload upload(const void* data, uint64_t size, uint64_t align);
 
 // Descriptor sets for this submit (freed when it completes).
@@ -88,13 +115,19 @@ void debug_dump_add(uint64_t texture);  // nvn_debug.cpp: read back at the end o
 // full, or when something waits for them.
 bool async_gpu();  // the slots are in use (either mode)
 bool pipelined();  // NX_PIPELINED: fences not waited for, write-backs copied before gpu_submit returns
-void frame_init(VkCommandPool pool, VkBuffer ring, uint8_t* ring_ptr, uint64_t ring_size);
+// The extensions and memory types that the Android performance plan depends on, logged once (nvn_caps.cpp).
+void log_device_caps(VkPhysicalDevice physical, const std::vector<VkExtensionProperties>& extensions);
+uint32_t upload_memory_type(uint32_t bits);
+bool native_r11g11b10();
+bool ubwc_flags();  // MUTABLE_FORMAT only with a format list (nvn_caps.cpp; Android)  // NVN 0x3f as B10G11R11_UFLOAT (nvn_caps.cpp; Android)  // the upload ring's memory type (nvn_caps.cpp)
+void frame_init(VkCommandPool pool, uint32_t family, VkBuffer ring, uint8_t* ring_ptr, uint64_t ring_size);
 VkCommandBuffer frame_begin(bool replay);  // NX_ASYNC_GPU, replay: submits with write-backs retired first
 VkSemaphore frame_acquire_semaphore();
 VkSemaphore frame_rendered_semaphore(uint32_t image);
 void frame_submit(VkSemaphore wait, VkSemaphore signal, std::vector<WriteBack> write_backs, bool wait_done);
 void frame_wait_all();
 uint64_t frame_upload_used();
+uint64_t frame_ring_size();  // the slots' upload ring (0: synchronous submits, no ring)
 uint64_t frame_completed();  // the serial of the last retired submit (for free_retired_images)
 Upload frame_upload_alloc(uint64_t size, uint64_t align);
 VkDescriptorSet frame_descriptor_set(VkDescriptorSetLayout layout);
@@ -107,6 +140,9 @@ size_t frame_plan_split(const std::vector<std::shared_ptr<CmdList>>& lists);
 VkCommandBuffer frame_split(VkCommandBuffer cb);
 VkCommandBuffer frame_after_dispatch(VkCommandBuffer cb);
 VkCommandBuffer frame_cb(VkCommandBuffer cb);
+// Chunks (nvn_frames.cpp, NX_SUBMIT_CHUNK_DRAWS): for replay_list before each command, with the draws done so far;
+// returns the command buffer to go on with (a new part once enough draws were recorded).
+VkCommandBuffer frame_chunk(VkCommandBuffer cb, uint64_t draws, bool pass_open);
 // Host time inside vkQueueSubmit (with vkEndCommandBuffer: Metal encoding) and inside vkWaitForFences, running
 // totals in every mode (the synchronous path adds its own).
 struct FrameTimes {
@@ -121,6 +157,7 @@ std::shared_ptr<GpuImage> reuse_image(const Texture& t);  // images of textures 
 // nvn_debug.cpp: NX_DUMP_FRAMES, the presented texture read back (recorded into the present's command buffer, written
 // after its fence).
 uint32_t frame_dump_every();
+bool frame_dump_due(uint64_t presents);  // NX_DUMP_FRAMES, or a dump_frames file in the data folder
 bool frame_dump_record(VkCommandBuffer cb, GpuImage& img);
 void frame_dump_write(const GpuImage& img, uint64_t frame);
 bool debug_snapshots_pending();  // NX_SNAP_*: this submit recorded snapshots (it is then waited for)
@@ -160,6 +197,17 @@ uint32_t clears_apply(const Targets& t, VkRenderingAttachmentInfo* colors, VkRen
 void clears_flush(VkCommandBuffer cb);  // outside a pass: the pending clears in a pass of their own
 void clears_begin_submit();
 void clears_log();
+bool pass_open();  // a render pass is being recorded
+// Render pass and framebuffer objects instead of dynamic rendering (nvn_renderpass.cpp, NX_RENDER_PASS_OBJECTS).
+bool render_pass_objects();
+VkFormat unused_slot_format();  // a pipeline's format for a colour slot with no image
+VkRenderPass compatible_render_pass(uint32_t count, const VkFormat* colors, VkFormat depth);
+void begin_render_pass(VkCommandBuffer cb, uint32_t count, const VkFormat* formats,
+                       const VkRenderingAttachmentInfo* colors, VkFormat depth_format,
+                       const VkRenderingAttachmentInfo& depth, const VkRenderingAttachmentInfo& stencil,
+                       VkExtent2D extent);
+void forget_framebuffers(VkImageView view);
+void render_pass_log();
 void pass_end_only(VkCommandBuffer cb, int reason);  // draw_end_rendering without the pending clears
 bool pass_open_on(const Targets& t);
 VkExtent2D pass_extent();
@@ -171,6 +219,8 @@ bool mask_clear(VkCommandBuffer cb, const Targets& t, uint32_t slot, uint32_t ma
                 const VkRect2D& rect);
 // nvn_replay.cpp: a command list into `cb` (`depth`: CallList nesting).
 void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth);
+std::shared_ptr<CmdList> submit_command_list(uint64_t handle);  // command_list(), once per handle per submit
+void submit_lists_reset();  // at each submit's start (draw_begin_submit)
 
 void replay_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list);  // nvn_copy.cpp: texture copies
 void forget_image_views(const GpuImage& img);
@@ -187,7 +237,17 @@ void debug_snapshot(VkCommandBuffer cb, GpuImage& img, uint64_t draw);
 void debug_snapshots_write();  // nvn_pipeline.cpp: before an image is freed
 
 // nvn_debug.cpp: GPU time per render pass (NX_GPU_PROFILE=1).
-bool gpu_profile_on();
+bool gpu_profile_on();  // NX_GPU_PROFILE=1: per-pass labels, every submit waited for (nvn_debug.cpp)
+// NX_GPU_PROFILE=3: the GPU's busy time per frame without waits, from per-part timestamps (nvn_gpu_busy.cpp).
+// The janitor thread (nvn_janitor.cpp, NX_JANITOR): pool resets of retired slots, off the replay thread.
+bool janitor_on();
+void janitor_run(std::function<void()> job);
+void janitor_wait(const std::atomic<bool>& done);
+bool gpu_busy_on();
+void gpu_busy_part_begin(uint32_t slot, uint32_t part, VkCommandBuffer cb);
+void gpu_busy_part_end(uint32_t slot, uint32_t part, VkCommandBuffer cb);
+void gpu_busy_retired(uint32_t slot, uint32_t queued);
+void gpu_busy_log(uint64_t frames);
 void gpu_profile_begin(VkCommandBuffer cb);
 void gpu_profile_mark(VkCommandBuffer cb, const std::string& label);
 void gpu_profile_collect();

@@ -451,6 +451,7 @@ int vulkan_create_surface(void* instance, void* native_window, uint64_t* surface
 namespace {
 
 void crash_handler(int sig, siginfo_t* info, void* uc) {
+    if ((sig == SIGSEGV || sig == SIGBUS) && nx::plat::write_watch_fault(info->si_addr)) return;  // write_watch.cpp
     const auto* m = static_cast<ucontext_t*>(uc)->uc_mcontext;
     Dl_info d{};
     uint64_t pc = m->__ss.__pc;

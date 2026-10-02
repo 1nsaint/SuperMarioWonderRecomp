@@ -7,7 +7,7 @@
 //
 // So any TrueType font works: <data root>/fonts/shared_<type>.ttf (0 standard, 1 simplified Chinese, 2 its
 // extension, 3 traditional Chinese, 4 Korean, 5 Nintendo extension), else shared.ttf, else the host's own
-// (NX_SHARED_FONT, or a system font on macOS). The fonts on our own firmware dump can go there once decoded.
+// (NX_SHARED_FONT, or a system font on macOS, Android and Windows). The fonts on our own firmware dump can go there once decoded.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -54,6 +54,12 @@ const Font& font(uint32_t type) {
 #if defined(__APPLE__)
     candidates.push_back("/System/Library/Fonts/Supplemental/Arial Unicode.ttf");
     candidates.push_back("/System/Library/Fonts/Supplemental/Arial.ttf");
+#elif defined(__ANDROID__)
+    candidates.push_back("/system/fonts/Roboto-Regular.ttf");
+#elif defined(_WIN32)
+    // Arial Unicode (Office installs it) covers the most; else Arial, as on the Mac.
+    candidates.push_back("C:/Windows/Fonts/arialuni.ttf");
+    candidates.push_back("C:/Windows/Fonts/arial.ttf");
 #endif
     std::vector<uint8_t> ttf;
     for (const auto& path : candidates) {
