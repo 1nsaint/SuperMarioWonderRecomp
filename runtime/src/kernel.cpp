@@ -181,7 +181,9 @@ static uint32_t svc_arbitrate_unlock(uint64_t addr) {
 static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
     std::unique_lock lk(g_k);
     KThread* self = t_self;
-    unlock_mutex(mutex);
+    // Like Horizon: the condvar's "has waiters" word is written BEFORE the mutex is released. The SDK's Signal/
+    // Broadcast read that word in guest code and skip the svc when it is 0; the other order lost wake-ups (a thread
+    // took the freed mutex, posted, saw 0, and the waiter then slept forever).
     self->wake = false;
     self->wait_mutex = mutex;
     self->wait_key = key;
@@ -189,6 +191,7 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
     self->wait_result = 0;
     g_cv_waiters.push_back(self);
     store32(key, 1);
+    unlock_mutex(mutex);
     if (block(lk, self, timeout)) return self->wait_result;
     // Timed out (not handed the mutex): leave the condvar, or the mutex queue a signal moved us to, and return
     // without the mutex. Like Horizon: the SDK re-locks it itself (TimedWait -> InternalCriticalSection::Enter);
