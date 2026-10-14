@@ -86,7 +86,8 @@ void frame_presented();  // after each present to the display
 // says whether the range was written since the last take; the crash handler calls fault first (true: handled).
 bool write_watch_add(uint64_t addr, uint64_t size);
 void write_watch_remove(uint64_t addr);
-bool write_watch_take(uint64_t addr);
+// lo/hi (optional): the written bytes as [lo, hi) from addr, page-rounded; [0, UINT64_MAX) when unknown, empty when none.
+bool write_watch_take(uint64_t addr, uint64_t* lo = nullptr, uint64_t* hi = nullptr);
 bool write_watch_fault(void* at);
 // NX_HEADLESS=1: no visible window (it is created hidden) and nothing presented; frames still render and
 // NX_DUMP_FRAMES still writes them. For unattended test runs.

@@ -31,6 +31,12 @@ void widen_r11g11b10(const uint8_t* src, uint8_t* dst, uint64_t texels) {
     }
 }
 
+// NX_FULL_UPLOAD=1: a pitch-linear texture the CPU wrote part of is uploaded whole again (bisecting).
+bool full_upload() {
+    static const bool on = std::getenv("NX_FULL_UPLOAD") != nullptr;
+    return on;
+}
+
 // Bytes from `base` to the end of what vkCmdCopyBufferToImage reads for `r`, at `bytes` per bw x bh block.
 uint64_t copy_end(const VkBufferImageCopy& r, uint64_t base, uint32_t bw, uint32_t bh, uint32_t bytes) {
     uint64_t row_blocks = ((r.bufferRowLength ? r.bufferRowLength : r.imageExtent.width) + bw - 1) / bw;
@@ -123,7 +129,8 @@ void clear_image(VkCommandBuffer cb, GpuImage& img, bool magenta) {
     }
 }
 
-void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
+void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img, uint64_t lo, uint64_t hi) {
+    const bool was_uploaded = img.uploaded;
     img.uploaded = true;
     if (gpu_profile_on()) gpu_profile_mark(cb, "texture uploads");
     if (!t.memory || !t.storage_size) return;
@@ -149,16 +156,22 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
         const uint8_t* src = reinterpret_cast<const uint8_t*>(t.memory);
         uint64_t rows = uint64_t(img.height) * layers;
         if (uint64_t(t.stride) * rows > t.storage_size) rows = t.storage_size / t.stride;
-        Upload u = upload_alloc(rows * img.width * 4, 16);
-        for (uint64_t y = 0; y < rows; y++) {
+        // Only the rows the CPU wrote (a single layer), when the texture is already there (NX_FULL_UPLOAD=1: all).
+        uint64_t y0 = 0, y1 = rows;
+        if (was_uploaded && layers == 1 && !full_upload() && hi != UINT64_MAX)
+            y0 = std::min(rows, lo / t.stride), y1 = std::min(rows, (hi + t.stride - 1) / t.stride);
+        if (y1 <= y0) return;
+        Upload u = upload_alloc((y1 - y0) * img.width * 4, 16);
+        for (uint64_t y = y0; y < y1; y++) {
             const uint8_t* s = src + y * t.stride;
-            uint32_t* d = reinterpret_cast<uint32_t*>(u.ptr + y * img.width * 4);
+            uint32_t* d = reinterpret_cast<uint32_t*>(u.ptr + (y - y0) * img.width * 4);
             for (uint32_t x = 0; x < img.width; x++) d[x] = 0x00FFFFFFu | (uint32_t(s[x]) << 24);
         }
         VkBufferImageCopy r{};
         r.bufferOffset = u.offset;
         r.imageSubresource = {img.aspect, 0, 0, img.layers};
-        r.imageExtent = {img.width, uint32_t(std::min<uint64_t>(rows, img.height)), 1};
+        r.imageOffset = {0, int32_t(y0), 0};
+        r.imageExtent = {img.width, uint32_t(std::min<uint64_t>(y1, img.height) - y0), 1};
         transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
         return;
@@ -189,8 +202,15 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img) {
             std::memset(u.ptr, 0, staged);
             for (uint64_t y = 0; y < have; y++) widen_r11g11b10(src + y * t.stride, u.ptr + y * img.width * 8, texels);
         } else {
-            staged = uint64_t(t.stride) * rows * layers;
-            u = upload(reinterpret_cast<const void*>(t.memory), staged, 16);
+            uint64_t y0 = 0, y1 = rows;  // only the rows the CPU wrote, for a texture already there
+            if (was_uploaded && bw == 1 && bh == 1 && layers == 1 && !full_upload() && hi != UINT64_MAX) {
+                y0 = std::min(rows, lo / t.stride), y1 = std::min(rows, (hi + t.stride - 1) / t.stride);
+                if (y1 <= y0) return;
+                r.imageOffset = {0, int32_t(y0), 0};
+                r.imageExtent = {img.width, uint32_t(y1 - y0), 1};
+            }
+            staged = uint64_t(t.stride) * (y1 - y0) * layers;
+            u = upload(reinterpret_cast<const uint8_t*>(t.memory) + y0 * t.stride, staged, 16);
             r.bufferRowLength = t.stride / bytes * bw;
         }
         r.bufferOffset = u.offset;

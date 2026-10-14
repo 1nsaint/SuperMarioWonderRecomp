@@ -119,7 +119,8 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
 GpuImage* ensure_contents(VkCommandBuffer cb, uint64_t texture);
 // nvn_upload.cpp: the texture's pool memory untiled (or taken row by row, pitch-linear) into the image, every level
 // and layer; cleared instead when the copies would read past what was staged. Marks it uploaded.
-void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img);
+// [lo, hi): the bytes of a texture already uploaded that changed (pitch-linear ones send only their rows).
+void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img, uint64_t lo = 0, uint64_t hi = UINT64_MAX);
 // Every level and layer to zero (colour; magenta with `magenta`), depth and stencil to 0. Leaves TRANSFER_DST.
 void clear_image(VkCommandBuffer cb, GpuImage& img, bool magenta = false);
 // A single level and layer of an image, for rendering to.

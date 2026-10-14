@@ -9,6 +9,7 @@
 // every 4th frame (~5 ms on a phone, a spike every 4 frames). Only for game code's stores: the kernel writing into a
 // read-only page fails the syscall instead (EFAULT), so it is kept to textures, and dropped with them. POSIX only;
 // elsewhere (and with NX_WRITE_WATCH=0) write_watch_add fails and callers hash as before.
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -28,7 +29,11 @@ namespace {
 struct Watch {
     std::atomic<uint64_t> addr{0};  // the caller's address (0: a free slot)
     std::atomic<uint64_t> begin{0}, end{0};  // the pages it covers
+    uint64_t size = 0;                       // the caller's size
     std::atomic<bool> written{false};
+    // The pages written since the last take, as the first and the end of them (UINT64_MAX / 0: none known). Set before
+    // `written`, so a take that sees the flag also sees the range; one that races a fault finds the range alone.
+    std::atomic<uint64_t> lo{UINT64_MAX}, hi{0};
 };
 constexpr int kWatches = 16;
 Watch g_watches[kWatches];
@@ -54,7 +59,8 @@ bool write_watch_add(uint64_t addr, uint64_t size) {
     for (Watch& w : g_watches) {
         uint64_t expected = 0;
         if (!w.addr.compare_exchange_strong(expected, addr)) continue;
-        w.begin = b, w.end = e, w.written = true;  // unknown until the first take: written
+        w.begin = b, w.end = e, w.size = size, w.written = true;  // unknown until the first take: written
+        w.lo = UINT64_MAX, w.hi = 0;
         if (mprotect(reinterpret_cast<void*>(b), e - b, PROT_READ) != 0) {
             w.addr = 0;
             return false;
@@ -73,11 +79,21 @@ void write_watch_remove(uint64_t addr) {
         }
 }
 
-bool write_watch_take(uint64_t addr) {
+bool write_watch_take(uint64_t addr, uint64_t* lo, uint64_t* hi) {
+    if (lo) *lo = 0, *hi = UINT64_MAX;  // unknown: all of it
     for (Watch& w : g_watches)
         if (w.addr == addr) {
             mprotect(reinterpret_cast<void*>(w.begin.load()), w.end - w.begin, PROT_READ);
-            return w.written.exchange(false);
+            bool was = w.written.exchange(false);
+            uint64_t a = w.lo.exchange(UINT64_MAX), b = w.hi.exchange(0);
+            if (a < b) {  // the written pages, clipped to the caller's range and made relative to it
+                a = a > addr ? a - addr : 0;
+                b = std::min<uint64_t>(b - addr, w.size);
+                if (lo) *lo = a, *hi = std::max(a, b);
+            } else if (lo && !was) {
+                *lo = *hi = 0;  // nothing written
+            }
+            return was || a < b;
         }
     return true;
 }
@@ -85,15 +101,23 @@ bool write_watch_take(uint64_t addr) {
 bool write_watch_fault(void* at) {
     uint64_t a = reinterpret_cast<uint64_t>(at);
     bool hit = false;
+    uint64_t page = a & ~(page_size() - 1);
     for (Watch& w : g_watches)
-        if (w.addr && a >= w.begin && a < w.end) w.written = true, hit = true;
+        if (w.addr && a >= w.begin && a < w.end) {
+            for (uint64_t cur = w.lo; page < cur && !w.lo.compare_exchange_weak(cur, page);) {}
+            for (uint64_t cur = w.hi; page + page_size() > cur && !w.hi.compare_exchange_weak(cur, page + page_size());) {}
+            w.written = true, hit = true;
+        }
     if (hit) mprotect(reinterpret_cast<void*>(a & ~(page_size() - 1)), page_size(), PROT_READ | PROT_WRITE);
     return hit;
 }
 #else
 bool write_watch_add(uint64_t, uint64_t) { return false; }
 void write_watch_remove(uint64_t) {}
-bool write_watch_take(uint64_t) { return true; }
+bool write_watch_take(uint64_t, uint64_t* lo, uint64_t* hi) {
+    if (lo) *lo = 0, *hi = UINT64_MAX;
+    return true;
+}
 bool write_watch_fault(void*) { return false; }
 #endif
 

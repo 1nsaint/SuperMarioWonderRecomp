@@ -207,6 +207,14 @@ struct Texture : Object {
     std::atomic<bool> has_writes{false};
     // The CPU wrote the texture's memory (nvnMemoryPoolFlushMappedRange over it, e.g. a glyph cache): upload again.
     std::atomic<bool> dirty{false};
+    // What of the memory the CPU wrote, as bytes from `memory` ([lo, hi); UINT64_MAX / 0: nothing known yet). Merged by
+    // mark_dirty, taken with `dirty`; a pitch-linear texture then uploads only the rows it touches (glyph cache).
+    std::atomic<uint64_t> dirty_lo{UINT64_MAX}, dirty_hi{0};
+    void mark_dirty(uint64_t lo, uint64_t hi) {  // [lo, hi) of the texture's bytes; (0, UINT64_MAX): all of it
+        for (uint64_t c = dirty_lo; lo < c && !dirty_lo.compare_exchange_weak(c, lo);) {}
+        for (uint64_t c = dirty_hi; hi > c && !dirty_hi.compare_exchange_weak(c, hi);) {}
+        dirty = true;
+    }
     // The swizzle of the texture-pool view it is registered with (4 NVNtextureSwizzle bytes, 0: none).
     std::atomic<uint32_t> pool_swizzle{0};
     // Pitch-linear textures the CPU keeps writing without a flush (Wonder's glyph cache: 2048x8192 R8): their memory

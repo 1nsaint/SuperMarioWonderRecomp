@@ -528,6 +528,8 @@ GpuImage* ensure_contents(VkCommandBuffer cb, uint64_t texture) {
     GpuImage* img = t ? image_of(texture) : nullptr;
     if (!img) return nullptr;
     bool dirty = t->dirty.exchange(false);
+    uint64_t dirty_lo = t->dirty_lo.exchange(UINT64_MAX), dirty_hi = t->dirty_hi.exchange(0);
+    if (dirty_hi <= dirty_lo) dirty_lo = 0, dirty_hi = UINT64_MAX;  // marked without a range: all of it
     static const bool reupload = std::getenv("NX_TEXELS_REUPLOAD") != nullptr;  // bisecting: the old way
     bool upload = !img->rendered && (!img->uploaded || (dirty && (!img->texels || reupload)));
     // A render target (COMPRESSIBLE, flag 0x8) the GPU never wrote through this image: its guest memory never holds
@@ -542,7 +544,8 @@ GpuImage* ensure_contents(VkCommandBuffer cb, uint64_t texture) {
             upload = false;
         }
     }
-    if (upload) upload_texture(cb, *t, *img);
+    // A texture already on the GPU that the CPU wrote part of: only those bytes go again (the glyph cache).
+    if (upload) upload_texture(cb, *t, *img, img->uploaded && dirty ? dirty_lo : 0, img->uploaded && dirty ? dirty_hi : UINT64_MAX);
     apply_texel_writes(cb, *t, *img);
     if (img->layout == VK_IMAGE_LAYOUT_UNDEFINED) {  // never written: black, not garbage
         transition(cb, *img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);

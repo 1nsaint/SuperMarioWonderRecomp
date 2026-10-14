@@ -184,7 +184,10 @@ void MemoryPoolFlushMappedRange(CPU& c) {
         auto o = objects().find(guest);
         auto* t = o == objects().end() ? nullptr : dynamic_cast<Texture*>(o->second.get());
         if (!t || t->offset >= off + size || t->offset + t->storage_size <= off) continue;
-        if (t->image) t->dirty = true;  // rendered images ignore it (nvn_pipeline.cpp)
+        if (t->image) {  // rendered images ignore it (nvn_pipeline.cpp)
+            uint64_t base = std::max(off, t->offset), end = std::min(off + size, t->offset + t->storage_size);
+            t->mark_dirty(base - t->offset, end - t->offset);
+        }
     }
 }
 // The CPU is about to read what the GPU wrote: with NX_ASYNC_GPU, compute results still in flight are waited for.

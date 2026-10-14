@@ -95,8 +95,9 @@ void check_linear_content(Texture& t) {
     if (t.stride && t.storage_size >= (1u << 20)) {
         if (!t.watched && !t.content_hash) t.watched = plat::write_watch_add(t.memory, t.storage_size);
         if (t.watched) {
-            if (plat::write_watch_take(t.memory) && t.content_hash) {
-                t.dirty = true;
+            uint64_t lo, hi;
+            if (plat::write_watch_take(t.memory, &lo, &hi) && t.content_hash) {
+                t.mark_dirty(lo, hi);
                 static uint64_t n = 0;
                 if (++n == 1 || n % 100 == 0) log("nvn: watched texture written by the CPU (%llu times)", (unsigned long long)n);
             }
@@ -106,7 +107,7 @@ void check_linear_content(Texture& t) {
     }
     uint64_t h = hash_memory(reinterpret_cast<const uint8_t*>(t.memory), t.storage_size);
     if (t.content_hash && h != t.content_hash) {
-        t.dirty = true;
+        t.mark_dirty(0, UINT64_MAX);
         static int logged = 0;
         if (!t.stride && logged++ < 100)
             log("nvn: block-linear texture %llux%u f%x (%llu bytes) changed by the CPU", (unsigned long long)t.width,
