@@ -588,18 +588,29 @@ void present_headless(uint64_t texture) {
     if (presents % (presents < 300 ? 60 : 300) == 0) draw_log_stats();
     if (presents % 60 == 0) log_timing(60), gpu_profile_log(60);
     if (presents % 300 == 0) zero_draws_log();
-    if (!frame_dump_due(presents)) return;
+    // NX_PRESENT_TEST_ALL=1 (with NX_PRESENT_TEST): the present pass runs for every frame, and its submit is timed.
+    static const bool every = std::getenv("NX_PRESENT_TEST_ALL") != nullptr;
+    bool due = frame_dump_due(presents);
+    if (!due && !every) return;
+    static uint64_t timed_ns = 0, timed = 0;
+    const uint64_t t0 = plat::monotonic_ns();
     if (src && src->layout != VK_IMAGE_LAYOUT_UNDEFINED && begin()) {
         GpuImage* shown = src;  // NX_PRESENT_TEST: what the present pass would put on a display (nvn_present.cpp)
         if (GpuImage* test = present_pass_test_target(); test && present_pass_record(g_cb, *src, nullptr, 0))
             test->layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, shown = test;
         transition(g_cb, *shown, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        bool dump = frame_dump_record(g_cb, *shown);
+        bool dump = due && frame_dump_record(g_cb, *shown);
         if (async_gpu())
             frame_submit(VK_NULL_HANDLE, VK_NULL_HANDLE, {}, dump);  // a dumped frame is waited for
         else
             end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);
         if (dump) frame_dump_write(*shown, presents);
+        if (every && !due && ++timed % 120 == 0) {
+            log("nvn/vk: present test: pass + wait %.2f ms/frame over the last %llu", double(timed_ns) / 1e6 / 120, 120ull);
+            timed_ns = 0;
+        } else if (every && !due) {
+            timed_ns += plat::monotonic_ns() - t0;
+        }
     }
     debug_dump_textures(presents);
 }

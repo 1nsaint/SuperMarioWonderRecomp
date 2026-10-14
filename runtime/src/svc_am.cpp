@@ -58,9 +58,17 @@ std::shared_ptr<Service> common_state_getter() {
         s.cmds[5] = [](IpcCtx& c) { c.push<uint8_t>(handheld ? 0 : 1); return 0u; };   // GetOperationMode
         s.cmds[6] = [](IpcCtx& c) { c.push<uint32_t>(handheld ? 0 : 1); return 0u; };  // GetPerformanceMode
         s.cmds[9] = [](IpcCtx& c) { c.push<uint8_t>(1); return 0u; };   // GetCurrentFocusState: in focus
+        // NX_RENDER_RES=<w>x<h>: the size the game renders at, while it stays docked (a resolution scale: the game sizes
+        // its window textures and targets from this answer; the present step stretches the picture to the window).
+        static const std::pair<uint32_t, uint32_t> res = [] {
+            uint32_t w = handheld ? 1280 : 1920, h = handheld ? 720 : 1080, rw = 0, rh = 0;
+            if (const char* e = std::getenv("NX_RENDER_RES"); e && std::sscanf(e, "%ux%u", &rw, &rh) == 2 && rw >= 320 && rh >= 180)
+                w = rw, h = rh;
+            return std::pair<uint32_t, uint32_t>{w, h};
+        }();
         s.cmds[60] = [](IpcCtx& c) {  // GetDefaultDisplayResolution
-            c.push<uint32_t>(handheld ? 1280 : 1920);
-            c.push<uint32_t>(handheld ? 720 : 1080);
+            c.push<uint32_t>(res.first);
+            c.push<uint32_t>(res.second);
             return 0u;
         };
         s.cmds[61] = [](IpcCtx& c) {  // GetDefaultDisplayResolutionChangeEvent
