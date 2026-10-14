@@ -1,18 +1,16 @@
-# SwitchGamesRecomp
+# Super Mario Bros. Wonder Recomp
 
-Static recompilation of Nintendo Switch 1 games (AArch64) to native code, CPU and GPU. No emulator runs: the games'
-machine code becomes C++ that is compiled for the host, and their system and graphics calls are implemented
-natively.
+Static recompilation of **Super Mario Bros. Wonder** (Nintendo Switch, 1.0.0, title ID `010015100B514000`) to native
+code. No emulator runs: the game's AArch64 machine code becomes C++ compiled for the host, and its system and graphics
+calls (NVN, Nintendo's own API) are implemented natively on **Vulkan** (MoltenVK on the Mac).
 
-| Game | Title ID | Host | Graphics path | State |
-|---|---|---|---|---|
-| **Hades** (Supergiant) | 0100535012974000 | Windows, Android | the game's own Vulkan, passed to the host driver | boot to gameplay |
-| **Super Mario Bros. Wonder** (Nintendo) | 010015100B514000 | macOS (Apple M1) | NVN implemented over Vulkan (MoltenVK) | title, menus, world map and course 1-1; 60 fps headless |
+Part of the [SwitchGamesRecomp](https://github.com/BelmanteGu/SwitchGamesRecomp) work (same runtime, see
+[docs/FRAMEWORK.md](docs/FRAMEWORK.md)); this repo follows Wonder alone. Living log: [PROGRESS.md](PROGRESS.md).
 
-No game data here. Everything derived from a game, keys or firmware stays in `private/` (gitignored). Bring your own
-legally dumped copy, keys and firmware.
+No game data here. Everything derived from the game, keys or firmware stays in `private/` (gitignored). Bring your
+own legally dumped copy, keys and firmware.
 
-## Super Mario Bros. Wonder
+## State
 
 | Title | Character select |
 |---|---|
@@ -143,49 +141,6 @@ Ground rules for this track:
 - no GPL code (Ryujinx, MIT, is used as a reference and for the offline shader translator);
 - Hades must not regress.
 
-## Hades
-
-**Hades runs natively on PC, from boot to gameplay**: the CPU code is recompiled (main + Nintendo's SDK, 3.0M AArch64
-instructions), the game's own Vulkan renderer (The Forge) runs on the host GPU through generated bridges, no
-emulation anywhere. RTX 3050 laptop, 1280x720, 143 fps (vsync). It also runs on Android phones: see
-[docs/ANDROID.md](docs/ANDROID.md).
-
-| Logo | Main menu |
-|---|---|
-| ![logo](docs/media/first-frame-logo.png) | ![menu](docs/media/main-menu.png) |
-| **Intro** | **Gameplay** |
-| ![intro](docs/media/intro.png) | ![gameplay](docs/media/gameplay.png) |
-
-### Approach
-
-Hades' `main` module imports everything it needs from the system by name: libc/libc++, `nn::*` SDK functions and
-**Vulkan** (100 `vk*` entry points; `subsdk0` is Nintendo's Vulkan driver). So:
-
-1. **CPU:** recompile `main` (AArch64) to C++ with our own recompiler (`recomp/`).
-2. **System:** implement main's imports natively on the host (`nn::os`, `nn::fs`, `nn::hid`, `nn::audio`, ...),
-   like ReXGlue does with Xbox 360 kernel exports.
-3. **GPU:** pass Vulkan calls through to the host driver. No Maxwell/NVN emulation.
-
-Both sides are little endian, so no byte swapping. Details in [docs/FINDINGS.md](docs/FINDINGS.md),
-[docs/RECOMP.md](docs/RECOMP.md) and [docs/RUNTIME.md](docs/RUNTIME.md).
-
-### Phases
-
-| Phase | What |
-|---|---|
-| 0 | Extraction and analysis |
-| 1 | AArch64 → C++ recompiler: functions, jump tables, NEON, atomics |
-| 2 | Runtime: loader, memory, threads, nn:: HLE |
-| 3 | Vulkan passthrough: first native pixels |
-| 4 | Audio, input, stability, full game |
-
-### Extraction
-
-```powershell
-nstool -x / private\extract\upd_nsp "private\update\<update>.nsp"
-nstool -k private\keys\prod.keys --tik <update .tik> -x /0 private\extract\exefs <update program .nca>
-python tools\nso2bin.py private\extract\exefs\main private\analysis\main.bin
-```
 
 ## Repository layout
 
