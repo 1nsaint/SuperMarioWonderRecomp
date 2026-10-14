@@ -23,6 +23,23 @@ NVN implemented over Vulkan (MoltenVK).
 
 ## Log
 
+### 2026-10-14: Mac performance study; glyph-cache upload fixed; FSR 1
+
+Full write-up and method: [docs/nvn/MAC-PERF.md](docs/nvn/MAC-PERF.md).
+
+- **Black screen on start** was a stale pipeline cache file (`pipelines_106b_*.bin`): MoltenVK's `readData` never
+  returned. The file was moved aside; it is rebuilt on the first run.
+- **Why the course was slow:** the 2048x8192 R8 glyph cache was untiled, expanded to RGBA8 (64 MB) and uploaded whole
+  almost every frame. Now the write watch reports the written pages and only those rows go up
+  (`5f01c9e`). Course 1-1 headless: 50.4 -> 59.1 fps mean, replay 6.3 -> 2.5 ms, windows under 35 fps 37 -> 0,
+  main-thread frames over 15.83 ms (the game's 30-fps governor trigger) 17.6% -> 1.7%.
+- **GPU is now the limit** at 1080p: 12.8 ms median, 16.3 p90. Handheld mode (`NX_HANDHELD=1`, 720p) needs 5.3 ms.
+- **FSR 1** (EASU + RCAS) in the present pass, `NX_FSR=1`, about 0.13 ms at 2560x1440. `tools/wonder_mac.sh
+  [quality|balanced|performance]` picks the switches.
+- Condvar fix from the Castlevania study: the waiters word is written before the mutex is released (`e579e08`).
+- Not done: arbitrary resolution scale (the game ignores the display resolution answer), FSR 3 frame generation
+  (no motion vectors; MetalFX interpolation needs macOS 26).
+
 ### 2026-09-30 (night): Wonder boots on Android; W8 fixes; Windows plan
 
 ![World map with the player](docs/media/wonder/39-world-map-player.png)
