@@ -110,7 +110,10 @@ void perf_hint_frame(int64_t ns) {
     std::lock_guard lk(g_lock);
     if (g_dirty && !g_tids.empty()) {  // a new thread made part of the frame: a session with all of them
         if (g_session) a.close(g_session);
-        g_session = a.create(a.get_manager(), g_tids.data(), g_tids.size(), 16'666'667);
+        // The ADPF target is the frame period: 33.3 ms when NX_FPS_CAP holds the game at 30 fps (nvn_queue.cpp).
+        const char* cap = std::getenv("NX_FPS_CAP");
+        int64_t target = cap && std::atoi(cap) > 0 && std::atoi(cap) <= 30 ? 33'333'333 : 16'666'667;
+        g_session = a.create(a.get_manager(), g_tids.data(), g_tids.size(), target);
         g_dirty = false;
         log("adpf: %s for %zu threads", g_session ? "session made" : "no session", g_tids.size());
     }

@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Wonder launcher APK (android/wonder, android/build_apk.sh, game wonder). LauncherActivity imports the player's own
+     dump on the phone (SAF, no storage permission) and starts GameActivity, a NativeActivity whose code is
+     libwonder.so (android_main in runtime/src/platform_android.cpp). A private build for the owner of the cartridge. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.github.belmantegu.wonderrecomp"
+    android:versionCode="3"
+    android:versionName="0.3.0">
+
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="35" />
+    <!-- Vulkan 1.3: timeline semaphores, synchronization2 and dynamic rendering (docs/WONDER-ANDROID-OPTIONS.md, "Vulkan"). -->
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x403000" android:required="true" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+    <application
+        android:label="Wonder"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:hasCode="true"
+        android:extractNativeLibs="true"
+        android:debuggable="true"
+        android:isGame="true"
+        android:appCategory="game"
+        android:largeHeap="true"
+        android:theme="@style/Fullscreen">
+        <activity
+            android:name=".LauncherActivity"
+            android:exported="true"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="density|smallestScreenSize|screenSize|uiMode|screenLayout|orientation|navigation|keyboardHidden|keyboard"
+            android:resizeableActivity="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity
+            android:name=".OptionsActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="density|smallestScreenSize|screenSize|uiMode|screenLayout|orientation|navigation|keyboardHidden|keyboard" />
+        <activity
+            android:name=".LayoutEditorActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="density|smallestScreenSize|screenSize|uiMode|screenLayout|orientation|navigation|keyboardHidden|keyboard" />
+        <!-- The game, in its own process (the memory guard may end it; the launcher stays). Exported for adb test runs. -->
+        <activity
+            android:name=".GameActivity"
+            android:exported="true"
+            android:process=":game"
+            android:launchMode="singleTask"
+            android:screenOrientation="sensorLandscape"
+            android:resizeableActivity="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density">
+            <meta-data android:name="android.app.lib_name" android:value="wonder" />
+        </activity>
+    </application>
+</manifest>

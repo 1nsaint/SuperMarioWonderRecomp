@@ -503,6 +503,11 @@ void request_immersive() {
 
 }  // namespace
 
+// Frames presented so far, for the launcher's FPS counter (GameActivity.nativeFrames, in the game's own process).
+extern "C" JNIEXPORT jlong JNICALL Java_io_github_belmantegu_wonderrecomp_GameActivity_nativeFrames(JNIEnv*, jclass) {
+    return jlong(nx::g_frame.load());
+}
+
 extern "C" JNIEXPORT void ANativeActivity_onCreate(ANativeActivity* activity, void* saved, size_t size) {
     g_activity = activity;
     if (g_ui_pipe[0] < 0 && pipe2(g_ui_pipe, O_NONBLOCK | O_CLOEXEC) == 0)
@@ -575,7 +580,12 @@ extern "C" void android_main(android_app* app) {
             if (line.rfind("NX_", 0) == 0 && eq != std::string::npos)
                 setenv(line.substr(0, eq).c_str(), line.substr(eq + 1).c_str(), 0);
         }
-        setenv("NX_HANDHELD", "1", 0);
+        // NX_HANDHELD=0 in config.txt (the launcher's TV mode): docked, 1080p. svc_am.cpp tests only whether the variable
+        // exists, so "0" must remove it.
+        if (const char* h = getenv("NX_HANDHELD"); h && h[0] == '0')
+            unsetenv("NX_HANDHELD");
+        else
+            setenv("NX_HANDHELD", "1", 0);
     }
     // The heap (scudo) zero-fills every allocation and gives freed pages back at once by default: in the replay, a
     // memset under each allocation and madvise churn (docs/nvn/android-perf/PLAN.md, phase 2). NX_MALLOC_TUNE=0: as

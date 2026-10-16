@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<script src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wonder Recomp Launcher</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ink:#2b2d33;         /* outline / extrusion, like the logo's dark gray */
+  --ink2:#44464e;
+  --cream:#fffbea;
+  --cream2:#f3ecd2;
+  --red:#e8262b;
+  --red2:#b5121a;
+  --blue:#2aa8ff;
+  --pink:#ff4fa8;
+  --green:#3dbb4a;
+  --yellow:#ffd23a;
+  --text:#2b2d33;
+  --muted:#6d6f78;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:#1b1c21;font-family:Fredoka,system-ui,sans-serif;color:var(--text)}
+body{display:flex;flex-direction:column;align-items:center;gap:14px;padding:18px 12px 40px}
+.bar{color:#cfd0d6;font-size:14px;display:flex;gap:10px;flex-wrap:wrap;justify-content:center;align-items:center}
+.bar button{font:inherit;color:#fff;background:#3a3c44;border:0;border-radius:99px;padding:7px 16px;cursor:pointer}
+.bar button.on{background:var(--red)}
+/* the phone: 19.5:9 landscape */
+.phone{position:relative;width:min(1180px,96vw);aspect-ratio:19.5/9;border-radius:34px;overflow:hidden;border:8px solid #000;background:#000;
+  container-type:inline-size;box-shadow:0 20px 60px #0009}
+.screen{position:absolute;inset:0;display:none;z-index:2}
+.screen.show{display:block}
+.shade{position:absolute;inset:0;background:linear-gradient(90deg,#fffbeaf2 0,#fffbeadd 30%,#fffbea00 56%)}
+/* living background: slow drift of the wallpaper, a light sweep, drifting checkers and twinkling sparkles */
+.bg{position:absolute;inset:0;overflow:hidden;background:var(--cream);z-index:0}
+.bg .art{position:absolute;inset:-6%;background:url(background.jpg) 50% 30%/cover;animation:drift 26s ease-in-out infinite alternate;will-change:transform}
+.bg .sweep{position:absolute;inset:0;background:linear-gradient(105deg,#fff0 35%,#fff6 50%,#fff0 65%);background-size:250% 100%;animation:sweep 9s linear infinite;mix-blend-mode:soft-light}
+.bg .check{position:absolute;inset:-20%;opacity:.07;background:conic-gradient(#000 25%,#0000 0 50%,#000 0 75%,#0000 0) 0 0/5cqw 5cqw;animation:check 40s linear infinite}
+.bg .sp{position:absolute;width:1.6cqw;height:1.6cqw;opacity:0;background:#fff;clip-path:polygon(50% 0,60% 40%,100% 50%,60% 60%,50% 100%,40% 60%,0 50%,40% 40%);filter:drop-shadow(0 0 .4cqw #8fd2ff);animation:tw 3.6s ease-in-out infinite}
+@keyframes drift{from{transform:scale(1.02) translate(-1.2%,.6%)}to{transform:scale(1.12) translate(1.6%,-1.4%)}}
+@keyframes sweep{from{background-position:130% 0}to{background-position:-130% 0}}
+@keyframes check{to{background-position:10cqw 10cqw}}
+@keyframes tw{0%,100%{opacity:0;transform:scale(.3) rotate(0)}50%{opacity:1;transform:scale(1) rotate(45deg)}}
+@media (prefers-reduced-motion:reduce){.bg *{animation:none!important}}
+/* sizes are in cqw so the whole screen scales like the phone does */
+.screen{font-size:1.5cqw}
+
+/* ---------- Wonder buttons ---------- */
+.wbtn{--face:var(--cream);--edge:var(--ink);--fg:var(--ink);
+  position:relative;display:flex;align-items:center;gap:.7em;border:.18em solid var(--edge);border-radius:1.2em;
+  background:var(--face);color:var(--fg);font:700 1.25em/1 Fredoka,sans-serif;padding:.75em 1.1em;cursor:pointer;
+  box-shadow:0 .2em 0 var(--edge);transition:transform .08s,box-shadow .08s;text-align:left;width:100%}
+.wbtn:active,.wbtn.press{transform:translateY(.16em);box-shadow:0 .04em 0 var(--edge)}
+.wbtn small{display:block;font:500 .62em/1.2 Fredoka;opacity:.75;margin-top:.25em}
+.wbtn .ic{width:1.5em;height:1.5em;flex:none}
+svg.lucide{stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round}
+.act .ic{width:1.1em;height:1.1em}.tab .ic{width:1.3em;height:1.3em}
+.wbtn .grow{flex:1}
+.wbtn.red{--face:var(--red);--fg:#fff}
+.wbtn.red::after,.wbtn.wonder::after{content:"";position:absolute;inset:.18em .5em auto .5em;height:38%;border-radius:1em;background:#fff3;pointer-events:none}
+.wbtn.wonder{--face:linear-gradient(180deg,var(--blue),var(--pink));--fg:#fff;text-shadow:0 .06em 0 #0004}
+.wbtn.blue{--face:var(--blue);--fg:#fff}
+.wbtn.green{--face:var(--green);--fg:#fff}
+.wbtn.ghost{--face:#fffbeacc}
+.wbtn[disabled]{filter:grayscale(.9) brightness(.95);opacity:.65;cursor:not-allowed}
+.chev{margin-left:auto;opacity:.55}
+
+/* ---------- HOME ---------- */
+.home::before{content:"";position:absolute;inset:0 auto 0 0;width:56%;background:linear-gradient(90deg,#fffbeaf2 0,#fffbeadd 55%,#fffbea00 100%);z-index:-1}
+.home{position:relative;display:grid;grid-template-columns:1fr 1fr;height:100%;padding:2% 3.5% 4%}
+.home .left{display:flex;flex-direction:column;justify-content:center;gap:.8em;max-width:23em}
+.home .left .wbtn{font-size:1.05em;padding:.6em .95em}
+.home .logo{width:68%;align-self:flex-start;filter:drop-shadow(0 .2em .3em #0005);margin-bottom:.2em}
+.pill{display:inline-flex;align-items:center;gap:.5em;background:#fffbeae6;border:.2em solid var(--ink);border-radius:99px;padding:.35em 1em;font-weight:600;font-size:.85em;box-shadow:0 .12em 0 var(--ink);align-self:flex-start}
+.dot{width:.7em;height:.7em;border-radius:50%;background:var(--green);box-shadow:0 0 0 .18em #3dbb4a44}
+.dot.warn{background:var(--yellow);box-shadow:0 0 0 .18em #ffd23a55}
+.dot.bad{background:var(--red)}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:1em}
+.appicon{position:absolute;top:4%;right:4%;width:7.2em;height:7.2em;border-radius:22%;border:.25em solid var(--ink);box-shadow:0 .35em 0 var(--ink);object-fit:cover}
+.brand{position:absolute;right:2.6%;bottom:4%;display:block;width:3.4em;height:3.4em;border-radius:50%;overflow:hidden;border:.14em solid var(--ink);box-shadow:0 .12em 0 var(--ink);transition:transform .1s;z-index:3}
+.brand img{width:100%;height:100%;display:block}
+.brand:hover{transform:translateY(-.1em) scale(1.06)}
+.foot{position:absolute;left:3.5%;bottom:2%;font-size:.62em;font-weight:500;color:#2b2d33c0}
+.foot b{font-weight:700}
+
+/* ---------- OPTIONS ---------- */
+.opts{display:flex;flex-direction:column;height:100%;padding:2.2% 3%;background:#fffbeaee;backdrop-filter:blur(.3em)}
+.opts .top{display:flex;align-items:center;gap:1em;margin-bottom:.9em}
+.opts .top h2{margin:0;font:700 1.9em/1 Fredoka;letter-spacing:.01em}
+.opts .top .note{color:var(--muted);font-weight:500;font-size:.9em}
+.back{width:auto;padding:.5em 1em;font-size:1em}
+.opts .body{flex:1;display:grid;grid-template-columns:15.5em 1fr;gap:1.2em;min-height:0}
+.tabs{display:flex;flex-direction:column;gap:.55em;overflow:auto;padding:.1em .3em .6em .1em}
+.tab{font-size:.95em;padding:.55em .8em}
+.tab.active{--face:var(--red);--fg:#fff}
+.list{overflow:auto;padding:.1em .5em .8em .2em;display:flex;flex-direction:column;gap:.7em;background:#ffffffaa;border:.18em solid var(--ink);border-radius:1.2em;padding:.9em;box-shadow:0 .2em 0 var(--ink)}
+.opt{display:flex;align-items:center;gap:1em;padding:.6em .8em;border-radius:.9em;background:var(--cream);border:.18em solid #2b2d3322}
+.opt:hover{border-color:var(--ink)}
+.opt .t{flex:1;min-width:0}
+.opt .t b{font-size:1.02em;display:flex;gap:.5em;align-items:center;flex-wrap:wrap}
+.opt .t>span{display:block;font-size:.76em;font-weight:500;color:var(--muted);line-height:1.3;margin-top:.15em}
+.tag{font-size:.62em;font-weight:700;border-radius:99px;padding:.15em .7em;color:#fff;background:var(--muted);letter-spacing:.03em}
+.tag.adv{background:var(--ink2)}.tag.exp{background:var(--pink)}.tag.rs{background:var(--blue)}.tag.port{background:#e08a00}
+.val{font-weight:700;font-size:.95em;min-width:9.5em;text-align:center;background:var(--cream2);border:.18em solid var(--ink);border-radius:.8em;padding:.4em .7em;cursor:pointer;user-select:none;box-shadow:0 .12em 0 var(--ink)}
+.val:active{transform:translateY(.1em);box-shadow:0 .02em 0 var(--ink)}
+.val::before{content:"‹  ";opacity:.4}.val::after{content:"  ›";opacity:.4}
+.tog{width:4.2em;height:2.1em;border-radius:99px;border:.2em solid var(--ink);background:#c9c9cf;position:relative;cursor:pointer;flex:none;box-shadow:0 .12em 0 var(--ink);transition:background .15s}
+.tog i{position:absolute;top:.17em;left:.2em;width:1.45em;height:1.45em;border-radius:50%;background:#fff;border:.15em solid var(--ink);transition:left .15s}
+.tog.on{background:var(--green)}.tog.on i{left:2.05em}
+.sl{display:flex;align-items:center;gap:.7em;min-width:15em}
+.sl input{flex:1;accent-color:var(--red);height:1.6em}
+.sl output{font-weight:700;min-width:3em;text-align:right}
+.act{width:auto;font-size:.85em;padding:.5em 1em;gap:.4em}
+.info{font-weight:700;color:var(--ink2)}
+.hr{height:.2em;background:#2b2d3318;border-radius:9px;margin:.2em 0}
+.sec{font-weight:700;font-size:.75em;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:.4em .2em 0}
+.legend{position:absolute;right:2%;bottom:1.5%;font-size:.62em;color:var(--muted);display:flex;gap:.6em;align-items:center}
+
+/* ---------- IMPORT ---------- */
+.imp{display:flex;align-items:center;justify-content:center;height:100%;background:#2b2d3399;backdrop-filter:blur(.25em)}
+.card{width:44em;background:var(--cream);border:.2em solid var(--ink);border-radius:1.5em;padding:1.6em 1.8em;box-shadow:0 .25em 0 var(--ink);display:flex;flex-direction:column;gap:1em}
+.card h3{margin:0;font:700 1.6em/1.1 Fredoka}
+.card p{margin:0;font-weight:500;line-height:1.4;font-size:.95em;color:#43454d}
+.steps{display:flex;flex-direction:column;gap:.55em}
+.step{display:flex;gap:.8em;align-items:center;background:#fff;border:.18em solid #2b2d3322;border-radius:.9em;padding:.55em .8em;font-weight:600;font-size:.95em}
+.step .n{width:1.8em;height:1.8em;border-radius:50%;background:var(--ink);color:#fff;display:grid;place-items:center;font-size:.85em;flex:none}
+.step.done .n{background:var(--green)}
+.step small{display:block;font-weight:500;color:var(--muted);font-size:.78em}
+.prog{height:1.5em;border-radius:99px;border:.2em solid var(--ink);background:#fff;overflow:hidden;position:relative}
+.prog i{position:absolute;inset:0 auto 0 0;width:38%;background:repeating-linear-gradient(135deg,var(--blue) 0 .8em,#6cc4ff .8em 1.6em)}
+.prog em{position:absolute;inset:0;display:grid;place-items:center;font:700 .75em Fredoka;font-style:normal}
+.btns{display:flex;gap:.9em}.btns .wbtn{justify-content:center;text-align:center}
+
+/* ---------- ICON SHEET ---------- */
+.sheet{display:flex;gap:26px;align-items:flex-end;color:#cfd0d6;font-size:13px;flex-wrap:wrap;justify-content:center;background:#24262c;border-radius:20px;padding:18px 26px}
+.sheet figure{margin:0;text-align:center;display:flex;flex-direction:column;align-items:center;gap:8px}
+.sheet img{object-fit:cover;display:block}
+.round{border-radius:50%}.sq{border-radius:22%}
+.homebg{background:linear-gradient(160deg,#3a5fa8,#8f6bc2);padding:14px 18px;border-radius:18px;display:flex;gap:16px}
+.homebg figure span{color:#fff;font-size:11px}
+</style>
+</head>
+<body>
+
+<div class="bar">
+  <strong style="color:#fff">Wonder Recomp · launcher (modelo)</strong>
+  <button class="on" data-go="home">Início</button>
+  <button data-go="opts">Configurações</button>
+  <button data-go="imp">Importar jogo</button>
+  <button data-go="imp2">Importando…</button>
+</div>
+
+<div class="phone" id="phone">
+  <div class="bg"><div class="art"></div><div class="sweep"></div><span class="sp" style="left:56%;top:12%;animation-delay:.2s"></span><span class="sp" style="left:78%;top:8%;animation-delay:1.1s"></span><span class="sp" style="left:90%;top:30%;animation-delay:2s"></span><span class="sp" style="left:62%;top:58%;animation-delay:.7s"></span><span class="sp" style="left:48%;top:36%;animation-delay:2.6s"></span><span class="sp" style="left:84%;top:62%;animation-delay:1.7s"></span><span class="sp" style="left:70%;top:30%;animation-delay:3s"></span></div>
+
+  <!-- HOME -->
+  <section class="screen show" id="home">
+    
+    <div class="home">
+      <div class="left">
+        <img class="logo" src="logo.png" alt="Super Mario Bros. Wonder">
+        <span class="pill"><span class="dot" id="stDot"></span><span id="stTxt">Jogo pronto · v1.0.0</span></span>
+        <button class="wbtn red" id="playBtn">
+          <i data-lucide="play" class="ic"></i>
+          <span class="grow">JOGAR<small>Iniciar Super Mario Bros. Wonder</small></span>
+        </button>
+        <div class="row2">
+          <button class="wbtn wonder" data-go="imp">
+            <i data-lucide="folder-open" class="ic"></i>
+            <span class="grow">Arquivos<small>XCI / NSP</small></span>
+          </button>
+          <button class="wbtn blue" data-go="opts">
+            <i data-lucide="settings" class="ic"></i>
+            <span class="grow">Configurações<small>Imagem, desempenho…</small></span>
+          </button>
+        </div>
+      </div>
+      <div></div>
+    </div>
+    <a class="brand" href="https://www.youtube.com/@belmante" target="_blank" rel="noopener" title="Projeto Belmante"><img src="belmante.jpg" alt="Projeto Belmante"></a>
+    <div class="foot"><b>Projeto Belmante</b> · sem arquivos do jogo, sem keys · você traz o seu próprio dump</div>
+  </section>
+
+  <!-- OPTIONS -->
+  <section class="screen" id="opts">
+    <div class="opts">
+      <div class="top">
+        <button class="wbtn back" data-go="home"><i data-lucide="chevron-left" class="ic"></i>Voltar</button>
+        <h2 id="oTitle">Imagem</h2><span class="note" id="oNote"></span>
+        <span style="flex:1"></span>
+      </div>
+      <div class="body">
+        <nav class="tabs" id="tabs"></nav>
+        <div class="list" id="list"></div>
+      </div>
+      <div class="legend"><span class="tag adv">AVANÇADO</span><span class="tag exp">EXPERIMENTAL</span><span class="tag rs">REINICIA O JOGO</span><span class="tag port">PRECISA PORTAR DO CASTLEVANIA</span></div>
+    </div>
+  </section>
+
+  <!-- IMPORT (card) -->
+  <section class="screen" id="imp">
+    <div class="imp"><div class="card">
+      <h3>Importar o jogo</h3>
+      <p>O launcher <b>não traz</b> o jogo, nem keys, nem firmware. Escolha a pasta que tem <b>o seu</b> <code>prod.keys</code> (+ <code>title.keys</code>) e o seu dump do Super Mario Bros. Wonder. O celular lê os arquivos onde estão e extrai para a pasta própria do app.</p>
+      <div class="steps">
+        <div class="step"><span class="n">1</span><span>Escolher o dump<small>.xci (cartucho) ou .nsp (base + update)</small></span></div>
+        <div class="step"><span class="n">2</span><span>Escolher o prod.keys<small>da sua própria Switch (Lockpick_RCM)</small></span></div>
+        <div class="step"><span class="n">3</span><span>Extrair<small>≈ 3,7 GB · continua de onde parou se for interrompido</small></span></div>
+      </div>
+      <div class="btns">
+        <button class="wbtn red" data-go="imp2" style="font-size:1.05em">Escolher a pasta</button>
+        <button class="wbtn ghost" style="font-size:1.05em">Um .zip de dados</button>
+        <button class="wbtn ghost" data-go="home" style="font-size:1.05em">Cancelar</button>
+      </div>
+    </div></div>
+  </section>
+
+  <!-- IMPORT (progress) -->
+  <section class="screen" id="imp2">
+    <div class="imp"><div class="card">
+      <h3>Importando…</h3>
+      <div class="steps">
+        <div class="step done"><span class="n">✓</span><span>keys lidas<small>header_key, titlekek_rev · ok</small></span></div>
+        <div class="step done"><span class="n">✓</span><span>MarioWonder.xci aberto<small>partição secure · 1 programa encontrado</small></span></div>
+        <div class="step"><span class="n">3</span><span>Extraindo RomFS + ExeFS<small>1,41 GB de 3,70 GB</small></span></div>
+      </div>
+      <div class="prog"><i></i><em>38%</em></div>
+      <div class="btns"><button class="wbtn ghost" data-go="imp" style="font-size:1.05em;justify-content:center">Cancelar importação</button></div>
+    </div></div>
+  </section>
+</div>
+
+<div class="sheet">
+  <figure><img class="sq" src="icon.jpeg" width="192" height="192" alt=""><span>xxxhdpi · 192</span></figure>
+  <figure><img class="sq" src="icon.jpeg" width="96" height="96" alt=""><span>xxhdpi · 96</span></figure>
+  <figure><img class="round" src="icon.jpeg" width="96" height="96" alt=""><span>ícone redondo</span></figure>
+  <div class="homebg">
+    <figure><img class="round" src="icon.jpeg" width="64" height="64" alt=""><span>Wonder</span></figure>
+    <figure><img class="sq" src="icon.jpeg" width="64" height="64" alt=""><span>Wonder</span></figure>
+  </div>
+  <span style="max-width:260px">Ícone do APK (de <code>icone.jpeg</code>, 447×447): só aparece na tela inicial do Android, nunca dentro do launcher ou do jogo.</span>
+</div>
+
+<script>
+const T = (k)=>k; // tab/row data below mirrors Castlevania's Props.java, trimmed to what Wonder's runtime reads
+const tabs = [
+ {id:'image',  n:'Imagem',       note:'Resolução, ampliação e filtros', ic:'image'},
+ {id:'perf',   n:'Desempenho',   note:'Taxa de quadros, GPU e memória', ic:'gauge'},
+ {id:'controls',n:'Controles',   note:'Botões na tela e controle físico', ic:'gamepad-2'},
+ {id:'driver', n:'Driver GPU',   note:'Somente Qualcomm (Adreno)', ic:'cpu'},
+ {id:'audio',  n:'Som',          note:'Volume e saída', ic:'volume-2'},
+ {id:'data',   n:'Dados',        note:'Arquivos do jogo e saves', ic:'folder'},
+ {id:'diag',   n:'Diagnóstico',  note:'FPS, logs e relatórios', ic:'activity'},
+ {id:'about',  n:'Sobre',        note:'Idioma, créditos e licenças', ic:'info'},
+];
+const OO=['Desligado','Ligado'];
+// kind: tog | ch (choices) | sl | act | info | sec ; flags: adv, exp, rs (restart), port (needs porting from Castlevania runtime)
+const rows = {
+ image:[
+  {k:'handheld',t:'Modo do console',d:'Portátil: o jogo renderiza para 720p, como o Switch na mão (mais leve, mais fps). TV: renderiza para 1080p (mais nítido, mais pesado).',kind:'ch',v:['Portátil (720p)','TV (1080p)'],i:0,rs:1},
+  {k:'render_height',t:'Resolução interna',d:'Altura da imagem renderizada. A largura segue a proporção da tela do aparelho.',kind:'ch',v:['A do modo do console','540p (leve)','720p','900p','1080p (nítido)'],i:0,rs:1},
+  {k:'render_scale',t:'Escala da janela',d:'Tamanho da imagem em relação à tela; a ampliação final é feita no present pass. Padrão por GPU (1 em Adreno 7xx+).',kind:'ch',v:['Padrão da GPU','0,5x','0,67x','0,75x','0,85x','1x'],i:0,rs:1},
+  {k:'widescreen',t:'Tela cheia (Hor+)',d:'Mostra mais cenário nas laterais em telas 19,5:9 em vez de esticar o 16:9.',kind:'tog',i:1,rs:1,port:1},
+  {k:'fsr',t:'FSR 1',d:'Ampliação AMD FidelityFX: renderiza menos pixels e reconstrói a imagem.',kind:'tog',i:0,rs:1},
+  {k:'fsr_sharpness',t:'Nitidez do FSR',d:'Quanto o RCAS afia a imagem depois da ampliação.',kind:'ch',v:['Padrão (0,25)','Máxima (0)','Alta (0,5)','Média (1)','Suave (2)','Sem nitidez'],i:0,rs:1,req:'fsr'},
+  {k:'fxaa',t:'FXAA',d:'Suaviza serrilhado antes da interface. Custa ~2 fps em GPUs fracas.',kind:'tog',i:1,rs:1,port:1},
+  {k:'display_res',t:'Tamanho de tela informado ao jogo',d:'Tabela de tamanhos que o jogo enxerga (ultrawide).',kind:'ch',v:['Proporção do aparelho','16:9 original','1920x1080','2560x1080 (21:9)'],i:0,rs:1,adv:1,exp:1,port:1},
+ ],
+ perf:[
+  {k:'fps_cap',t:'Limite de quadros',d:'Período fixo de apresentação; também o alvo do ADPF (gerenciamento térmico do Android).',kind:'ch',v:['Sem limite','30','40','45','60'],i:4,rs:1,port:1},
+  {k:'pipelined',t:'Envios de GPU em voo',d:'Fences em pipeline: quantos envios ficam em voo. 0 = síncrono.',kind:'ch',v:['0 (síncrono)','2 (padrão)','3','4'],i:1,rs:1},
+  {k:'gpu_turbo',t:'GPU turbo',d:'Desliga o controle de energia KGSL: Adreno no clock máximo. Esquenta mais.',kind:'tog',i:0,rs:1},
+  {k:'mem_limit',t:'Limite de memória',d:'O guarda encerra o jogo acima disso, em vez de o sistema matar o app.',kind:'ch',v:['Automático (60% da RAM)','3 GB','3,5 GB','4 GB','5 GB','6 GB'],i:0,rs:1},
+  {k:'affinity',t:'Núcleos da CPU',d:'Onde as threads ficam nos clusters (big/prime/little).',kind:'ch',v:['0 (o sistema decide)','1','2 (sem os núcleos pequenos)','3 (padrão)'],i:3,rs:1,adv:1},
+  {k:'chunk_draws',t:'Draws por parte enviada',d:'Envios parciais antecipados dentro do mesmo quadro.',kind:'ch',v:['0 (uma parte)','150 (padrão)','400'],i:1,rs:1,adv:1},
+  {k:'pipeline_cache',t:'Cache de pipelines',d:'VkPipelineCache em disco: menos engasgos depois da primeira vez.',kind:'tog',i:1,rs:1,adv:1},
+ ],
+ controls:[
+  {k:'touch_show',t:'Botões na tela',d:'Esconde os botões virtuais (o botão de menu fica). Útil com controle Bluetooth.',kind:'tog',i:1},
+  {k:'opacity',t:'Opacidade dos botões',d:'',kind:'sl',min:10,max:100,step:5,val:85},
+  {k:'size',t:'Tamanho dos botões',d:'',kind:'sl',min:50,max:160,step:5,val:100},
+  {k:'layout',t:'Editar botões',d:'Arraste cada botão para onde quiser.',kind:'act',a:'Editar'},
+  {k:'mirror',t:'Modo canhoto',d:'Espelha o layout dos botões.',kind:'act',a:'Espelhar'},
+  {k:'resetlayout',t:'Restaurar layout',d:'Volta os botões à posição original.',kind:'act',a:'Restaurar'},
+  {k:'controls_mode',t:'Desenho dos botões',d:'Arte do app ou círculos simples desenhados pelo runtime.',kind:'ch',v:['Arte do app (padrão)','Círculos simples'],i:0,rs:1,adv:1},
+  {k:'haptics',t:'Vibração nos botões',d:'Feedback tátil ao tocar nos botões virtuais.',kind:'tog',i:1,port:1},
+  {k:'stick',t:'Analógico virtual',d:'Fixo no canto ou flutuante, aparece onde o polegar encosta.',kind:'ch',v:['Flutuante','Fixo'],i:0,port:1},
+ ],
+ driver:[
+  {k:'driver',t:'Driver em uso',d:'Driver Vulkan atual do sistema ou personalizado.',kind:'info',val:'Sistema (Adreno 740)'},
+  {k:'driver_download',t:'Baixar driver',d:'Escolher um driver Turnip/Qualcomm da lista online.',kind:'act',a:'Baixar'},
+  {k:'driver_import',t:'Importar driver (.zip)',d:'Usar um driver que você já baixou.',kind:'act',a:'Importar'},
+  {k:'driver_test',t:'Testar driver',d:'Abre o Vulkan com o driver escolhido e verifica se funciona antes de jogar.',kind:'act',a:'Testar'},
+  {k:'gpu_info',t:'Este aparelho',d:'Modelo da GPU, versão do Vulkan e extensões exigidas pelo jogo.',kind:'act',a:'Ver'},
+ ],
+ audio:[
+  {k:'mute',t:'Mudo',d:'Não abre a saída de áudio; o jogo continua cronometrado por timer.',kind:'tog',i:0,rs:1},
+  {k:'volume',t:'Volume do jogo',d:'Ganho aplicado antes da saída AAudio.',kind:'sl',min:0,max:100,step:5,val:100,port:1},
+  {k:'audio_lat',t:'Latência do áudio',d:'Baixa usa buffer pequeno (pode estalar); alta é mais estável.',kind:'ch',v:['Baixa','Equilibrada','Alta'],i:1,rs:1,adv:1,port:1},
+ ],
+ data:[
+  {k:'state',t:'Dados do jogo',d:'',kind:'info',val:'Importados ✓'},
+  {k:'space',t:'Espaço livre',d:'',kind:'info',val:'41,2 GB'},
+  {k:'import',t:'Importar o jogo',d:'XCI ou NSP + prod.keys, ou um .zip de dados.',kind:'act',a:'Importar'},
+  {k:'saves',t:'Saves',d:'Pasta user/save. Exportar para backup ou importar de outro aparelho.',kind:'act',a:'Exportar'},
+  {k:'clearcache',t:'Limpar cache de pipelines',d:'Apaga os pipelines_*.bin. Recria na próxima partida.',kind:'act',a:'Limpar'},
+  {k:'wipe',t:'Apagar dados importados',d:'Remove analysis / extract / spirv / index. Os saves ficam.',kind:'act',a:'Apagar'},
+ ],
+ diag:[
+  {k:'fps_mode',t:'Contador de FPS',d:'Sobreposição durante o jogo.',kind:'ch',v:['Desligado','Simples','Completo'],i:0},
+  {k:'fps_pos',t:'Posição do contador',d:'',kind:'ch',v:['Canto superior esquerdo','Canto superior direito'],i:0},
+  {k:'trace',t:'Rastrear chamadas de sistema',d:'Registra file system e SVCs no log. Muito lento: só para diagnóstico.',kind:'tog',i:0,rs:1,adv:1},
+  {k:'logpath',t:'Logs',d:'nx.log (e o da partida anterior, nx.log.prev).',kind:'act',a:'Ver'},
+  {k:'diag',t:'Salvar diagnóstico',d:'Empacota log, GPU e configuração em um arquivo para compartilhar.',kind:'act',a:'Salvar'},
+  {k:'report',t:'Enviar relatório',d:'Revise o que será enviado antes de qualquer envio. Nada sai sem você confirmar.',kind:'act',a:'Revisar'},
+ ],
+ about:[
+  {k:'lang',t:'Idioma do app',d:'',kind:'ch',v:['Automático','English','Português'],i:0},
+  {k:'advanced',t:'Opções avançadas',d:'Mostra as linhas marcadas como AVANÇADO.',kind:'tog',i:0},
+  {k:'version',t:'Versão',d:'',kind:'info',val:'0.3.0 (build 14)'},
+  {k:'credits',t:'Créditos',d:'Projeto Belmante e quem ajudou.',kind:'act',a:'Ver'},
+  {k:'yt',t:'Canal do Belmante',d:'',kind:'act',a:'Abrir'},
+  {k:'licenses',t:'Licenças',d:'Bibliotecas de código aberto usadas.',kind:'act',a:'Ver'},
+  {k:'legal',t:'Aviso',d:'Projeto sem fins lucrativos. Não inclui código, assets, keys ou firmware do jogo. Nintendo e Super Mario são marcas da Nintendo.',kind:'info',val:''},
+ ],
+};
+const state = {}; // key -> value index / on / number
+let cur = 'image', advanced = false;
+
+function el(h){const t=document.createElement('template');t.innerHTML=h.trim();return t.content.firstChild}
+function renderTabs(){
+  setTimeout(()=>lucide.createIcons());
+  const nav=document.getElementById('tabs');nav.innerHTML='';
+  tabs.forEach(t=>{
+    const b=el(`<button class="wbtn tab ${t.id===cur?'active':''}"><i data-lucide="${t.ic}" class="ic"></i><span class="grow">${t.n}</span></button>`);
+    b.onclick=()=>{cur=t.id;renderTabs();renderList()};nav.appendChild(b);
+  });
+  const t=tabs.find(x=>x.id===cur);
+  document.getElementById('oTitle').textContent=t.n;document.getElementById('oNote').textContent=t.note;
+}
+function get(r,f){return state[r.k]!==undefined?state[r.k]:r[f]}
+function renderList(){
+  setTimeout(()=>lucide.createIcons());
+  const L=document.getElementById('list');L.innerHTML='';
+  rows[cur].forEach(r=>{
+    if(r.adv&&!advanced)return;
+    if(r.req&&!get(rows.image.find(x=>x.k===r.req),'i'))return;
+    const tags=(r.adv?'<span class="tag adv">AVANÇADO</span>':'')+(r.exp?'<span class="tag exp">EXPERIMENTAL</span>':'')+(r.rs?'<span class="tag rs">REINICIA</span>':'')+(r.port?'<span class="tag port">PORTAR</span>':'');
+    const row=el(`<div class="opt"><div class="t"><b>${r.t} ${tags}</b>${r.d?`<span>${r.d}</span>`:''}</div></div>`);
+    let ctl;
+    if(r.kind==='tog'){
+      const on=get(r,'i')===1;ctl=el(`<div class="tog ${on?'on':''}"><i></i></div>`);
+      ctl.onclick=()=>{state[r.k]=on?0:1;renderList()};
+    }else if(r.kind==='ch'){
+      const i=get(r,'i');ctl=el(`<div class="val">${r.v[i]}</div>`);
+      ctl.onclick=e=>{const w=ctl.getBoundingClientRect();const d=(e.clientX-w.left)<w.width/2?-1:1;state[r.k]=(i+d+r.v.length)%r.v.length;renderList()};
+    }else if(r.kind==='sl'){
+      const v=get(r,'val');ctl=el(`<div class="sl"><input type="range" min="${r.min}" max="${r.max}" step="${r.step}" value="${v}"><output>${v}%</output></div>`);
+      ctl.firstChild.oninput=e=>{state[r.k]=+e.target.value;ctl.lastChild.textContent=e.target.value+'%'};
+    }else if(r.kind==='act'){
+      const AI={Editar:'pencil',Espelhar:'flip-horizontal-2',Restaurar:'rotate-ccw',Baixar:'download',Importar:'upload',Testar:'flask-conical',Ver:'eye',Limpar:'eraser',Apagar:'trash-2',Exportar:'share',Salvar:'save',Revisar:'eye',Abrir:'external-link'};
+      ctl=el(`<button class="wbtn act ${/Apagar|Limpar/.test(r.a)?'':'blue'}" style="${/Apagar/.test(r.a)?'--face:var(--red);--fg:#fff':''}"><i data-lucide="${AI[r.a]||'chevron-right'}" class="ic"></i>${r.a}</button>`);
+    }else{ctl=el(`<div class="info">${r.val||''}</div>`)}
+    row.appendChild(ctl);L.appendChild(row);
+  });
+}
+// advanced toggle reacts
+const adv=rows.about.find(r=>r.k==='advanced');
+document.addEventListener('click',()=>{advanced=get(adv,'i')===1;},true);
+document.addEventListener('click',()=>setTimeout(()=>{ if(cur==='about'||true){const was=advanced;advanced=get(adv,'i')===1;if(was!==advanced)renderList();}}));
+
+function go(id){
+  document.querySelectorAll('.screen').forEach(s=>s.classList.toggle('show',s.id===id));
+  document.querySelectorAll('.bar button').forEach(b=>b.classList.toggle('on',b.dataset.go===id));
+  if(id==='opts'){renderTabs();renderList()}
+  lucide.createIcons();
+}
+document.addEventListener('click',e=>{const b=e.target.closest('[data-go]');if(b)go(b.dataset.go)});
+renderTabs();renderList();lucide.createIcons();
+</script>
+</body>
+</html>
