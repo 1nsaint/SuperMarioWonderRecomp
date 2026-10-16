@@ -2,7 +2,7 @@
 # Start Wonder on a device/emulator, wait $2 seconds, save the log (logcat, tag wonder) and pull the frame dumps.
 # usage: tools/wonder_run_android.sh <serial> <seconds> <name>
 S=${1:-emulator-5554}; T=${2:-90}; N=${3:-emu}
-cd /Users/volan/Documents/Projetos/Switch/SwitchGamesRecomp
+cd "$(dirname "$0")/.."
 PKG=io.github.belmantegu.wonderrecomp
 D="/storage/emulated/0/Super Mario Bros. Wonder"
 adb -s "$S" shell am force-stop "$PKG"

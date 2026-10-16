@@ -13,6 +13,5 @@ __pycache__/
 *.keys
 
 # Local tooling state and run logs.
-.flowforge/
 nx.log
 *.log
