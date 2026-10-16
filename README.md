@@ -71,6 +71,8 @@ welcome.
 - **Button icons:** our own glyph font for the NintendoExtended codepoints (`tools/fonts/make_button_font.py`).
 - **Audio:** the sdk's own AudioRenderer (server and DSP code) runs in process.
 - **Memory:** 3.5 to 4.2 GB in play.
+- **Dump used:** Super Mario Bros. Wonder **1.0.0**, base game, no update, from an XCI of 3,769,099,776 bytes (SHA-256 and the rest in
+  [docs/WONDER-DUMP.md](docs/WONDER-DUMP.md)). Other versions are not supported.
 
 ### Open
 
