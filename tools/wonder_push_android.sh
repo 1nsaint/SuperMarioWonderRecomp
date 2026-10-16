@@ -3,7 +3,7 @@
 # The data goes to Internal storage/Super Mario Bros. Wonder, with all-files access granted by appops.
 set -e
 S=${1:-emulator-5554}
-cd /Users/volan/Documents/Projetos/Switch/SwitchGamesRecomp
+cd "$(dirname "$0")/.."
 PKG=io.github.belmantegu.wonderrecomp
 D="/storage/emulated/0/Super Mario Bros. Wonder"
 adb -s "$S" install -r private/wonder/apk/wonder.apk | tail -1

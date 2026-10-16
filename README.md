@@ -14,6 +14,13 @@ Part of the [SwitchGamesRecomp](https://github.com/BelmanteGu/SwitchGamesRecomp)
 > provided.
 
 > [!IMPORTANT]
+> **This project was made with a lot of AI and a lot of study.** Most of the code, tooling and documentation was
+> written with AI assistance (Anthropic's Claude), directed, tested and reviewed by a human who spent a great deal of
+> time studying the Switch's CPU, OS and graphics stack (AArch64, NVN, Maxwell shaders, Vulkan) to guide it. If you
+> don't agree with the use of AI or don't trust AI-written code, that is your right; you run the code at your own
+> discretion.
+
+> [!IMPORTANT]
 > **A note on the history of this repo.** The project was developed across several computers, and files were lost
 > when moving between them. Part of the code had to be rewritten from scratch, and some early notes, test
 > scripts and intermediate results no longer exist. If something in [PROGRESS.md](PROGRESS.md) or the docs refers
