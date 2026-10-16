@@ -85,8 +85,55 @@ the 1.3 features struct chained only on 1.3, and a check of the translated shade
 about a day of code plus testing on a real 1.1/1.2 phone, which nobody here has run. The target (Adreno 740) is 1.3, the gain is
 only devices that are unlikely to run the game fast enough, so the manifest and runtime are left at 1.3.
 
+## Measured on a Galaxy S23 (SM-S911B, Adreno 740, Android 14)
+
+Handheld mode (the game renders 1280x720, the present pass draws it into the 2340x1080 swapchain), 60 Hz panel, phone plugged in.
+Numbers are the runtime's own "per frame over 60" lines (`nx.log`), steady state of each run, **one run per row**.
+
+| Scene | Setting | fps | replay (CPU) | fence wait (GPU) | present | upload / frame |
+|---|---|---|---|---|---|---|
+| Title, user select, menus | default | 60 | ~6 ms | ~4 ms | ~4.4 ms | ~3.5 MB |
+| "Welcome to the Flower Kingdom" (fountain) | default (synchronous) | 24 | 20.6 ms | 12.7 ms | 5.5 ms | 10.4 MB |
+| same | `NX_PIPELINED=2` | **60** | 9.7 ms | 1.3 ms | 0.3 ms | 10.1 MB |
+| same | `NX_PIPELINED=3` | 60 | 10.2 ms | 0.9 ms | 0.4 ms | 10.0 MB |
+
+What the numbers say: in synchronous mode the CPU replay and the GPU wait are serialized (about 21 + 13 + 5 ms per frame), so the
+game drops to its own 30 fps mode (the log shows `window present interval 1 -> 2`). Pipelining overlaps them and the GPU is not
+the limit (the fence wait falls to about 1 ms): the replay thread is the CPU-side limit and pipelining hides it. Memory stays
+around 1.1 GB resident (peak 1.17 GB, limit 4.1 GB). Entering the fountain scene creates about 130 pipelines in one second
+(~41 ms hitch; the on-disk pipeline cache makes the next visit cheaper). Upload per frame goes from ~3.5 MB to ~10 MB in that scene;
+what is uploaded was not investigated.
+
+### Recommended settings for this phone
+
+| Option | Value | Why |
+|---|---|---|
+| GPU submits in flight (Performance) | **2** (restart) | the only lever measured: 24 to 60 fps on the fountain scene |
+| FPS limit (Performance) | 60 (the game's own rule) | 60 when the phone keeps up, its own 30 when heavy; 30 locks the 30 fps cadence (not measured on a phone) |
+| Console mode (Image) | Handheld (720p) | lighter than Docked (1080p), which was not measured |
+| FSR, GPU turbo | off | no gain measured; turbo only runs hotter |
+| Memory limit | automatic | the game uses ~1.1 GB |
+
+Caveats: a single scene, a single run per row. Pipelined mode is still off by default because it once drew exploded meshes in
+some courses (DEBUG-2 #76; the docs list the cause, #90, as fixed): watch other courses after turning it on, and go back to
+synchronous if the geometry breaks. Back-to-back runs without a cooldown took the AP sensor from 39.7 to 52 C with thermal status 0.
+
+## Other phones
+
+A POCO F6 (Xiaomi 24069PC21G, Android 15, Adreno 735, 11 GB) imported the game fine and then closed as soon as it started:
+`FATAL: cannot reserve thunks at 6f00000000 (+100000): the range is in use` (`wonder-diagnostics.zip`, Settings > Diagnostics). The
+HLE thunk range only names HLE functions (`loader.cpp` dispatches by address and nothing is ever mapped there), so a host mapping
+already in it is harmless: `memory.cpp` now logs a warning instead of stopping. The fix is the one the Castlevania runtime already
+had for the same phone; it has not been run on that phone yet.
+
 ## Not verified
 
-None of this has run on a device. The launcher compiles (javac/d8), the APK passes `apksigner verify` and `aapt2 dump badging`,
-`OptionsModel`/`GameConfig`/`ControlLayout` have a plain-JVM test of the file rules, and the runtime edits (`touch_layout.cpp`,
-`platform_android_input.cpp`, `platform_android_audio.cpp`, `platform_android.cpp`) pass `clang -fsyntax-only` with the NDK.
+Run on the S23: the launcher UI, the XCI import (19,012 RomFS files, 3.73 GB), the game starting, the title, the menus, the intro
+and the fountain scene (the controller-button glyphs show with the stand-in font), and the benchmark above.
+
+Not run on any device: the 30 fps limit (the code forces the present interval to 2 and the game's own interval fields; game speed
+at 30 was not timed against real time), Console mode `NX_HANDHELD=0` (docked), FSR, the window scale and resolution rows, chunk
+draws, the pipeline cache cold against warm, mute, the FPS counter overlay, the layout editor, the saves import/export, the zip
+import, and course 1-1 (a script could not get past the fountain dialog). The POCO F6 fix has not been run on that phone.
+The launcher compiles (javac/d8), the APK passes `apksigner verify` and `aapt2 dump badging`, `OptionsModel`/`GameConfig`/
+`ControlLayout` have a plain-JVM test of the file rules, and the runtime edits pass `clang -fsyntax-only` with the NDK.
