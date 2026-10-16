@@ -11,3 +11,8 @@ __pycache__/
 *.xcz
 *.rar
 *.keys
+
+# Local tooling state and run logs.
+.flowforge/
+nx.log
+*.log
