@@ -71,7 +71,7 @@ change `main` and break the recompiled code).
 The importer writes `analysis/*.bin`, `analysis/main.npdm` and `extract/romfs/`. It does not write `spirv/`: the translated
 shaders come from the APK (`assets/spirv.zip`, made by `android/build_apk.sh` from `private/wonder/spirv`, which needs the
 player's own dump and `tools/maxwell/spirv_harness`), and `config.txt` is created on the first import or Play. The button
-font (`fonts/shared_5.ttf`) is not produced: on Android the runtime falls back to a system font (`hle_pl.cpp`).
+font (`fonts/shared_5.ttf`) is not produced by the importer: the launcher installs it (see Fixes below).
 A "data .zip" made by `tools/pack_phone_wonder.py` is also accepted.
 
 ## Vulkan 1.3 requirement
@@ -84,6 +84,23 @@ entry points used (or `NX_RENDER_PASS_OBJECTS=1` made the default: that path exi
 the 1.3 features struct chained only on 1.3, and a check of the translated shaders' SPIR-V version and capabilities. Effort:
 about a day of code plus testing on a real 1.1/1.2 phone, which nobody here has run. The target (Adreno 740) is 1.3, the gain is
 only devices that are unlikely to run the game fast enough, so the manifest and runtime are left at 1.3.
+
+## Fixes
+
+- **Controller-button icons shown as "??".** The game writes the buttons in its text ("Press [L] + [R] to Start") as codepoints of the
+  Switch's extension font, which lives in the firmware and is not ours to ship. Without `fonts/shared_5.ttf` the runtime fell back to
+  Roboto (`hle_pl.cpp`), which has no such glyphs. The launcher now installs a stand-in: `tools/fonts/make_button_font.py` draws 39
+  button icons (A B X Y L R ZL ZR SL SR + - D-pad, stick, arrows) on top of Fredoka (SIL OFL, so it can be bundled; 56 KB), and
+  `AppFiles.installSharedFont` copies it from `assets/fonts/shared_5.ttf` to `<data root>/fonts/shared_5.ttf` on every launcher
+  start when the file is missing. It never replaces a font that is already there, so a font put in by hand wins. Checked on the
+  S23: the title shows "Press (L) + (R) to Start" with the icons. The earlier macOS-Arial based font is only for local use and is not
+  in the APK.
+- **Closing at once on a POCO F6** (Android 15, Adreno 735): the HLE thunk range at `0x6F00000000` was already mapped and its
+  reservation was fatal (`FATAL: cannot reserve thunks ...`). It only names HLE functions, so `memory.cpp` now logs a warning and goes on.
+- **Console mode.** `NX_HANDHELD=0` now really gives docked 1080p (before, the variable existing at all meant handheld).
+- **Mute** (`NX_MUTE`) and the **touch layout** keys (`NX_TOUCH_*`) now have readers in the runtime; rows without a reader are hidden.
+- **Launcher layout:** the 7 tabs fit the screen and the rows list fades at its edge so a row cut by the panel reads as "scroll".
+- **FPS limit** (`NX_FPS_CAP`): see the rows table; 60 keeps the game's own rule, 30 holds the 30 fps cadence.
 
 ## Measured on a Galaxy S23 (SM-S911B, Adreno 740, Android 14)
 

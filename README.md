@@ -117,6 +117,25 @@ The APK has its own launcher (`android/wonder/`, see [docs/WONDER-ANDROID-OPTION
 the game on the phone from a folder with your `prod.keys` and your XCI/NSP, has the options screen and the touch layout editor.
 `LAUNCHER_ONLY=1 bash android/build_apk.sh --game wonder` builds it without the game library (the UI and the import work, Play does not).
 
+#### Launcher, fixes and optimizations (Galaxy S23)
+
+- **Launcher in the Wonder style:** animated background, Lucide icons, and an options screen with a reader behind every row
+  (no dead switches). Import the game on the phone from your own `prod.keys` + **XCI or NSP**; the APK carries no game data, keys or firmware.
+- **Fixes:**
+  - **Button icons showed as `??`.** The launcher now installs a stand-in button font (drawn by `tools/fonts/make_button_font.py`
+    on Fredoka, OFL, 56 KB). The title shows "Press (L) + (R) to Start" with the icons.
+  - **Closing at once on a POCO F6 (Android 15):** an address range the runtime reserved was already taken on that phone and the
+    reservation was fatal; it is now a warning.
+  - **Docked mode** (`NX_HANDHELD=0`) really renders 1080p; **mute** and the touch layout keys now work.
+- **FPS limit:** 60 keeps the game's own rule (60 fps when the phone keeps up, its own 30 fps mode when heavy); 30 holds the 30 fps
+  cadence (steady 33 ms frame, cooler). Console mode: Handheld (720p) or Docked (1080p).
+- **Optimization that worked (S23, one scene, one run each):** the "Flower Kingdom" fountain scene ran at **24 fps** with the
+  default synchronous submits and at **60 fps** with `NX_PIPELINED=2` ("GPU submits in flight = 2" in Settings > Performance):
+  replay 20.6 to 9.7 ms and GPU wait 12.7 to 1.3 ms per frame, because the CPU replay and the GPU no longer run in series.
+  It is still **off by default** (it once drew exploded meshes in some courses): turn it on, and go back if the geometry breaks.
+  The 30 fps limit and the docked mode have not been timed on a phone yet.
+- Measurements, recommended settings, what has and has not run on a device: [docs/WONDER-ANDROID-OPTIONS.md](docs/WONDER-ANDROID-OPTIONS.md).
+
 Touch controls:
 - **Right side:** A (jump, big), B, Y (dash), X.
 - **Top:** ZR, R, L, + and -.
