@@ -113,6 +113,10 @@ Without a computer, copy the APK and the zip to the phone:
 
 The APK contains recompiled game code built from your own dump. It is for you only: never share or publish it.
 
+The APK has its own launcher (`android/wonder/`, see [docs/WONDER-ANDROID-OPTIONS.md](docs/WONDER-ANDROID-OPTIONS.md)): it imports
+the game on the phone from a folder with your `prod.keys` and your XCI/NSP, has the options screen and the touch layout editor.
+`LAUNCHER_ONLY=1 bash android/build_apk.sh --game wonder` builds it without the game library (the UI and the import work, Play does not).
+
 Touch controls:
 - **Right side:** A (jump, big), B, Y (dash), X.
 - **Top:** ZR, R, L, + and -.

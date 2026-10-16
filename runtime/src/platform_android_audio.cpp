@@ -87,6 +87,8 @@ aaudio_data_callback_result_t audio_cb(AAudioStream*, void*, void* out, int32_t 
 
 bool audio_open(AudioDone done) {
     g_done = done;
+    // NX_MUTE=1 (and headless test runs): no device, the callers pace themselves with a timer (as on Windows and macOS).
+    if (headless() || std::getenv("NX_MUTE")) return false;
     AAudioStreamBuilder* b = nullptr;
     if (AAudio_createStreamBuilder(&b) != AAUDIO_OK) return false;
     AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);

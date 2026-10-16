@@ -140,6 +140,7 @@ int32_t on_input(android_app*, AInputEvent* e) {
         return 1;
     }
     if ((src & AINPUT_SOURCE_TOUCHSCREEN) != AINPUT_SOURCE_TOUCHSCREEN) return 0;
+    if (!touch_enabled()) return 0;  // NX_TOUCH_SHOW=0
     int32_t action = AMotionEvent_getAction(e);
     int32_t kind = action & AMOTION_EVENT_ACTION_MASK;
     size_t index = size_t((action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
@@ -154,7 +155,7 @@ int32_t on_input(android_app*, AInputEvent* e) {
         touch_buttons(drawn);
         if (drawn) {  // a drawn layout (touch_layout.cpp): its buttons first, the rest of the left half is the stick
             uint64_t b = touch_hit(x / g_w, y / g_h, g_w / g_h);
-            bool left = !b && x < g_w * 0.5f;
+            bool left = !b && (touch_mirrored() ? x > g_w * 0.5f : x < g_w * 0.5f);
             if (b || left) g_touches.push_back({AMotionEvent_getPointerId(e, index), x, y, x, y, left, b});
         } else {
             bool left = x < g_w * 0.5f;
@@ -218,21 +219,22 @@ size_t touch_overlay(OverlayShape* out, size_t max) {
     const TouchButton* b = touch_buttons(n);
     if (!n) return 0;
     std::lock_guard lk(g_in);
-    if (g_gamepad) return 0;
+    if (g_gamepad || !touch_enabled()) return 0;
+    const float shade = touch_opacity_scale();
     const Touch* stick = nullptr;
     uint64_t held = 0;
     for (const auto& t : g_touches) {
         if (t.left) stick = &t;
         held |= t.button;
     }
-    for (size_t i = 0; i < n && k < max; i++) out[k++] = {b[i].x, b[i].y, b[i].r, held & b[i].button ? 0.5f : 0.2f};
+    for (size_t i = 0; i < n && k < max; i++) out[k++] = {b[i].x, b[i].y, b[i].r, std::min(1.0f, (held & b[i].button ? 0.5f : 0.2f) * shade)};
     if (stick && k + 2 <= max) {
         float r = 0.12f, dx = (stick->x - stick->x0) / g_h, dy = (stick->y - stick->y0) / g_h;
         float len = std::hypot(dx, dy), s = len > r ? r / len : 1.f;
-        out[k++] = {stick->x0 / g_w, stick->y0 / g_h, r, 0.14f};
-        out[k++] = {(stick->x0 / g_h + dx * s) * g_h / g_w, stick->y0 / g_h + dy * s, 0.055f, 0.45f};
+        out[k++] = {stick->x0 / g_w, stick->y0 / g_h, r, std::min(1.0f, 0.14f * shade)};
+        out[k++] = {(stick->x0 / g_h + dx * s) * g_h / g_w, stick->y0 / g_h + dy * s, 0.055f, std::min(1.0f, 0.45f * shade)};
     } else if (k < max) {
-        out[k++] = {0.15f, 0.72f, 0.12f, 0.08f};  // where the stick goes
+        out[k++] = {touch_mirrored() ? 0.85f : 0.15f, 0.72f, 0.12f, std::min(1.0f, 0.08f * shade)};  // where the stick goes
     }
     return k;
 }

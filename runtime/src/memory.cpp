@@ -29,7 +29,12 @@ void memory_init() {
     reserve(kAliasBase, kAliasSize, "alias");
     reserve(kStackBase, kStackSize, "stack");
     reserve(kKernelBase, kKernelSize, "kernel");
-    reserve(kThunkBase, kThunkSize, "thunks");
+    // The thunk range only names HLE functions: calls to it are dispatched by address (loader.cpp) and nothing is ever
+    // mapped, read or run there, so a host mapping already in it is harmless. On a POCO F6 (Android 15, Adreno 735,
+    // Xiaomi 24069PC21G) something sat at 0x6F00000000 and this was fatal: the app closed as soon as the game started.
+    if (!plat::reserve(kThunkBase, kThunkSize))
+        log("memory: thunk range %llx (+%llx) already in use on this device: not reserved (only an address range for "
+            "HLE calls, never mapped)", (unsigned long long)kThunkBase, (unsigned long long)kThunkSize);
     // Only the alias and stack regions are free for the guest to pick addresses in (nn::os maps shared memory,
     // transfer memory and thread stacks at random free addresses); everything else is reported inaccessible.
     uint64_t end = kAddressSpaceBase + kAddressSpaceSize;
