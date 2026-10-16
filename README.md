@@ -7,8 +7,33 @@ calls (NVN, Nintendo's own API) are implemented natively on **Vulkan** (MoltenVK
 Part of the [SwitchGamesRecomp](https://github.com/BelmanteGu/SwitchGamesRecomp) work (same runtime, see
 [docs/FRAMEWORK.md](docs/FRAMEWORK.md)); this repo follows Wonder alone. Living log: [PROGRESS.md](PROGRESS.md).
 
-No game data here. Everything derived from the game, keys or firmware stays in `private/` (gitignored). Bring your
-own legally dumped copy, keys and firmware.
+> [!NOTE]
+> **No game files are included.** This repository holds no game code, assets, keys or firmware, and no build
+> made from them. Everything derived from the game stays in `private/` (gitignored). You need your own legally
+> dumped copy of Wonder 1.0.0, plus your own keys and firmware. Instructions on how to obtain them are **not**
+> provided.
+
+> [!IMPORTANT]
+> **A note on the history of this repo.** The project was developed across several computers, and files were lost
+> when moving between them. Part of the code had to be rewritten from scratch, and some early notes, test
+> scripts and intermediate results no longer exist. If something in [PROGRESS.md](PROGRESS.md) or the docs refers
+> to a file you cannot find, that is probably why. Bug reports about gaps like this are welcome.
+
+## Platforms
+
+| Platform | Status | Graphics |
+|---|---|---|
+| macOS (Apple Silicon) | works, the reference platform | Vulkan on Metal through MoltenVK |
+| Windows (x86-64) | works, tested on NVIDIA (RTX 3050) and Intel GPUs | native Vulkan 1.3 |
+| Android (arm64) | works, tested on a Galaxy S23 | native Vulkan 1.3 |
+| Linux | **not ported yet, but close** | native Vulkan 1.3 |
+
+Linux is not a rewrite. The recompiled game code is portable C++ and the NVN layer talks only generic Vulkan, with
+no Metal code. What is missing is the same small platform layer macOS, Windows and Android already have: a
+`platform_linux.cpp` (window, input, audio) and a `memguard_linux.cpp` next to the existing `platform_mac.cpp` /
+`platform_win.cpp` / `memguard_*.cpp` in `runtime/src/`, plus a Linux branch in `CMakeLists.txt` (today its
+non-Apple, non-Android branch is the Windows one). Nobody has built or run it on Linux yet. Pull requests are
+welcome.
 
 ## State
 
@@ -42,20 +67,23 @@ The details are in the GitHub milestones.
 - **Windowed stretches at 35-40 fps (#51):** the GPU goes past the frame budget only when a window is visible.
 - **Windowed confirmation of the W7 glitch fixes (#43-#45, #47):** horizon band, silhouettes, present mode.
 - **Character-select blur:** needs a reference from a real console.
-- **Android port:** planned in [docs/nvn/ANDROID-PORT.md](docs/nvn/ANDROID-PORT.md), in progress on branch
-  `feat/android-wonder`. See below.
-- **Windows port:** planned in [docs/nvn/WINDOWS-PORT.md](docs/nvn/WINDOWS-PORT.md), branch `feat/windows-wonder`.
+- **Android rendering bugs and performance:** hand-off notes in [docs/nvn/android-perf/](docs/nvn/android-perf/).
+- **Linux:** see [Platforms](#platforms).
 
-### Android (in progress, branch `feat/android-wonder`)
+### Windows
+
+Wonder runs on Windows 10/11 with a Vulkan 1.3 GPU (tested on an NVIDIA RTX 3050 and on Intel). The port is
+described in [docs/nvn/WINDOWS-PORT.md](docs/nvn/WINDOWS-PORT.md) and [WINDOWS-PLAN.md](docs/nvn/WINDOWS-PLAN.md),
+the PC quality work in [docs/nvn/pc-quality/](docs/nvn/pc-quality/). `dev.ps1` sets up the build environment
+(Visual Studio Build Tools, clang, CMake, Ninja, Vulkan SDK) and `tools/pack_pc_wonder.py` packs your own data for
+the PC. The recompile, shader and build steps are the same as in the macOS section below.
+
+### Android
 
 The same recompiled code runs on arm64 phones with a native Vulkan 1.3 driver. On a Galaxy S23 (Snapdragon 8 Gen 2)
-the game runs at 40-60 fps at the title. Since then these were added:
-- the present pass: rotated to the display, 16:9 with bars, alpha 1;
-- drawn touch controls;
-- a pipeline cache on disk;
-- ADPF performance hints.
-
-They were checked on the Mac, with the phone check pending. Progress and the test list are in ANDROID-PORT.md.
+the game runs with drawn touch controls, a present pass rotated to the display (16:9 with bars), a pipeline cache on
+disk and ADPF performance hints. Progress, the test list and the performance phases are in
+[docs/nvn/ANDROID-PORT.md](docs/nvn/ANDROID-PORT.md).
 
 Build and install (macOS or Linux, Android SDK with NDK 28.2):
 
@@ -153,3 +181,29 @@ Ground rules for this track:
 | `tools/` | extraction, shader and font tools, packaging |
 | `android/` | Android project and build script |
 | `docs/` | findings, plans, debug history, screenshots (`docs/media/`) |
+
+## Credits
+
+- **Ryujinx** shader translator (MIT) - used offline to translate the Maxwell shaders to SPIR-V; also a reference for
+  the Switch GPU. Ryujinx and yuzu were studied as references only; no GPL code is used.
+- **Hephaistos** by Nicolas Busseneau (MIT, copy of the license in
+  `games/hades/mods/hephaistos/LICENSE`) - the Lua widescreen mod served to Hades by the shared runtime. It is not
+  used by Wonder.
+- [SDL 3](https://libsdl.org) (zlib), [MoltenVK](https://github.com/KhronosGroup/MoltenVK) (Apache 2.0) and the
+  Vulkan headers and loader (Apache 2.0 / MIT).
+- [envytools](https://github.com/envytools/envytools), [Switchbrew](https://switchbrew.org) and the Switch homebrew
+  community's documentation.
+
+## Legal
+
+This is a fan project. It is not affiliated with, endorsed by or sponsored by Nintendo. *Super Mario Bros. Wonder* and
+*Nintendo Switch* are trademarks of Nintendo. No game files, game code, assets, keys, firmware or fonts are included,
+in this repository or in any release. You must provide your own legally obtained copy of the game. The APK or data zip
+you build from your own dump contains Nintendo's code and data: it is for you only, never share or publish it.
+The API (NVN) is reverse engineered from binaries; no leaked NVN headers are used.
+
+## License
+
+The code in this repository is open source under the [MIT License](LICENSE). Third-party components keep their own
+licenses (see Credits). The license covers this project's code only and grants nothing for Nintendo's game.
+See [CONTRIBUTING.md](CONTRIBUTING.md) to report bugs or contribute.
