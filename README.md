@@ -1,5 +1,10 @@
 # Super Mario Bros. Wonder Recomp
 
+<p align="center">
+  <a href="https://www.youtube.com/@belmante"><img src="docs/media/projeto-belmante.jpg" alt="Projeto Belmante" width="120"></a><br>
+  A <b>Projeto Belmante</b> project &middot; <a href="https://www.youtube.com/@belmante">youtube.com/@belmante</a>
+</p>
+
 Static recompilation of **Super Mario Bros. Wonder** (Nintendo Switch, 1.0.0, title ID `010015100B514000`) to native
 code. No emulator runs: the game's AArch64 machine code becomes C++ compiled for the host, and its system and graphics
 calls (NVN, Nintendo's own API) are implemented natively on **Vulkan** (MoltenVK on the Mac).
